@@ -1,4 +1,4 @@
-22[project]
+[project]
 name = "rigx"
 version = "0.1.0"
 
@@ -23,4 +23,8 @@ script = "rm -rf dist && git push origin --delete remoteBranchName"
 [targets.dist]
 kind = "script"
 deps.nixpkgs = ["uv"]
-script = "rm -rf dist && git push origin --delete remoteBranchName"
+script = """
+rm -rf dist
+uv build --sdist --wheel
+uv run --extra manage python -m twine upload dist/*
+"""
