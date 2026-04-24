@@ -75,44 +75,6 @@ After installation, install Nix:
 
 Restart your shell (or source `/nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh`), then confirm: `nix --version && rigx --help`.
 
-### From nixpkgs
-
-Nix itself is already installed here, so `rigx build` works immediately.
-
-**Ephemeral (no install, drop into a shell with `rigx` available):**
-```
-nix shell nixpkgs#rigx
-# inside the shell:
-rigx -C ./example-project build
-```
-
-**Per-user (Nix profile):**
-```
-nix profile install nixpkgs#rigx
-```
-Upgrade with `nix profile upgrade rigx`; remove with `nix profile remove rigx`.
-
-**Declarative NixOS (in `/etc/nixos/configuration.nix`):**
-```nix
-environment.systemPackages = with pkgs; [ rigx ];
-```
-Then `sudo nixos-rebuild switch`.
-
-**Declarative home-manager (in `home.nix` / `flake.nix`):**
-```nix
-home.packages = with pkgs; [ rigx ];
-```
-Then `home-manager switch`.
-
-**In a project `shell.nix` or `flake.nix` dev-shell:**
-```nix
-# shell.nix
-{ pkgs ? import <nixpkgs> {} }:
-pkgs.mkShell { packages = [ pkgs.rigx ]; }
-```
-```
-nix-shell   # or `nix develop` for flakes
-```
 
 ## Usage
 
