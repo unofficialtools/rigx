@@ -1,0 +1,31 @@
+[project]
+name = "hello-example"
+version = "0.1.0"
+
+[nixpkgs]
+ref = "nixos-24.11"
+
+[targets.greet]
+kind = "static_library"
+sources = ["src/greet.cpp"]
+includes = ["include"]
+public_headers = ["include"]
+cxxflags = ["-std=c++17", "-Wall"]
+deps.nixpkgs = ["fmt"]
+
+[targets.hello]
+kind = "executable"
+sources = ["src/main.cpp"]
+includes = ["include"]
+cxxflags = ["-std=c++17", "-Wall"]
+ldflags = ["-lfmt"]
+deps.internal = ["greet"]
+deps.nixpkgs = ["fmt"]
+
+[targets.hello.variants.debug]
+cxxflags = ["-O0", "-g"]
+defines = { DEBUG = "1" }
+
+[targets.hello.variants.release]
+cxxflags = ["-O2"]
+defines = { NDEBUG = "1" }
