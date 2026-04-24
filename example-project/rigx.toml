@@ -1,0 +1,94 @@
+[project]
+name = "hello-example"
+version = "0.1.0"
+
+[nixpkgs]
+ref = "nixos-24.11"
+
+[targets.greet]
+kind = "static_library"
+sources = ["src/greet.cpp"]
+includes = ["include"]
+public_headers = ["include"]
+cxxflags = ["-std=c++17", "-Wall"]
+deps.nixpkgs = ["fmt"]
+
+[targets.hello]
+kind = "executable"
+sources = ["src/main.cpp"]
+includes = ["include"]
+cxxflags = ["-std=c++17", "-Wall"]
+ldflags = ["-lfmt"]
+deps.internal = ["greet"]
+deps.nixpkgs = ["fmt"]
+
+[targets.hello.variants.debug]
+cxxflags = ["-O0", "-g"]
+defines = { DEBUG = "1" }
+
+[targets.hello.variants.release]
+cxxflags = ["-O2"]
+defines = { NDEBUG = "1" }
+
+[targets.hello_nim]
+kind = "nim_executable"
+sources = ["src/hello.nim"]
+nim_flags = ["-d:release", "--opt:speed"]
+deps.nixpkgs = ["nim"]
+
+[targets.hello_nim.variants.debug]
+nim_flags = ["-d:debug", "--debugger:native"]
+
+[targets.hello_nim.variants.release]
+nim_flags = ["-d:release", "--opt:speed"]
+
+[targets.greet_py]
+kind = "python_script"
+sources = ["src/greet.py"]
+python_version = "3.12"
+python_project = "."            # dir containing pyproject.toml + uv.lock
+# python_venv_hash = "sha256-..."  # see README; first build prints the real hash
+
+[targets.gen_greeting]
+kind = "executable"
+sources = ["src/gen_greeting.cpp"]
+cxxflags = ["-std=c++17"]
+
+[targets.greeting]
+kind = "run"
+run = "gen_greeting"
+args = ["--name", "Massimo", "--out", "greeting.txt"]
+outputs = ["greeting.txt"]
+
+# A run target that invokes a nixpkgs tool (`zip`) to bundle project files.
+[targets.headers_zip]
+kind = "run"
+run = "zip"                       # name resolved via PATH (no such internal target)
+deps.nixpkgs = ["zip"]             # provides `zip` on PATH in the sandbox
+args = ["-r", "headers.zip", "include"]
+outputs = ["headers.zip"]
+
+# A run target that consumes the artifact of another run target.
+# ${headers_zip} Nix-interpolates to the store path of that derivation.
+[targets.unpack_headers]
+kind = "run"
+run = "unzip"
+deps.nixpkgs = ["unzip"]
+deps.internal = ["headers_zip"]    # declares the build-order dependency
+args = ["-d", "extracted", "${headers_zip}/headers.zip"]
+outputs = ["extracted"]            # a directory; cp -r handles it
+
+# Escape hatch: an unsupported language (Go) whose compiler is in nixpkgs.
+# User supplies the build/install scripts directly.
+[targets.hello_go]
+kind = "custom"
+deps.nixpkgs = ["go"]
+build_script = """
+export GOCACHE=$TMPDIR/go-cache
+export GOPATH=$TMPDIR/go
+go build -o hello_go src/hello.go
+"""
+install_script = """
+mkdir -p $out/bin
+cp hello_go $out/bin/
+"""

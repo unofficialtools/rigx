@@ -1,4 +1,4 @@
-from procton.cli import main
+from rigx.cli import main
 
 if __name__ == "__main__":
     main()

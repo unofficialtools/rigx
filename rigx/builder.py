@@ -6,8 +6,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from procton import nix_gen
-from procton.config import Project
+from rigx import nix_gen
+from rigx.config import Project
 
 OUTPUT_DIR = "output"
 FLAKE_FILE = "flake.nix"
@@ -16,6 +16,33 @@ NIX_EXPERIMENTAL = ["--extra-experimental-features", "nix-command flakes"]
 
 class BuildError(RuntimeError):
     pass
+
+
+class NixNotFoundError(BuildError):
+    """Raised when the `nix` binary is not on PATH."""
+
+
+NIX_INSTALL_INSTRUCTIONS = """\
+Nix is required but was not found on PATH.
+
+rigx runs all builds inside Nix's sandbox. Install Nix, restart your shell,
+then re-run `rigx`.
+
+Install instructions
+--------------------
+
+macOS / Linux (official installer):
+  sh <(curl -L https://nixos.org/nix/install) --daemon
+
+macOS / Linux (Determinate Systems installer, recommended for most users):
+  curl --proto '=https' --tlsv1.2 -sSf -L \\
+    https://install.determinate.systems/nix | sh -s -- install
+
+After installing, restart your shell or source:
+  . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+
+Docs: https://nixos.org/download
+"""
 
 
 def _flake_path(project: Project) -> Path:
@@ -29,9 +56,7 @@ def _output_dir(project: Project) -> Path:
 def _nix_bin() -> str:
     nix = shutil.which("nix")
     if not nix:
-        raise BuildError(
-            "nix is not installed or not on PATH; install Nix from https://nixos.org/download"
-        )
+        raise NixNotFoundError(NIX_INSTALL_INSTRUCTIONS)
     return nix
 
 
@@ -42,10 +67,43 @@ def write_flake(project: Project) -> Path:
     return flake_path
 
 
+def _flake_ref(project: Project, attr: str | None = None) -> str:
+    # Use the explicit "path:" scheme so Nix treats the directory as a flake
+    # regardless of any enclosing git repo (which otherwise hides untracked
+    # files like the generated flake.nix).
+    ref = f"path:{project.root.resolve()}"
+    return f"{ref}#{attr}" if attr else ref
+
+
+def run_nixpkgs_tool(
+    project: Project,
+    attr: str,
+    args: list[str],
+    cwd: Path | None = None,
+) -> int:
+    """Invoke a binary from the project's pinned nixpkgs via `nix run`.
+
+    Lets rigx wrap tools like `uv` without requiring the user to install them
+    on their host — the project's `[nixpkgs].ref` (pinned via flake.lock)
+    provides a reproducible binary.
+    """
+    nix = _nix_bin()
+    cmd = [
+        nix,
+        *NIX_EXPERIMENTAL,
+        "run",
+        f"nixpkgs/{project.nixpkgs_ref}#{attr}",
+        "--",
+        *args,
+    ]
+    result = subprocess.run(cmd, cwd=cwd, check=False)
+    return result.returncode
+
+
 def update_lock(project: Project) -> None:
     write_flake(project)
     nix = _nix_bin()
-    cmd = [nix, *NIX_EXPERIMENTAL, "flake", "lock", str(project.root)]
+    cmd = [nix, *NIX_EXPERIMENTAL, "flake", "lock", _flake_ref(project)]
     result = subprocess.run(cmd, check=False)
     if result.returncode != 0:
         raise BuildError(f"nix flake lock failed (exit {result.returncode})")
@@ -99,7 +157,7 @@ def build(project: Project, specs: list[str]) -> list[tuple[str, Path]]:
 
     for attr in attrs:
         out_link = output_dir / attr
-        flake_ref = f"{project.root}#{attr}"
+        flake_ref = _flake_ref(project, attr)
         cmd = [
             nix,
             *NIX_EXPERIMENTAL,
@@ -108,7 +166,7 @@ def build(project: Project, specs: list[str]) -> list[tuple[str, Path]]:
             "--out-link",
             str(out_link),
         ]
-        print(f"[procton] building {attr}")
+        print(f"[rigx] building {attr}")
         result = subprocess.run(cmd, check=False)
         if result.returncode != 0:
             raise BuildError(f"nix build {attr} failed (exit {result.returncode})")

@@ -1,4 +1,4 @@
-"""Parse procton.toml into typed dataclasses."""
+"""Parse rigx.toml into typed dataclasses."""
 
 from __future__ import annotations
 
@@ -6,7 +6,15 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-VALID_KINDS = {"executable", "static_library", "shared_library"}
+VALID_KINDS = {
+    "executable",
+    "static_library",
+    "shared_library",
+    "nim_executable",
+    "python_script",
+    "run",
+    "custom",
+}
 
 
 @dataclass
@@ -31,6 +39,7 @@ class Variant:
     cxxflags: list[str] = field(default_factory=list)
     defines: dict[str, str] = field(default_factory=dict)
     ldflags: list[str] = field(default_factory=list)
+    nim_flags: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -44,6 +53,17 @@ class Target:
     cxxflags: list[str] = field(default_factory=list)
     ldflags: list[str] = field(default_factory=list)
     defines: dict[str, str] = field(default_factory=dict)
+    nim_flags: list[str] = field(default_factory=list)
+    # Python (kind = "python_script")
+    python_version: str = "3.12"
+    python_project: str = "."
+    python_venv_hash: str | None = None
+    run: str | None = None                          # for kind = "run"
+    args: list[str] = field(default_factory=list)   # for kind = "run"
+    outputs: list[str] = field(default_factory=list)  # for kind = "run"
+    build_script: str | None = None                 # for kind = "custom"
+    install_script: str | None = None               # for kind = "custom"
+    native_build_inputs: list[str] = field(default_factory=list)  # nixpkgs attrs
     variants: dict[str, Variant] = field(default_factory=dict)
 
     def variant_names(self) -> list[str]:
@@ -65,9 +85,9 @@ class ConfigError(ValueError):
 
 
 def load(root: Path) -> Project:
-    toml_path = root / "procton.toml"
+    toml_path = root / "rigx.toml"
     if not toml_path.is_file():
-        raise ConfigError(f"no procton.toml found at {toml_path}")
+        raise ConfigError(f"no rigx.toml found at {toml_path}")
     with toml_path.open("rb") as f:
         data = tomllib.load(f)
 
@@ -122,6 +142,7 @@ def load(root: Path) -> Project:
                 cxxflags=list(vconf.get("cxxflags", [])),
                 defines=dict(vconf.get("defines", {})),
                 ldflags=list(vconf.get("ldflags", [])),
+                nim_flags=list(vconf.get("nim_flags", [])),
             )
 
         targets[tname] = Target(
@@ -134,6 +155,16 @@ def load(root: Path) -> Project:
             cxxflags=list(tconf.get("cxxflags", [])),
             ldflags=list(tconf.get("ldflags", [])),
             defines=dict(tconf.get("defines", {})),
+            nim_flags=list(tconf.get("nim_flags", [])),
+            python_version=str(tconf.get("python_version", "3.12")),
+            python_project=str(tconf.get("python_project", ".")),
+            python_venv_hash=tconf.get("python_venv_hash"),
+            run=tconf.get("run"),
+            args=list(tconf.get("args", [])),
+            outputs=list(tconf.get("outputs", [])),
+            build_script=tconf.get("build_script"),
+            install_script=tconf.get("install_script"),
+            native_build_inputs=list(tconf.get("native_build_inputs", [])),
             variants=variants,
         )
 
@@ -142,6 +173,28 @@ def load(root: Path) -> Project:
             if dep not in targets:
                 raise ConfigError(
                     f"target {tname}: internal dep '{dep}' is not a defined target"
+                )
+        if target.kind == "custom":
+            if not target.install_script:
+                raise ConfigError(
+                    f"target {tname}: kind='custom' requires 'install_script'"
+                )
+        if target.kind == "run":
+            if not target.run:
+                raise ConfigError(f"target {tname}: kind='run' requires 'run = <name>'")
+            # If `run` matches an internal target, require it to be runnable.
+            # Otherwise, treat `run` as a bare command name resolved via PATH
+            # (supplied by deps.nixpkgs / deps.git).
+            if target.run in targets:
+                runnable_kinds = {"executable", "nim_executable"}
+                if targets[target.run].kind not in runnable_kinds:
+                    raise ConfigError(
+                        f"target {tname}: run target '{target.run}' must be one of "
+                        f"{sorted(runnable_kinds)}, got {targets[target.run].kind!r}"
+                    )
+            if not target.outputs:
+                raise ConfigError(
+                    f"target {tname}: kind='run' requires 'outputs' (files to capture)"
                 )
 
     return Project(

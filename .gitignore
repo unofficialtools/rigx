@@ -11,7 +11,7 @@ dist/
 .venv/
 venv/
 
-# procton-generated (in any subproject)
+# rigx-generated (in any subproject)
 **/flake.nix
 **/output/
 result
