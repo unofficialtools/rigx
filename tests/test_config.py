@@ -165,6 +165,23 @@ class LoadTargetKinds(unittest.TestCase):
         self.assertEqual(r.args, ["--a", "1"])
         self.assertEqual(r.outputs, ["out.txt"])
 
+    def test_script_target(self):
+        body = """
+            [project]
+            name = "p"
+
+            [targets.publish]
+            kind = "script"
+            deps.nixpkgs = ["uv"]
+            script = "uv build && uv publish"
+        """
+        with TempProject(body) as root:
+            proj = config.load(root)
+        s = proj.targets["publish"]
+        self.assertEqual(s.kind, "script")
+        self.assertEqual(s.deps.nixpkgs, ["uv"])
+        self.assertIn("uv publish", s.script)
+
     def test_custom_target(self):
         body = """
             [project]
@@ -314,6 +331,17 @@ class ValidationErrors(unittest.TestCase):
         """
         with TempProject(body) as root:
             with self.assertRaisesRegex(ConfigError, "must be one of"):
+                config.load(root)
+
+    def test_script_missing_script_field(self):
+        body = """
+            [project]
+            name = "p"
+            [targets.x]
+            kind = "script"
+        """
+        with TempProject(body) as root:
+            with self.assertRaisesRegex(ConfigError, "requires 'script'"):
                 config.load(root)
 
     def test_custom_missing_install_script(self):

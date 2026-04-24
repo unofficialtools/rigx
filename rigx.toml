@@ -1,0 +1,34 @@
+[project]
+name = "rigx"
+version = "0.1.0"
+
+[nixpkgs]
+ref = "nixos-24.11"
+
+# `rigx build publish` — builds sdist + wheel with uv, then uploads to PyPI.
+#
+# Requires a PyPI publish token in the environment, for example:
+#   export UV_PUBLISH_TOKEN="pypi-..."
+# (or UV_PUBLISH_USERNAME/UV_PUBLISH_PASSWORD for a classic account token).
+#
+# This runs host-side via `nix shell` with the pinned nixpkgs `uv` — not
+# inside a sandbox — because publishing is a side-effecting network action.
+[targets.publish]
+kind = "script"
+deps.nixpkgs = ["uv"]
+script = """
+rm -rf dist
+uv build
+uv publish
+"""
+
+# Build artifacts only (reproducible; no upload). Useful for smoke-testing
+# a release without touching PyPI.
+[targets.dist]
+kind = "script"
+deps.nixpkgs = ["uv"]
+script = """
+rm -rf dist
+uv build
+ls -la dist
+"""

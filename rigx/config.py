@@ -14,6 +14,7 @@ VALID_KINDS = {
     "python_script",
     "run",
     "custom",
+    "script",
 }
 
 
@@ -64,6 +65,7 @@ class Target:
     build_script: str | None = None                 # for kind = "custom"
     install_script: str | None = None               # for kind = "custom"
     native_build_inputs: list[str] = field(default_factory=list)  # nixpkgs attrs
+    script: str | None = None                       # for kind = "script"
     variants: dict[str, Variant] = field(default_factory=dict)
 
     def variant_names(self) -> list[str]:
@@ -165,6 +167,7 @@ def load(root: Path) -> Project:
             build_script=tconf.get("build_script"),
             install_script=tconf.get("install_script"),
             native_build_inputs=list(tconf.get("native_build_inputs", [])),
+            script=tconf.get("script"),
             variants=variants,
         )
 
@@ -178,6 +181,11 @@ def load(root: Path) -> Project:
             if not target.install_script:
                 raise ConfigError(
                     f"target {tname}: kind='custom' requires 'install_script'"
+                )
+        if target.kind == "script":
+            if not target.script:
+                raise ConfigError(
+                    f"target {tname}: kind='script' requires 'script'"
                 )
         if target.kind == "run":
             if not target.run:

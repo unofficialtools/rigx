@@ -289,6 +289,17 @@ class GenerateCustom(unittest.TestCase):
         self.assertIn("nativeBuildInputs = [ pkgs.makeWrapper ]", out)
 
 
+class GenerateScript(unittest.TestCase):
+    def test_script_kind_is_omitted_from_flake(self):
+        script_target = Target(name="publish", kind="script", script="uv publish")
+        exe = Target(name="app", kind="executable", sources=["m.cpp"])
+        out = nix_gen.generate(_project(targets={"publish": script_target, "app": exe}))
+        self.assertIn("app =", out)
+        # The script target has no Nix derivation emitted.
+        self.assertNotIn("publish =", out)
+        self.assertNotIn('pname = "publish"', out)
+
+
 class GenerateGitDeps(unittest.TestCase):
     def test_git_input_becomes_flake_input(self):
         dep = GitDep(name="mylib", url="https://example/mylib", rev="main")

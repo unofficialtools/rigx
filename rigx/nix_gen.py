@@ -502,6 +502,9 @@ def generate(project: Project) -> str:
     w("        in rec {")
 
     for tname, target in project.targets.items():
+        # `script` targets are host-side tasks; they don't become Nix derivations.
+        if target.kind == "script":
+            continue
         block = _target_block(target, project)
         w(_indent(block, 10))
 

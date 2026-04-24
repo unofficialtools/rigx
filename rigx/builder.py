@@ -129,9 +129,16 @@ def _resolve_attr(project: Project, spec: str) -> str:
 
 
 def _all_attrs(project: Project) -> list[str]:
-    """Every build attribute (targets with variants expand to one per variant)."""
+    """Every build attribute (targets with variants expand to one per variant).
+
+    `script`-kind targets are excluded so `rigx build` with no arguments does
+    not inadvertently run side-effecting tasks (publish, deploy, etc.). Run
+    them explicitly with `rigx build <name>`.
+    """
     attrs: list[str] = []
     for name, target in project.targets.items():
+        if target.kind == "script":
+            continue
         if not target.variants:
             attrs.append(name)
         else:
@@ -140,22 +147,76 @@ def _all_attrs(project: Project) -> list[str]:
     return attrs
 
 
-def build(project: Project, specs: list[str]) -> list[tuple[str, Path]]:
-    """Build the given target specs (empty list = all). Returns (attr, out_link)."""
-    write_flake(project)
+def run_script_target(project: Project, target) -> int:
+    """Execute a `kind = "script"` target via `nix shell` on the host.
 
+    Tools listed in `deps.nixpkgs` are brought onto PATH from the project's
+    pinned nixpkgs. Runs in the project root; no sandbox. The target's script
+    is passed to `bash -eo pipefail`.
+    """
+    assert target.script is not None
+    nix = _nix_bin()
+    refs = [
+        f"nixpkgs/{project.nixpkgs_ref}#{pkg}"
+        for pkg in target.deps.nixpkgs
+    ]
+    cmd = [
+        nix,
+        *NIX_EXPERIMENTAL,
+        "shell",
+        *refs,
+        "--command",
+        "bash",
+        "-eo",
+        "pipefail",
+        "-c",
+        target.script,
+    ]
+    result = subprocess.run(cmd, cwd=project.root, check=False)
+    return result.returncode
+
+
+def build(project: Project, specs: list[str]) -> list[tuple[str, Path]]:
+    """Build the given target specs (empty list = all). Returns (attr, out_link).
+
+    `script`-kind targets are dispatched to `run_script_target` and produce no
+    output symlink (they run host-side). They're included only when named
+    explicitly in `specs`; `rigx build` with no args skips them.
+    """
     if specs:
         attrs = [_resolve_attr(project, s) for s in specs]
     else:
         attrs = _all_attrs(project)
 
+    # Split into Nix-derivation attrs and host-side script targets.
+    script_targets = [
+        project.targets[a] for a in attrs if a in project.targets
+        and project.targets[a].kind == "script"
+    ]
+    nix_attrs = [
+        a for a in attrs if not (
+            a in project.targets and project.targets[a].kind == "script"
+        )
+    ]
+
+    # Run host-side scripts first (no Nix build needed).
+    for t in script_targets:
+        print(f"[rigx] running script target {t.name}")
+        rc = run_script_target(project, t)
+        if rc != 0:
+            raise BuildError(f"script target {t.name!r} failed (exit {rc})")
+
+    if not nix_attrs:
+        return []
+
+    write_flake(project)
     output_dir = _output_dir(project)
     output_dir.mkdir(exist_ok=True)
 
     nix = _nix_bin()
     results: list[tuple[str, Path]] = []
 
-    for attr in attrs:
+    for attr in nix_attrs:
         out_link = output_dir / attr
         flake_ref = _flake_ref(project, attr)
         cmd = [

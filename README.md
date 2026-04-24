@@ -356,6 +356,39 @@ cp hello_go $out/bin/
 - Literal `${` inside a script must be written as `''${` (Nix indented-string
   escape) because `${var}` is interpreted by Nix.
 
+### `script` — host-side task (publish, deploy, release)
+
+```toml
+[targets.publish]
+kind         = "script"
+deps.nixpkgs = ["uv"]
+script = """
+rm -rf dist
+uv build
+uv publish
+"""
+```
+
+Unlike every other kind, a `script` target **runs on the host**, not inside
+a Nix build sandbox. It executes via `nix shell nixpkgs/<pinned-ref>#<deps> --
+command bash -eo pipefail -c "<script>"` in the project root.
+
+- Intended for side-effecting tasks: publishing, deploying, pushing images,
+  running end-to-end tests against real systems.
+- `deps.nixpkgs` tools come from the project's pinned nixpkgs, so the
+  environment is still reproducible even though the script is not sandboxed.
+- **Excluded from `rigx build`** (the no-arg form) so you don't
+  accidentally publish when building everything. Run them explicitly:
+  `rigx build publish`.
+- Produces no `output/<target>` symlink — side effects happen in place.
+- Variants, `$out`, and the Nix store are not available — the script runs as
+  a plain bash `-eo pipefail` block in your current shell environment (with
+  tools on PATH, `$HOME`, etc.).
+
+Credentials needed by the script (`UV_PUBLISH_TOKEN`, cloud CLI creds, SSH
+keys, …) are read from your shell environment — set them before invoking
+`rigx build <target>`.
+
 ---
 
 ## Complete example (matches `example-project/rigx.toml`)

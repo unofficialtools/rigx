@@ -78,6 +78,15 @@ class AllAttrs(unittest.TestCase):
         # alias is reachable, but _all_attrs emits the concrete variants.
         self.assertNotIn("variadic", attrs)
 
+    def test_script_targets_excluded_from_build_all(self):
+        proj = _project_with(
+            hello=Target(name="hello", kind="executable", sources=["m.cpp"]),
+            publish=Target(name="publish", kind="script", script="uv publish"),
+        )
+        attrs = builder._all_attrs(proj)
+        self.assertIn("hello", attrs)
+        self.assertNotIn("publish", attrs)
+
 
 class NixMissing(unittest.TestCase):
     def test_raises_specific_error_with_instructions(self):
