@@ -121,6 +121,7 @@ rigx build hello          # build one target
 rigx build hello@release  # build a specific variant
 rigx flake                # print generated flake.nix (for debugging)
 rigx clean                # remove output/
+rigx run publish          # execute a script-kind target (publish/deploy/etc.)
 rigx uv lock              # run uv (from pinned nixpkgs) — e.g. to refresh uv.lock
 ```
 
@@ -373,13 +374,19 @@ Unlike every other kind, a `script` target **runs on the host**, not inside
 a Nix build sandbox. It executes via `nix shell nixpkgs/<pinned-ref>#<deps> --
 command bash -eo pipefail -c "<script>"` in the project root.
 
+**Invoke with `rigx run`, not `rigx build`:**
+```
+rigx run publish
+```
+Script targets produce no artifact and therefore aren't buildable. If you name
+one in `rigx build`, you'll get an error pointing at `rigx run`.
+
 - Intended for side-effecting tasks: publishing, deploying, pushing images,
   running end-to-end tests against real systems.
 - `deps.nixpkgs` tools come from the project's pinned nixpkgs, so the
   environment is still reproducible even though the script is not sandboxed.
-- **Excluded from `rigx build`** (the no-arg form) so you don't
-  accidentally publish when building everything. Run them explicitly:
-  `rigx build publish`.
+- Excluded from `rigx build` entirely — they're listed by `rigx list` for
+  discoverability but only runnable via `rigx run`.
 - Produces no `output/<target>` symlink — side effects happen in place.
 - Variants, `$out`, and the Nix store are not available — the script runs as
   a plain bash `-eo pipefail` block in your current shell environment (with
@@ -387,7 +394,7 @@ command bash -eo pipefail -c "<script>"` in the project root.
 
 Credentials needed by the script (`UV_PUBLISH_TOKEN`, cloud CLI creds, SSH
 keys, …) are read from your shell environment — set them before invoking
-`rigx build <target>`.
+`rigx run <target>`.
 
 ---
 

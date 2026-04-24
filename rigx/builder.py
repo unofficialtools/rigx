@@ -176,37 +176,45 @@ def run_script_target(project: Project, target) -> int:
     return result.returncode
 
 
+def run_named_script(project: Project, name: str) -> None:
+    """CLI helper: look up a script target by name and execute it."""
+    if name not in project.targets:
+        raise BuildError(f"no such target: {name}")
+    target = project.targets[name]
+    if target.kind != "script":
+        raise BuildError(
+            f"target {name!r} (kind={target.kind!r}) is not a script target; "
+            f"use `rigx build {name}` instead"
+        )
+    print(f"[rigx] running {name}")
+    rc = run_script_target(project, target)
+    if rc != 0:
+        raise BuildError(f"script target {name!r} failed (exit {rc})")
+
+
 def build(project: Project, specs: list[str]) -> list[tuple[str, Path]]:
     """Build the given target specs (empty list = all). Returns (attr, out_link).
 
-    `script`-kind targets are dispatched to `run_script_target` and produce no
-    output symlink (they run host-side). They're included only when named
-    explicitly in `specs`; `rigx build` with no args skips them.
+    `script`-kind targets are NOT buildable — they produce no artifact. Name a
+    script here and you'll get an error pointing at `rigx run`. `rigx build`
+    with no args skips them (see `_all_attrs`).
     """
     if specs:
+        for spec in specs:
+            name = spec.split("@", 1)[0]
+            if (
+                name in project.targets
+                and project.targets[name].kind == "script"
+            ):
+                raise BuildError(
+                    f"target {name!r} is a script target (produces no artifact); "
+                    f"use `rigx run {name}` instead"
+                )
         attrs = [_resolve_attr(project, s) for s in specs]
     else:
         attrs = _all_attrs(project)
 
-    # Split into Nix-derivation attrs and host-side script targets.
-    script_targets = [
-        project.targets[a] for a in attrs if a in project.targets
-        and project.targets[a].kind == "script"
-    ]
-    nix_attrs = [
-        a for a in attrs if not (
-            a in project.targets and project.targets[a].kind == "script"
-        )
-    ]
-
-    # Run host-side scripts first (no Nix build needed).
-    for t in script_targets:
-        print(f"[rigx] running script target {t.name}")
-        rc = run_script_target(project, t)
-        if rc != 0:
-            raise BuildError(f"script target {t.name!r} failed (exit {rc})")
-
-    if not nix_attrs:
+    if not attrs:
         return []
 
     write_flake(project)
@@ -216,7 +224,7 @@ def build(project: Project, specs: list[str]) -> list[tuple[str, Path]]:
     nix = _nix_bin()
     results: list[tuple[str, Path]] = []
 
-    for attr in nix_attrs:
+    for attr in attrs:
         out_link = output_dir / attr
         flake_ref = _flake_ref(project, attr)
         cmd = [

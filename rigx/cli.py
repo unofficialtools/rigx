@@ -80,6 +80,17 @@ def cmd_flake(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_run(args: argparse.Namespace) -> int:
+    """Execute a script-kind target (e.g. publish, deploy)."""
+    project = _load(args)
+    try:
+        builder.run_named_script(project, args.target)
+    except builder.BuildError as e:
+        _report_build_error(e)
+        return 1
+    return 0
+
+
 def cmd_uv(args: argparse.Namespace) -> int:
     """Run uv via the project's pinned nixpkgs (no host uv install needed)."""
     project = _load(args)
@@ -115,6 +126,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("flake", help="print the generated flake.nix")
     sp.set_defaults(func=cmd_flake)
+
+    sp = sub.add_parser(
+        "run",
+        help="execute a script-kind target (e.g. `rigx run publish`)",
+    )
+    sp.add_argument("target", help="script target name")
+    sp.set_defaults(func=cmd_run)
 
     sp = sub.add_parser(
         "uv",

@@ -1,4 +1,4 @@
-[project]
+22[project]
 name = "rigx"
 version = "0.1.0"
 
@@ -16,19 +16,11 @@ ref = "nixos-24.11"
 [targets.publish]
 kind = "script"
 deps.nixpkgs = ["uv"]
-script = """
-rm -rf dist
-uv build
-uv publish
-"""
+script = "rm -rf dist && git push origin --delete remoteBranchName"
 
 # Build artifacts only (reproducible; no upload). Useful for smoke-testing
 # a release without touching PyPI.
 [targets.dist]
 kind = "script"
 deps.nixpkgs = ["uv"]
-script = """
-rm -rf dist
-uv build
-ls -la dist
-"""
+script = "rm -rf dist && git push origin --delete remoteBranchName"

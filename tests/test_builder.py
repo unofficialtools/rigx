@@ -102,6 +102,29 @@ class NixMissing(unittest.TestCase):
         self.assertTrue(issubclass(NixNotFoundError, BuildError))
 
 
+class RunNamedScript(unittest.TestCase):
+    def test_rejects_unknown_target(self):
+        proj = _project_with()
+        with self.assertRaisesRegex(BuildError, "no such target"):
+            builder.run_named_script(proj, "missing")
+
+    def test_rejects_non_script_target(self):
+        proj = _project_with(
+            hello=Target(name="hello", kind="executable", sources=["m.cpp"]),
+        )
+        with self.assertRaisesRegex(BuildError, "is not a script target"):
+            builder.run_named_script(proj, "hello")
+
+
+class BuildRejectsScript(unittest.TestCase):
+    def test_build_points_at_rigx_run(self):
+        proj = _project_with(
+            publish=Target(name="publish", kind="script", script="echo"),
+        )
+        with self.assertRaisesRegex(BuildError, "use `rigx run publish`"):
+            builder.build(proj, ["publish"])
+
+
 class FlakeRef(unittest.TestCase):
     def test_shape(self):
         proj = _project_with()
