@@ -2,6 +2,11 @@
 
 <p align="center"><img src="rigx.png" alt="rigx logo" width="320"></p>
 
+> ⚠️ **Status: first release, experimental.** This is the initial version
+> (`0.1.0`). APIs, the `rigx.toml` schema, and CLI behavior may change without
+> notice. Use it, report issues, but don't rely on it for production builds
+> yet.
+
 A Nix-backed declarative minimalistic build system for human beings. Targets are described in `rigx.toml`. rigx generates a Nix flake, which drives sandboxed builds entirely through the Nix store. Build artifacts materialize only as symlinks under `output/`. No Nix knowledge or NixOS required, just Nix installed.
 
 ## Features

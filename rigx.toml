@@ -32,3 +32,93 @@ rm -rf dist
 uv build --sdist --wheel
 uv publish
 """
+
+# `rigx run nixpkgs-stage` — generate a nixpkgs-style package.nix into
+# ./nixpkgs-pkg/ so you can drop it into a nixos/nixpkgs fork and open a PR.
+#
+# Prerequisites (do these once per release):
+#   1. Bump version in pyproject.toml
+#   2. git tag v$VERSION && git push origin v$VERSION
+#   3. (optional) rigx run publish   # push to PyPI
+#
+# This target does NOT open a PR — it only prepares the derivation file and
+# prints the next steps. Submitting to nixpkgs is a human-reviewed process.
+[targets.nixpkgs-stage]
+kind = "script"
+deps.nixpkgs = ["nix", "coreutils", "gnused", "jq"]
+script = """
+set -euo pipefail
+
+VERSION=$(sed -nE 's/^version = "(.*)"$/\\1/p' pyproject.toml | head -1)
+if [ -z "$VERSION" ]; then
+  echo "error: could not read version from pyproject.toml" >&2
+  exit 1
+fi
+echo "[rigx] staging nixpkgs derivation for rigx v$VERSION"
+echo "[rigx] prefetching github:unofficialtools/rigx/v$VERSION ..."
+
+HASH=$(nix --extra-experimental-features "nix-command flakes" \\
+  flake prefetch --json "github:unofficialtools/rigx/v$VERSION" \\
+  | jq -r .hash)
+echo "[rigx] source hash: $HASH"
+
+mkdir -p nixpkgs-pkg
+cat > nixpkgs-pkg/package.nix <<'NIX_EOF'
+{
+  lib,
+  python3Packages,
+  fetchFromGitHub,
+  nix,
+}:
+
+python3Packages.buildPythonApplication rec {
+  pname = "rigx";
+  version = "__VERSION__";
+  pyproject = true;
+
+  src = fetchFromGitHub {
+    owner = "unofficialtools";
+    repo = "rigx";
+    tag = "v${version}";
+    hash = "__HASH__";
+  };
+
+  build-system = with python3Packages; [ setuptools ];
+
+  # rigx shells out to `nix` at runtime — make sure it is on PATH.
+  makeWrapperArgs = [
+    "--prefix" "PATH" ":" (lib.makeBinPath [ nix ])
+  ];
+
+  meta = with lib; {
+    description = "A Nix-backed declarative minimalistic build system";
+    homepage = "https://github.com/unofficialtools/rigx";
+    license = licenses.bsd2;
+    mainProgram = "rigx";
+    # maintainers = with maintainers; [ your-nixpkgs-handle ];
+  };
+}
+NIX_EOF
+
+sed -i "s|__VERSION__|$VERSION|g; s|__HASH__|$HASH|g" nixpkgs-pkg/package.nix
+
+echo
+echo "==================================================================="
+echo "Staged: $PWD/nixpkgs-pkg/package.nix"
+echo "-------------------------------------------------------------------"
+cat nixpkgs-pkg/package.nix
+echo "-------------------------------------------------------------------"
+echo
+echo "Next steps to submit to nixpkgs:"
+echo "  gh repo fork nixos/nixpkgs --clone --remote"
+echo "  cd nixpkgs"
+echo "  mkdir -p pkgs/by-name/ri/rigx"
+echo "  cp \\"$OLDPWD/nixpkgs-pkg/package.nix\\" pkgs/by-name/ri/rigx/"
+echo "  nix build .#rigx          # sanity-check the build"
+echo "  git checkout -b rigx-init-v$VERSION"
+echo "  git add pkgs/by-name/ri/rigx/package.nix"
+echo "  git commit -m 'rigx: init at $VERSION'"
+echo "  git push -u origin rigx-init-v$VERSION"
+echo "  gh pr create --fill"
+echo "==================================================================="
+"""

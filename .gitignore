@@ -15,6 +15,7 @@ venv/
 **/flake.nix
 **/output/
 result
+nixpkgs-pkg/
 
 # Nix
 .direnv/
