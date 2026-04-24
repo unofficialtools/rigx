@@ -16,7 +16,11 @@ ref = "nixos-24.11"
 [targets.publish]
 kind = "script"
 deps.nixpkgs = ["uv"]
-script = "rm -rf dist && git push origin --delete remoteBranchName"
+script = """
+rm -rf dist
+uv build
+uv publish
+"""
 
 # Build artifacts only (reproducible; no upload). Useful for smoke-testing
 # a release without touching PyPI.
@@ -26,5 +30,5 @@ deps.nixpkgs = ["uv"]
 script = """
 rm -rf dist
 uv build --sdist --wheel
-uv run --extra manage python -m twine upload dist/*
+uv publish
 """
