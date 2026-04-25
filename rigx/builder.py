@@ -370,18 +370,23 @@ def _expand_build_spec(project: Project, spec: str) -> list[str]:
                 f"(script/test)"
             )
         return attrs
-    name = base
+    # Canonicalize for the lookup — `project.targets` keys are stored in the
+    # underscore form, but the user might have typed dashes. (Without this,
+    # the test/script rejection silently misses dash-named targets and the
+    # build proceeds to `nix build .#a_b`, which fails for non-buildable
+    # kinds with a confusing "attribute … not provided" error.)
+    name = canonicalize_qualified(base)
     tgt_kind = (
         project.targets[name].kind if name in project.targets else None
     )
     if tgt_kind == "test":
         raise BuildError(
-            f"target {name!r} is a test target; use `rigx test {name}` instead"
+            f"target {base!r} is a test target; use `rigx test {base}` instead"
         )
     if tgt_kind == "script":
         raise BuildError(
-            f"target {name!r} is a script target (produces no artifact); "
-            f"use `rigx run {name}` instead"
+            f"target {base!r} is a script target (produces no artifact); "
+            f"use `rigx run {base}` instead"
         )
     return [_resolve_attr(project, spec)]
 

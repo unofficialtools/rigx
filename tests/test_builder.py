@@ -327,6 +327,17 @@ class DashNamedTargets(unittest.TestCase):
         attrs = sorted(builder._expand_build_spec(proj, "actarus-*"))
         self.assertEqual(attrs, ["actarus_helper", "actarus_test_runner"])
 
+    def test_dashed_test_target_rejected_with_pointer_to_rigx_test(self):
+        # Regression: when the canonical form was stored but the kind-check
+        # used the raw user input, dashed test/script targets bypassed
+        # rejection and `rigx build a-b` got a confusing nix-build error.
+        proj = _project_with(**{
+            "a_b": Target(name="a_b", kind="test", script="exit 0"),
+        })
+        for spelling in ("a-b", "a_b"):
+            with self.assertRaisesRegex(BuildError, "is a test target"):
+                builder._expand_build_spec(proj, spelling)
+
     def test_dashed_test_filter_matches_canonical(self):
         from rigx.config import Variant  # noqa
         proj = Project(
