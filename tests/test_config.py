@@ -482,5 +482,115 @@ class VarsExpansion(unittest.TestCase):
                 config.load(root)
 
 
+class SourceGlobs(unittest.TestCase):
+    def test_star_glob_expands_to_sorted_files(self):
+        body = """
+            [project]
+            name = "p"
+
+            [targets.app]
+            kind = "executable"
+            sources = ["src/*.cpp"]
+        """
+        with TempProject(body) as root:
+            (root / "src").mkdir()
+            (root / "src" / "b.cpp").write_text("")
+            (root / "src" / "a.cpp").write_text("")
+            (root / "src" / "z.h").write_text("")  # excluded by extension
+            proj = config.load(root)
+        self.assertEqual(
+            proj.targets["app"].sources, ["src/a.cpp", "src/b.cpp"]
+        )
+
+    def test_doublestar_glob_recurses(self):
+        body = """
+            [project]
+            name = "p"
+
+            [targets.app]
+            kind = "executable"
+            sources = ["src/**/*.cpp"]
+        """
+        with TempProject(body) as root:
+            (root / "src" / "deep" / "nested").mkdir(parents=True)
+            (root / "src" / "top.cpp").write_text("")
+            (root / "src" / "deep" / "mid.cpp").write_text("")
+            (root / "src" / "deep" / "nested" / "leaf.cpp").write_text("")
+            proj = config.load(root)
+        self.assertEqual(
+            proj.targets["app"].sources,
+            ["src/deep/mid.cpp", "src/deep/nested/leaf.cpp", "src/top.cpp"],
+        )
+
+    def test_literal_path_passes_through_unchanged(self):
+        body = """
+            [project]
+            name = "p"
+
+            [targets.app]
+            kind = "executable"
+            sources = ["src/main.cpp"]
+        """
+        with TempProject(body) as root:
+            # File not required to exist — literals are not validated here.
+            proj = config.load(root)
+        self.assertEqual(proj.targets["app"].sources, ["src/main.cpp"])
+
+    def test_literal_entry_point_kept_before_glob_results(self):
+        body = """
+            [project]
+            name = "p"
+
+            [targets.app]
+            kind = "executable"
+            sources = ["src/main.cpp", "src/lib/*.cpp"]
+        """
+        with TempProject(body) as root:
+            (root / "src" / "lib").mkdir(parents=True)
+            (root / "src" / "main.cpp").write_text("")
+            (root / "src" / "lib" / "a.cpp").write_text("")
+            (root / "src" / "lib" / "b.cpp").write_text("")
+            proj = config.load(root)
+        self.assertEqual(
+            proj.targets["app"].sources,
+            ["src/main.cpp", "src/lib/a.cpp", "src/lib/b.cpp"],
+        )
+
+    def test_zero_match_glob_raises(self):
+        body = """
+            [project]
+            name = "p"
+
+            [targets.app]
+            kind = "executable"
+            sources = ["src/*.cpp"]
+        """
+        with TempProject(body) as root:
+            (root / "src").mkdir()
+            with self.assertRaisesRegex(ConfigError, "matched no files"):
+                config.load(root)
+
+    def test_glob_inside_var(self):
+        body = """
+            [project]
+            name = "p"
+
+            [vars]
+            cxx_srcs = ["src/**/*.cpp"]
+
+            [targets.app]
+            kind = "executable"
+            sources = ["$vars.cxx_srcs"]
+        """
+        with TempProject(body) as root:
+            (root / "src" / "sub").mkdir(parents=True)
+            (root / "src" / "a.cpp").write_text("")
+            (root / "src" / "sub" / "b.cpp").write_text("")
+            proj = config.load(root)
+        self.assertEqual(
+            proj.targets["app"].sources, ["src/a.cpp", "src/sub/b.cpp"]
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

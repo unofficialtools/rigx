@@ -138,6 +138,29 @@ def _expand_list(items, vars: dict[str, list[str]], ctx: str) -> list[str]:
     return out
 
 
+def _expand_globs(items: list[str], root: Path, ctx: str) -> list[str]:
+    """Resolve glob patterns (`*`, `**`, `?`, `[…]`) in a path list against
+    `root`. Non-glob entries pass through verbatim; glob entries are replaced
+    by their sorted matches. A glob that matches no files is a config error —
+    silent zero-match globs hide typos and produce empty derivations."""
+    out: list[str] = []
+    for item in items:
+        if not any(c in item for c in "*?["):
+            out.append(item)
+            continue
+        # Path.glob handles `**` natively. Sort for deterministic Nix derivation
+        # hashes and stable build commands.
+        matches = sorted(
+            p.relative_to(root).as_posix()
+            for p in root.glob(item)
+            if p.is_file()
+        )
+        if not matches:
+            raise ConfigError(f"{ctx}: glob {item!r} matched no files under {root}")
+        out.extend(matches)
+    return out
+
+
 def load(root: Path) -> Project:
     toml_path = root / "rigx.toml"
     if not toml_path.is_file():
@@ -209,10 +232,15 @@ def load(root: Path) -> Project:
             )
 
         tctx = f"target {tname}"
+        sources = _expand_globs(
+            _expand_list(tconf.get("sources", []), vars_table, f"{tctx}.sources"),
+            root,
+            f"{tctx}.sources",
+        )
         targets[tname] = Target(
             name=tname,
             kind=kind,
-            sources=_expand_list(tconf.get("sources", []), vars_table, f"{tctx}.sources"),
+            sources=sources,
             includes=_expand_list(tconf.get("includes", []), vars_table, f"{tctx}.includes"),
             public_headers=_expand_list(
                 tconf.get("public_headers", []), vars_table, f"{tctx}.public_headers"

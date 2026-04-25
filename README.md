@@ -165,13 +165,25 @@ attr  = "default"            # attribute inside packages.${system} (default "def
 
 ## Targets
 
-Every target lives under `[targets.<name>]` and has a `kind`. Fields common
-to several kinds:
+Every target lives under `[targets.<name>]` and has a `kind`.
+
+**Source globs.** Entries in `sources` may use `*`, `**`, `?`, and `[…]`
+patterns (Python `Path.glob` semantics). Globs are resolved against the
+project root at config-load time, results are sorted for deterministic Nix
+hashes, and a glob that matches no files is a config error. Literal entries
+pass through unchanged, so you can mix them — useful when a kind treats
+`sources[0]` as the entry point:
+
+```toml
+sources = ["src/main.cpp", "src/lib/**/*.cpp"]   # main.cpp stays first
+```
+
+Fields common to several kinds:
 
 | Field                  | Type            | Purpose                                          |
 |------------------------|-----------------|--------------------------------------------------|
 | `kind`                 | string          | One of the kinds listed below. **Required.**     |
-| `sources`              | list[string]    | Source files, paths relative to project root.    |
+| `sources`              | list[string]    | Source files (paths or globs, relative to root). |
 | `includes`             | list[string]    | Header / include search paths.                   |
 | `cxxflags`             | list[string]    | Compiler flags (C/C++).                          |
 | `ldflags`              | list[string]    | Linker flags (C/C++).                            |
