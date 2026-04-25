@@ -630,6 +630,80 @@ keys, …) are read from your shell environment — set them before invoking
 
 ---
 
+## Cross-compilation
+
+rigx doesn't have a first-class `target = "aarch64-linux"` field yet, but
+cross-compiling to a different CPU/OS works cleanly through `kind = "custom"`
+plus **`zig cc`** as the compiler. Zig ships with clang and a portable libc
+layer, so a single `pkgs.zig` covers every platform Zig supports — no
+separate cross-gcc toolchain to install.
+
+### C → aarch64-linux
+
+```toml
+[targets.hello_c_arm64]
+kind         = "custom"
+deps.nixpkgs = ["zig"]
+build_script = """
+export HOME=$TMPDIR
+zig cc -target aarch64-linux-musl -O2 -o hello_c_arm64 src/hello.c
+"""
+install_script = """
+mkdir -p $out/bin
+cp hello_c_arm64 $out/bin/
+"""
+```
+
+```
+rigx build hello_c_arm64
+file ./output/hello_c_arm64/bin/hello_c_arm64
+# → ELF 64-bit LSB executable, ARM aarch64, statically linked, …
+```
+
+### Nim → aarch64-linux
+
+Nim invokes a C compiler under the hood. Wrap `zig cc` in a tiny shim and
+point Nim at it via `--clang.exe` / `--clang.linkerexe`. Recipe adapted from
+[the nim_zigcc guide](https://codeberg.org/janAkali/nim_zigcc_guide):
+
+```toml
+[targets.hello_nim_arm64]
+kind         = "custom"
+deps.nixpkgs = ["nim", "zig"]
+build_script = """
+export HOME=$TMPDIR
+mkdir -p $TMPDIR/bin
+cat > $TMPDIR/bin/zigcc <<'SH'
+#!/usr/bin/env bash
+exec zig cc -target aarch64-linux-musl "$@"
+SH
+chmod +x $TMPDIR/bin/zigcc
+
+nim c \\
+  --cc:clang \\
+  --clang.exe:$TMPDIR/bin/zigcc \\
+  --clang.linkerexe:$TMPDIR/bin/zigcc \\
+  --cpu:arm64 \\
+  --os:linux \\
+  -d:release \\
+  --nimcache:$TMPDIR/nimcache \\
+  --out:hello_nim_arm64 \\
+  src/hello.nim
+"""
+install_script = """
+mkdir -p $out/bin
+cp hello_nim_arm64 $out/bin/
+"""
+```
+
+To target a different platform, swap the `-target` triple — `zig cc -h` on
+the host lists everything Zig knows (Linux/macOS/Windows on
+x86_64/aarch64/armv7/riscv/…). For variants of the same target across
+platforms, factor the triple into `[vars]` and reference it from each
+build_script.
+
+---
+
 ## Inspecting the build graph
 
 `rigx graph <target>` prints a [Mermaid](https://mermaid.js.org/) `graph TD`
