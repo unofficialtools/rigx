@@ -7,7 +7,70 @@
 > notice. If you use it, please report issues, but don't rely on it
 > for production builds yet.
 
-A Nix-backed declarative minimalistic build system for human beings. Targets are described in `rigx.toml`. rigx generates a Nix flake, which drives sandboxed builds entirely through the Nix store. Build artifacts materialize only as symlinks under `output/`. No Nix knowledge or NixOS required, just Nix installed.
+A small build system for C, C++, Nim, and Python (and anything else you can
+script). You list your targets and their sources in `rigx.toml`, run
+`rigx build`, and get reproducible binaries — the compiler and every library
+come from a pinned snapshot, so the same command produces the same bytes on
+your laptop, your CI, and your colleague's machine. No `apt install`, no
+Docker, no version drift.
+
+Under the hood rigx writes a Nix flake and lets Nix do the work. You don't
+have to know any of that — install Nix once and forget about it.
+
+## A taste, if you've used Make or Bazel
+
+```make
+# Makefile
+CXX = g++
+CXXFLAGS = -std=c++17 -O2
+
+hello: src/main.cpp src/greet.cpp
+	$(CXX) $(CXXFLAGS) -o hello $^
+```
+
+```python
+# BUILD.bazel
+cc_binary(
+    name = "hello",
+    srcs = ["src/main.cpp", "src/greet.cpp"],
+    copts = ["-std=c++17", "-O2"],
+)
+```
+
+```toml
+# rigx.toml
+[project]
+name = "hello"
+
+[targets.hello]
+kind     = "executable"
+sources  = ["src/main.cpp", "src/greet.cpp"]
+cxxflags = ["-std=c++17", "-O2"]
+```
+
+```
+rigx build hello              # builds in a sandbox
+./output/hello/bin/hello      # run it
+```
+
+What's different:
+
+- You describe **what to build**, not the recipe — closer to Bazel's
+  `cc_binary` than Make's `$(CXX) ... $^` block. `kind = "executable"` tells
+  rigx how to compile a C++ program.
+- The compiler and any `deps.nixpkgs = ["fmt"]` libraries come from a pinned
+  `nixpkgs` — not your `$PATH` (Make) and not Bazel's host toolchain. First
+  build pulls them; later builds use the Nix store cache.
+- Outputs live in `/nix/store/...` and `output/hello` is a symlink to the
+  current build. `rigx clean` removes the symlink; the store entry persists
+  and gets reused next time.
+- No `.PHONY`, no `genrule` — for side-effecting tasks (publish, deploy, run
+  a script) use `kind = "script"` and `rigx run <name>`.
+- Need a different language? Set `kind = "nim_executable"`, `"python_script"`,
+  or use `"custom"` with your own build/install scripts (Go, Rust, etc.).
+- `rigx.toml` is pure data — no Starlark, no Make macros. Sharing values
+  across targets is `[vars]`; sharing across folders is `[modules]` or
+  `[dependencies.local.*]` (see below).
 
 ## Features
 
