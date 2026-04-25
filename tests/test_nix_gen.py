@@ -103,14 +103,15 @@ class EffectiveFlags(unittest.TestCase):
         self.assertIn("-d:X=1", out)
 
 
-def _project(name="p", targets=None, git_deps=None) -> Project:
+def _project(name="p", targets=None, git_deps=None, local_deps=None, root=None) -> Project:
     return Project(
         name=name,
         version="0.1.0",
         nixpkgs_ref="nixos-24.11",
         git_deps=git_deps or {},
         targets=targets or {},
-        root=Path("/tmp"),
+        root=root or Path("/tmp"),
+        local_deps=local_deps or {},
     )
 
 
@@ -318,6 +319,230 @@ class GenerateGitDeps(unittest.TestCase):
         self.assertIn("mylib.url = ", out)
         self.assertIn("mylib.flake = true", out)
         self.assertIn("inputs.mylib.packages.${system}.default", out)
+
+
+class GenerateLocalDeps(unittest.TestCase):
+    @staticmethod
+    def _sub(name="sub") -> Project:
+        return Project(
+            name=name,
+            version="0.1.0",
+            nixpkgs_ref="nixos-24.11",
+            git_deps={},
+            targets={
+                "app": Target(name="app", kind="executable", sources=["m.cpp"]),
+                "lib": Target(
+                    name="lib",
+                    kind="executable",
+                    sources=["m.cpp"],
+                    variants={
+                        "debug": Variant(name="debug"),
+                        "release": Variant(name="release"),
+                    },
+                ),
+            },
+            root=Path("/tmp/sub"),
+        )
+
+    def test_local_dep_becomes_path_flake_input(self):
+        from rigx.config import LocalDep
+        sub = self._sub()
+        ldep = LocalDep(name="sub", path=Path("/tmp/parent/sub"), sub_project=sub)
+        parent = _project(
+            name="parent",
+            root=Path("/tmp/parent"),
+            local_deps={"sub": ldep},
+            targets={
+                "bundle": Target(
+                    name="bundle",
+                    kind="custom",
+                    install_script="true",
+                    deps=TargetDeps(internal=["sub.app"]),
+                ),
+            },
+        )
+        out = nix_gen.generate(parent)
+        self.assertIn('sub.url = "path:./sub"', out)
+        self.assertIn("sub.flake = true", out)
+
+    def test_re_exports_all_subproject_attrs(self):
+        from rigx.config import LocalDep
+        sub = self._sub()
+        ldep = LocalDep(name="sub", path=Path("/tmp/parent/sub"), sub_project=sub)
+        parent = _project(
+            name="parent", root=Path("/tmp/parent"), local_deps={"sub": ldep},
+        )
+        out = nix_gen.generate(parent)
+        # Plain target → re-exported under sanitized name.
+        self.assertIn("sub_app = inputs.sub.packages.${system}.app;", out)
+        # Variant → re-exported with hyphenated sub-attr access.
+        self.assertIn(
+            "sub_lib_debug = inputs.sub.packages.${system}.lib-debug;", out
+        )
+        self.assertIn(
+            "sub_lib_release = inputs.sub.packages.${system}.lib-release;", out
+        )
+        # Unqualified alias also re-exported.
+        self.assertIn("sub_lib = inputs.sub.packages.${system}.lib;", out)
+
+    def test_dotted_dep_internal_renders_sanitized_id(self):
+        from rigx.config import LocalDep
+        sub = self._sub()
+        ldep = LocalDep(name="sub", path=Path("/tmp/parent/sub"), sub_project=sub)
+        parent = _project(
+            name="parent",
+            root=Path("/tmp/parent"),
+            local_deps={"sub": ldep},
+            targets={
+                "bundle": Target(
+                    name="bundle",
+                    kind="custom",
+                    install_script="cp ${sub.app}/bin/app $out/bin/app",
+                    deps=TargetDeps(internal=["sub.app"]),
+                ),
+            },
+        )
+        out = nix_gen.generate(parent)
+        # buildInputs uses the sanitized identifier.
+        self.assertIn("sub_app", out)
+        # The user's `${sub.app}` interpolation got rewritten to `${sub_app}`.
+        self.assertIn("${sub_app}/bin/app", out)
+        self.assertNotIn("${sub.app}", out)
+
+    def test_cross_flake_run_resolves_binary_path(self):
+        from rigx.config import LocalDep
+        sub = self._sub()
+        ldep = LocalDep(name="sub", path=Path("/tmp/parent/sub"), sub_project=sub)
+        parent = _project(
+            name="parent",
+            root=Path("/tmp/parent"),
+            local_deps={"sub": ldep},
+            targets={
+                "out_txt": Target(
+                    name="out_txt",
+                    kind="run",
+                    run="sub.app",
+                    args=["--out", "x.txt"],
+                    outputs=["x.txt"],
+                ),
+            },
+        )
+        out = nix_gen.generate(parent)
+        # Binary path uses sanitized id for the store-path interpolation,
+        # but the binary's basename is the *last segment* of the dotted ref.
+        self.assertIn("${sub_app}/bin/app", out)
+
+
+class InterpRewrite(unittest.TestCase):
+    def test_rewrites_known_local_dep(self):
+        from rigx.config import LocalDep
+        proj = _project(
+            local_deps={
+                "sub": LocalDep(name="sub", path=Path("/tmp/sub")),
+            },
+        )
+        self.assertEqual(
+            nix_gen._rewrite_interp("hi ${sub.app}/bin/x", proj),
+            "hi ${sub_app}/bin/x",
+        )
+
+    def test_leaves_unknown_dotted_alone(self):
+        # `pkgs.foo` is a Nix attr path the user wrote intentionally; we must
+        # not mangle it.
+        proj = _project()
+        self.assertEqual(
+            nix_gen._rewrite_interp("hi ${pkgs.foo}", proj),
+            "hi ${pkgs.foo}",
+        )
+
+    def test_handles_multiple_segments(self):
+        from rigx.config import LocalDep
+        proj = _project(
+            local_deps={
+                "sub": LocalDep(name="sub", path=Path("/tmp/sub")),
+            },
+        )
+        self.assertEqual(
+            nix_gen._rewrite_interp("${sub.deep.thing}", proj),
+            "${sub_deep_thing}",
+        )
+
+
+class GenerateModuleTargets(unittest.TestCase):
+    def test_namespaced_target_emits_sanitized_rec_attr(self):
+        t = Target(
+            name="greet",
+            namespace="frontend",
+            kind="static_library",
+            sources=["frontend/src/greet.cpp"],
+            public_headers=["frontend/include"],
+        )
+        out = nix_gen.generate(_project(targets={"frontend.greet": t}))
+        # Rec attr uses sanitized form (`_`).
+        self.assertIn("frontend_greet =", out)
+        # Library file is named after the *raw* target name, not the qualified one.
+        self.assertIn("$AR rcs libgreet.a", out)
+        # pname carries the qualified form (visible in build logs).
+        self.assertIn('pname = "frontend.greet"', out)
+
+    def test_intra_flake_b_dep_renders_sanitized_id(self):
+        # Two modules: `frontend.greet` (lib) consumed by `app.main` (exe).
+        # The exe's link line must reference the sanitized rec attr, but the
+        # `lib<name>.a` file uses the dep target's raw name.
+        lib = Target(
+            name="greet",
+            namespace="frontend",
+            kind="static_library",
+            sources=["frontend/g.cpp"],
+            public_headers=["frontend/include"],
+        )
+        exe = Target(
+            name="main",
+            namespace="app",
+            kind="executable",
+            sources=["app/m.cpp"],
+            deps=TargetDeps(internal=["frontend.greet"]),
+        )
+        out = nix_gen.generate(
+            _project(targets={"frontend.greet": lib, "app.main": exe}),
+        )
+        # buildInputs uses the rec attr.
+        self.assertIn("frontend_greet", out)
+        # Link line references the rec attr but the raw lib filename.
+        self.assertIn("${frontend_greet}/lib/libgreet.a", out)
+        # Include line uses the rec attr.
+        self.assertIn("-I${frontend_greet}/include", out)
+
+    def test_b_dep_interpolation_rewritten(self):
+        # Custom target uses ${frontend.greet}/include in its install_script.
+        lib = Target(
+            name="greet",
+            namespace="frontend",
+            kind="static_library",
+            sources=["frontend/g.cpp"],
+        )
+        custom = Target(
+            name="bundle",
+            kind="custom",
+            install_script="cp ${frontend.greet}/lib/libgreet.a $out/",
+            deps=TargetDeps(internal=["frontend.greet"]),
+        )
+        out = nix_gen.generate(
+            _project(targets={"frontend.greet": lib, "bundle": custom}),
+        )
+        # Dotted interpolation → underscore interpolation.
+        self.assertIn("${frontend_greet}/lib/libgreet.a", out)
+        self.assertNotIn("${frontend.greet}/lib", out)
+
+
+class NixIdHelper(unittest.TestCase):
+    def test_replaces_dot_and_hyphen(self):
+        self.assertEqual(nix_gen._nix_id("frontend.app"), "frontend_app")
+        self.assertEqual(nix_gen._nix_id("hello-debug"), "hello_debug")
+        self.assertEqual(nix_gen._nix_id("a.b-c"), "a_b_c")
+
+    def test_no_op_on_clean_id(self):
+        self.assertEqual(nix_gen._nix_id("hello"), "hello")
 
 
 if __name__ == "__main__":

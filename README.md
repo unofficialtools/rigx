@@ -101,8 +101,9 @@ If rigx isn't installed, invoke it as a module:
 # `rigx.toml` reference
 
 Every `rigx.toml` has a `[project]` section, an optional `[nixpkgs]` section,
-an optional `[vars]` table, zero or more `[dependencies.git.*]` entries, and
-one or more `[targets.*]`.
+an optional `[vars]` table, zero or more `[dependencies.git.*]` entries,
+zero or more `[dependencies.local.*]` entries, an optional `[modules]` block,
+and one or more `[targets.*]`.
 
 ## Top-level sections
 
@@ -162,6 +163,83 @@ rev   = "v1.0.0"             # branch / tag / 40-char commit SHA
 flake = true                 # must be a flake in this version (default true)
 attr  = "default"            # attribute inside packages.${system} (default "default")
 ```
+
+### `[dependencies.local.<name>]`
+
+Pull in a sibling rigx project as a **path flake input**. The sub-project
+stays standalone (its own flake, its own `output/`, builds independently from
+its directory) and the parent depends on its **built outputs** — never raw
+sources.
+
+```toml
+[dependencies.local.frontend]
+path  = "./frontend"          # required; relative to this rigx.toml
+flake = true                  # default true; mirrors [dependencies.git.*]
+```
+
+Reference targets across the boundary with the `<localdep>.<target>` form in
+`deps.internal`, `run`, `args`, and shell scripts:
+
+```toml
+[targets.bundle]
+kind          = "custom"
+deps.internal = ["frontend.app"]                        # adds the dep to buildInputs
+install_script = "cp ${frontend.app}/bin/app $out/bin/" # ${X.Y} resolves cross-flake
+```
+
+Cross-flake refs are *opaque* to the parent — it has no metadata about the
+sub-project's targets, so the linker/include helpers used for same-project
+deps don't fire. To consume a sibling `static_library`, write a `custom`
+target that copies headers/archives explicitly, or use `[modules]` (below).
+
+`rigx build frontend.app` from the parent re-exports and builds the
+sub-project's output. `rigx list` shows everything reachable as
+`<localdep>.<target>` forms. The parent's `flake.lock` pins each local-dep
+as a path input.
+
+### `[modules]`
+
+Merge sibling rigx-style configs into the **same flake**. Use this when the
+project really is a monorepo and you want cross-folder targets to share
+sources, vars, and the parent's pinned `[nixpkgs]`.
+
+```toml
+[modules]
+include = ["frontend", "service"]   # paths to sub-folders containing rigx.toml
+```
+
+Each module's `rigx.toml`:
+
+- **must not** define `[project]` or `[nixpkgs]` (the parent owns identity).
+- **may** define `[targets.*]`, `[vars]`, `[dependencies.git.*]`,
+  `[dependencies.local.*]`, and its own `[modules]` (recursive).
+- has its `[targets.*]` automatically prefixed with the module's directory
+  name: `frontend/rigx.toml`'s `[targets.app]` becomes `frontend.app` in the
+  merged set.
+- has its source paths interpreted relative to the module's directory and
+  rewritten to be parent-root-relative — so a module looks like a normal
+  rigx project to its author.
+
+Inside a module, `deps.internal = ["greet"]` (unqualified) auto-binds to the
+same module's `greet`. To reference a different module, qualify it:
+`deps.internal = ["other.foo"]`.
+
+`[vars]`, `[dependencies.git.*]`, and `[dependencies.local.*]` from each
+module are flat-merged into the parent. Name collisions across modules (or
+between a module and the parent) are config errors — keeps things explicit.
+
+Picking between (A) `[dependencies.local.*]` and (B) `[modules]`:
+
+| You want…                                      | Use |
+|-----------------------------------------------|-----|
+| Subfolders that build independently (`cd` and go) | (A) |
+| Subfolders with their own `flake.lock` / nixpkgs ref | (A) |
+| Cross-folder `static_library` linking         | (B) |
+| Shared `[vars]` across folders                | (B) |
+| One-flake monorepo with namespaced targets    | (B) |
+
+You can use both in the same parent — they share the dotted CLI surface
+(`frontend.app`) but resolve through different mechanisms.
 
 ## Targets
 

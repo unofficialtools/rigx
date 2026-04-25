@@ -34,6 +34,20 @@ class GitDep:
 
 
 @dataclass
+class LocalDep:
+    """A sibling rigx project pulled in as a path flake input.
+
+    The sub-project is loaded recursively (so its targets can be enumerated
+    and re-exported) but is otherwise opaque: the parent depends on its
+    *built outputs*, never its raw sources.
+    """
+    name: str
+    path: Path                         # absolute, resolved against parent root
+    flake: bool = True
+    sub_project: "Project | None" = None  # populated during recursive load
+
+
+@dataclass
 class TargetDeps:
     internal: list[str] = field(default_factory=list)
     nixpkgs: list[str] = field(default_factory=list)
@@ -73,9 +87,17 @@ class Target:
     native_build_inputs: list[str] = field(default_factory=list)  # nixpkgs attrs
     script: str | None = None                       # for kind = "script"
     variants: dict[str, Variant] = field(default_factory=dict)
+    # Module namespace (`[modules]` form). Empty for parent-owned targets.
+    # The full identity is `namespace.name` when namespace is set; this is
+    # what populates `project.targets` keys and Nix attr names.
+    namespace: str = ""
 
     def variant_names(self) -> list[str]:
         return sorted(self.variants.keys())
+
+    @property
+    def qualified_name(self) -> str:
+        return f"{self.namespace}.{self.name}" if self.namespace else self.name
 
 
 @dataclass
@@ -86,6 +108,23 @@ class Project:
     git_deps: dict[str, GitDep]
     targets: dict[str, Target]
     root: Path
+    local_deps: dict[str, "LocalDep"] = field(default_factory=dict)
+
+    def find_target(self, qualified: str) -> tuple["Project", str] | None:
+        """Resolve a possibly-qualified target name (e.g. 'frontend.app') to
+        (owning_project, target_name_in_that_project). Returns None if the
+        name doesn't resolve. Used to render cross-flake `deps.internal`
+        refs and to expand `${frontend.app}` interpolations."""
+        if "." in qualified:
+            head, tail = qualified.split(".", 1)
+            if head in self.local_deps and self.local_deps[head].sub_project:
+                sub = self.local_deps[head].sub_project
+                # Recurse so 'a.b.c' walks through nested local-deps.
+                return sub.find_target(tail) if "." in tail else (
+                    (sub, tail) if tail in sub.targets else None
+                )
+            return None
+        return (self, qualified) if qualified in self.targets else None
 
 
 class ConfigError(ValueError):
@@ -138,20 +177,26 @@ def _expand_list(items, vars: dict[str, list[str]], ctx: str) -> list[str]:
     return out
 
 
-def _expand_globs(items: list[str], root: Path, ctx: str) -> list[str]:
+def _expand_globs(
+    items: list[str], root: Path, ctx: str, *, output_prefix: str = ""
+) -> list[str]:
     """Resolve glob patterns (`*`, `**`, `?`, `[…]`) in a path list against
     `root`. Non-glob entries pass through verbatim; glob entries are replaced
     by their sorted matches. A glob that matches no files is a config error —
-    silent zero-match globs hide typos and produce empty derivations."""
+    silent zero-match globs hide typos and produce empty derivations.
+
+    `output_prefix` is prepended to every resolved path (literal or globbed).
+    Used by `[modules]` so a module's `src/main.cpp` ends up as
+    `frontend/src/main.cpp` relative to the parent root."""
     out: list[str] = []
     for item in items:
         if not any(c in item for c in "*?["):
-            out.append(item)
+            out.append(output_prefix + item)
             continue
         # Path.glob handles `**` natively. Sort for deterministic Nix derivation
         # hashes and stable build commands.
         matches = sorted(
-            p.relative_to(root).as_posix()
+            output_prefix + p.relative_to(root).as_posix()
             for p in root.glob(item)
             if p.is_file()
         )
@@ -161,7 +206,227 @@ def _expand_globs(items: list[str], root: Path, ctx: str) -> list[str]:
     return out
 
 
+def _build_target(
+    tname: str,
+    tconf: dict,
+    vars_table: dict[str, list[str]],
+    git_deps: dict[str, "GitDep"],
+    glob_root: Path,
+    *,
+    namespace: str = "",
+    path_prefix: str = "",
+) -> Target:
+    """Build a single Target from its TOML table.
+
+    `glob_root` is where source globs are resolved (parent root for parent
+    targets, module root for `[modules]`-merged targets). `path_prefix` is
+    a POSIX path fragment (with trailing `/`) prepended to every resolved
+    path so module-relative paths stay valid relative to the parent root.
+    `namespace` populates `target.namespace`; same-namespace `deps.internal`
+    refs are auto-qualified (`greet` → `frontend.greet`)."""
+    kind = tconf.get("kind")
+    if kind not in VALID_KINDS:
+        raise ConfigError(
+            f"target {tname}: 'kind' must be one of {sorted(VALID_KINDS)}"
+        )
+
+    deps_conf = tconf.get("deps", {})
+    for unknown in deps_conf.keys() - {"internal", "nixpkgs", "git"}:
+        raise ConfigError(f"target {tname}: unknown deps key '{unknown}'")
+    deps = TargetDeps(
+        internal=_expand_list(
+            deps_conf.get("internal", []), vars_table, f"target {tname}: deps.internal"
+        ),
+        nixpkgs=_expand_list(
+            deps_conf.get("nixpkgs", []), vars_table, f"target {tname}: deps.nixpkgs"
+        ),
+        git=_expand_list(
+            deps_conf.get("git", []), vars_table, f"target {tname}: deps.git"
+        ),
+    )
+    for g in deps.git:
+        if g not in git_deps:
+            raise ConfigError(
+                f"target {tname}: deps.git references undefined dependency '{g}'"
+            )
+    # Auto-qualify intra-module deps so module-author writes `greet` and the
+    # merged scope sees `frontend.greet`. Already-qualified refs and own-
+    # project parent refs (no namespace) pass through.
+    if namespace:
+        deps.internal = [
+            d if "." in d else f"{namespace}.{d}"
+            for d in deps.internal
+        ]
+
+    variants: dict[str, Variant] = {}
+    for vname, vconf in tconf.get("variants", {}).items():
+        vctx = f"target {tname}: variants.{vname}"
+        variants[vname] = Variant(
+            name=vname,
+            cxxflags=_expand_list(vconf.get("cxxflags", []), vars_table, f"{vctx}.cxxflags"),
+            defines=dict(vconf.get("defines", {})),
+            ldflags=_expand_list(vconf.get("ldflags", []), vars_table, f"{vctx}.ldflags"),
+            nim_flags=_expand_list(vconf.get("nim_flags", []), vars_table, f"{vctx}.nim_flags"),
+        )
+
+    tctx = f"target {tname}"
+    sources = _expand_globs(
+        _expand_list(tconf.get("sources", []), vars_table, f"{tctx}.sources"),
+        glob_root,
+        f"{tctx}.sources",
+        output_prefix=path_prefix,
+    )
+    includes = [
+        path_prefix + i
+        for i in _expand_list(tconf.get("includes", []), vars_table, f"{tctx}.includes")
+    ]
+    public_headers = [
+        path_prefix + p
+        for p in _expand_list(
+            tconf.get("public_headers", []), vars_table, f"{tctx}.public_headers"
+        )
+    ]
+    python_project = str(tconf.get("python_project", "."))
+    if path_prefix and python_project not in (".", ""):
+        # python_project is a path relative to the declaring rigx.toml; rewrite
+        # so it stays valid from the parent's root.
+        python_project = path_prefix.rstrip("/") + "/" + python_project.lstrip("./")
+    elif path_prefix and python_project in (".", ""):
+        python_project = path_prefix.rstrip("/")
+
+    return Target(
+        name=tname,
+        kind=kind,
+        sources=sources,
+        includes=includes,
+        public_headers=public_headers,
+        deps=deps,
+        cxxflags=_expand_list(tconf.get("cxxflags", []), vars_table, f"{tctx}.cxxflags"),
+        ldflags=_expand_list(tconf.get("ldflags", []), vars_table, f"{tctx}.ldflags"),
+        defines=dict(tconf.get("defines", {})),
+        nim_flags=_expand_list(tconf.get("nim_flags", []), vars_table, f"{tctx}.nim_flags"),
+        python_version=str(tconf.get("python_version", "3.12")),
+        python_project=python_project,
+        python_venv_hash=tconf.get("python_venv_hash"),
+        run=tconf.get("run"),
+        args=_expand_list(tconf.get("args", []), vars_table, f"{tctx}.args"),
+        outputs=_expand_list(tconf.get("outputs", []), vars_table, f"{tctx}.outputs"),
+        build_script=tconf.get("build_script"),
+        install_script=tconf.get("install_script"),
+        native_build_inputs=_expand_list(
+            tconf.get("native_build_inputs", []), vars_table, f"{tctx}.native_build_inputs"
+        ),
+        script=tconf.get("script"),
+        variants=variants,
+        namespace=namespace,
+    )
+
+
+def _enumerate_modules(
+    data: dict, base_root: Path, ns_prefix: str = ""
+):
+    """Yield (namespace, module_root, raw_data) for each `[modules].include`
+    entry, recursing into nested module trees. Validates that modules don't
+    declare `[project]` or `[nixpkgs]` — those are reserved for the parent."""
+    section = data.get("modules", {})
+    if not isinstance(section, dict):
+        raise ConfigError("[modules] must be a table")
+    includes = section.get("include", [])
+    if not isinstance(includes, list):
+        raise ConfigError("[modules].include must be a list of paths")
+    for entry in includes:
+        if not isinstance(entry, str):
+            raise ConfigError(
+                f"[modules].include: entries must be strings, got {entry!r}"
+            )
+        mod_root = (base_root / entry).resolve()
+        mod_basename = Path(entry).name
+        ns = f"{ns_prefix}.{mod_basename}" if ns_prefix else mod_basename
+        if not (mod_root / "rigx.toml").is_file():
+            raise ConfigError(f"module {ns}: no rigx.toml at {mod_root}")
+        with (mod_root / "rigx.toml").open("rb") as f:
+            mod_data = tomllib.load(f)
+        if "project" in mod_data:
+            raise ConfigError(
+                f"module {ns}: must not contain [project] (parent owns identity)"
+            )
+        if "nixpkgs" in mod_data:
+            raise ConfigError(
+                f"module {ns}: must not contain [nixpkgs] (parent's nixpkgs ref is shared)"
+            )
+        yield (ns, mod_root, mod_data)
+        yield from _enumerate_modules(mod_data, mod_root, ns)
+
+
 def load(root: Path) -> Project:
+    return _load(root.resolve(), _visited=set())
+
+
+def _parse_git_deps(section: dict, source_label: str) -> dict[str, GitDep]:
+    out: dict[str, GitDep] = {}
+    for gname, gconf in section.items():
+        if "url" not in gconf:
+            raise ConfigError(f"{source_label}dependencies.git.{gname}: missing 'url'")
+        out[gname] = GitDep(
+            name=gname,
+            url=gconf["url"],
+            rev=gconf.get("rev", "HEAD"),
+            flake=gconf.get("flake", True),
+            attr=gconf.get("attr"),
+        )
+    return out
+
+
+def _parse_local_deps(
+    section: dict,
+    declared_root: Path,
+    git_deps: dict[str, GitDep],
+    _visited: set[Path],
+    source_label: str,
+) -> dict[str, LocalDep]:
+    out: dict[str, LocalDep] = {}
+    for lname, lconf in section.items():
+        if "path" not in lconf:
+            raise ConfigError(
+                f"{source_label}dependencies.local.{lname}: missing 'path'"
+            )
+        if lname in git_deps:
+            raise ConfigError(
+                f"{source_label}dependencies.local.{lname}: "
+                f"name collides with dependencies.git.{lname}"
+            )
+        sub_root = (declared_root / lconf["path"]).resolve()
+        if not (sub_root / "rigx.toml").is_file():
+            raise ConfigError(
+                f"{source_label}dependencies.local.{lname}: no rigx.toml at {sub_root}"
+            )
+        sub_project = _load(sub_root, _visited)
+        out[lname] = LocalDep(
+            name=lname,
+            path=sub_root,
+            flake=lconf.get("flake", True),
+            sub_project=sub_project,
+        )
+    return out
+
+
+def _merge_into(
+    base: dict, new: dict, kind: str, source_label: str
+) -> None:
+    for k, v in new.items():
+        if k in base:
+            raise ConfigError(
+                f"{source_label}: {kind}.{k} collides with another module or parent"
+            )
+        base[k] = v
+
+
+def _load(root: Path, _visited: set[Path]) -> Project:
+    if root in _visited:
+        chain = " -> ".join(str(p) for p in [*_visited, root])
+        raise ConfigError(f"local-dep cycle detected: {chain}")
+    _visited = _visited | {root}
+
     toml_path = root / "rigx.toml"
     if not toml_path.is_file():
         raise ConfigError(f"no rigx.toml found at {toml_path}")
@@ -177,100 +442,86 @@ def load(root: Path) -> Project:
     nixpkgs = data.get("nixpkgs", {})
     nixpkgs_ref = nixpkgs.get("ref", "nixos-24.11")
 
-    vars_table = _load_vars(data)
+    # Phase 1: gather modules. Each module's TOML is read and validated for
+    # the `no [project]` / `no [nixpkgs]` rules during enumeration.
+    modules = list(_enumerate_modules(data, root))
 
-    git_deps: dict[str, GitDep] = {}
-    deps_section = data.get("dependencies", {}).get("git", {})
-    for gname, gconf in deps_section.items():
-        if "url" not in gconf:
-            raise ConfigError(f"dependencies.git.{gname}: missing 'url'")
-        git_deps[gname] = GitDep(
-            name=gname,
-            url=gconf["url"],
-            rev=gconf.get("rev", "HEAD"),
-            flake=gconf.get("flake", True),
-            attr=gconf.get("attr"),
+    # Phase 2: merge top-level tables (vars, git_deps, local_deps) across the
+    # parent and every module. Collisions are config errors so the user
+    # always knows which module owns what.
+    vars_table = _load_vars(data)
+    git_deps = _parse_git_deps(data.get("dependencies", {}).get("git", {}), "")
+    local_deps = _parse_local_deps(
+        data.get("dependencies", {}).get("local", {}),
+        root, git_deps, _visited, "",
+    )
+    for ns, mod_root, mod_data in modules:
+        label = f"module {ns}"
+        _merge_into(vars_table, _load_vars(mod_data), "vars", label)
+        _merge_into(
+            git_deps,
+            _parse_git_deps(mod_data.get("dependencies", {}).get("git", {}), f"{label}: "),
+            "dependencies.git", label,
+        )
+        _merge_into(
+            local_deps,
+            _parse_local_deps(
+                mod_data.get("dependencies", {}).get("local", {}),
+                mod_root, git_deps, _visited, f"{label}: ",
+            ),
+            "dependencies.local", label,
         )
 
+    # Phase 3: build targets. Parent's first (no namespace), then each module
+    # with its namespace and a path prefix so source paths stay valid relative
+    # to the parent root.
     targets: dict[str, Target] = {}
     for tname, tconf in data.get("targets", {}).items():
-        kind = tconf.get("kind")
-        if kind not in VALID_KINDS:
+        targets[tname] = _build_target(
+            tname, tconf, vars_table, git_deps, root,
+            namespace="", path_prefix="",
+        )
+    for ns, mod_root, mod_data in modules:
+        try:
+            rel = mod_root.relative_to(root)
+            prefix = f"{rel.as_posix()}/"
+        except ValueError:
             raise ConfigError(
-                f"target {tname}: 'kind' must be one of {sorted(VALID_KINDS)}"
+                f"module {ns}: path {mod_root} is not under parent root {root}"
             )
-
-        deps_conf = tconf.get("deps", {})
-        for unknown in deps_conf.keys() - {"internal", "nixpkgs", "git"}:
-            raise ConfigError(f"target {tname}: unknown deps key '{unknown}'")
-        deps = TargetDeps(
-            internal=_expand_list(
-                deps_conf.get("internal", []), vars_table, f"target {tname}: deps.internal"
-            ),
-            nixpkgs=_expand_list(
-                deps_conf.get("nixpkgs", []), vars_table, f"target {tname}: deps.nixpkgs"
-            ),
-            git=_expand_list(
-                deps_conf.get("git", []), vars_table, f"target {tname}: deps.git"
-            ),
-        )
-        for g in deps.git:
-            if g not in git_deps:
+        for tname, tconf in mod_data.get("targets", {}).items():
+            qual = f"{ns}.{tname}"
+            if qual in targets:
                 raise ConfigError(
-                    f"target {tname}: deps.git references undefined dependency '{g}'"
+                    f"module {ns}: target name collision on '{qual}'"
                 )
-
-        variants: dict[str, Variant] = {}
-        for vname, vconf in tconf.get("variants", {}).items():
-            vctx = f"target {tname}: variants.{vname}"
-            variants[vname] = Variant(
-                name=vname,
-                cxxflags=_expand_list(vconf.get("cxxflags", []), vars_table, f"{vctx}.cxxflags"),
-                defines=dict(vconf.get("defines", {})),
-                ldflags=_expand_list(vconf.get("ldflags", []), vars_table, f"{vctx}.ldflags"),
-                nim_flags=_expand_list(vconf.get("nim_flags", []), vars_table, f"{vctx}.nim_flags"),
+            targets[qual] = _build_target(
+                tname, tconf, vars_table, git_deps, mod_root,
+                namespace=ns, path_prefix=prefix,
             )
 
-        tctx = f"target {tname}"
-        sources = _expand_globs(
-            _expand_list(tconf.get("sources", []), vars_table, f"{tctx}.sources"),
-            root,
-            f"{tctx}.sources",
-        )
-        targets[tname] = Target(
-            name=tname,
-            kind=kind,
-            sources=sources,
-            includes=_expand_list(tconf.get("includes", []), vars_table, f"{tctx}.includes"),
-            public_headers=_expand_list(
-                tconf.get("public_headers", []), vars_table, f"{tctx}.public_headers"
-            ),
-            deps=deps,
-            cxxflags=_expand_list(tconf.get("cxxflags", []), vars_table, f"{tctx}.cxxflags"),
-            ldflags=_expand_list(tconf.get("ldflags", []), vars_table, f"{tctx}.ldflags"),
-            defines=dict(tconf.get("defines", {})),
-            nim_flags=_expand_list(tconf.get("nim_flags", []), vars_table, f"{tctx}.nim_flags"),
-            python_version=str(tconf.get("python_version", "3.12")),
-            python_project=str(tconf.get("python_project", ".")),
-            python_venv_hash=tconf.get("python_venv_hash"),
-            run=tconf.get("run"),
-            args=_expand_list(tconf.get("args", []), vars_table, f"{tctx}.args"),
-            outputs=_expand_list(tconf.get("outputs", []), vars_table, f"{tctx}.outputs"),
-            build_script=tconf.get("build_script"),
-            install_script=tconf.get("install_script"),
-            native_build_inputs=_expand_list(
-                tconf.get("native_build_inputs", []), vars_table, f"{tctx}.native_build_inputs"
-            ),
-            script=tconf.get("script"),
-            variants=variants,
-        )
-
-    for tname, target in targets.items():
+    # Phase 4: validate deps.internal across the merged set. A ref is valid
+    # if it names (a) a target in this flake (parent or merged module), or
+    # (b) a `<localdep>.<target>` cross-flake ref into a sibling project.
+    for qname, target in targets.items():
         for dep in target.deps.internal:
-            if dep not in targets:
-                raise ConfigError(
-                    f"target {tname}: internal dep '{dep}' is not a defined target"
-                )
+            if dep in targets:
+                continue
+            if "." in dep:
+                head, tail = dep.split(".", 1)
+                if head in local_deps:
+                    sub = local_deps[head].sub_project
+                    resolved = sub.find_target(tail) if sub else None
+                    if resolved is None:
+                        raise ConfigError(
+                            f"target {qname}: internal dep '{dep}' — target "
+                            f"'{tail}' not found in local-dep '{head}'"
+                        )
+                    continue
+            raise ConfigError(
+                f"target {qname}: internal dep '{dep}' is not a defined target "
+                f"(neither a sibling target in this flake nor a known local-dep ref)"
+            )
         if target.kind == "custom":
             if not target.install_script:
                 raise ConfigError(
@@ -304,6 +555,7 @@ def load(root: Path) -> Project:
         version=version,
         nixpkgs_ref=nixpkgs_ref,
         git_deps=git_deps,
+        local_deps=local_deps,
         targets=targets,
         root=root,
     )

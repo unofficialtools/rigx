@@ -56,6 +56,107 @@ class ResolveAttr(unittest.TestCase):
             builder._resolve_attr(proj, "h@asan")
 
 
+class ResolveAttrCrossFlake(unittest.TestCase):
+    @staticmethod
+    def _parent_with_sub() -> Project:
+        from rigx.config import LocalDep
+        sub = Project(
+            name="sub",
+            version="0.1.0",
+            nixpkgs_ref="nixos-24.11",
+            git_deps={},
+            targets={
+                "app": Target(name="app", kind="executable", sources=["m.cpp"]),
+                "lib": Target(
+                    name="lib",
+                    kind="executable",
+                    sources=["m.cpp"],
+                    variants={
+                        "debug": Variant(name="debug"),
+                        "release": Variant(name="release"),
+                    },
+                ),
+            },
+            root=Path("/tmp/sub"),
+        )
+        return Project(
+            name="parent",
+            version="0.1.0",
+            nixpkgs_ref="nixos-24.11",
+            git_deps={},
+            targets={},
+            root=Path("/tmp/parent"),
+            local_deps={"sub": LocalDep(name="sub", path=Path("/tmp/sub"), sub_project=sub)},
+        )
+
+    def test_dotted_no_variant(self):
+        proj = self._parent_with_sub()
+        self.assertEqual(builder._resolve_attr(proj, "sub.app"), "sub_app")
+
+    def test_dotted_with_variant(self):
+        proj = self._parent_with_sub()
+        self.assertEqual(
+            builder._resolve_attr(proj, "sub.lib@release"), "sub_lib_release"
+        )
+
+    def test_unknown_dotted_target(self):
+        proj = self._parent_with_sub()
+        with self.assertRaisesRegex(BuildError, "no such target"):
+            builder._resolve_attr(proj, "sub.missing")
+
+    def test_unknown_variant_on_dotted(self):
+        proj = self._parent_with_sub()
+        with self.assertRaisesRegex(BuildError, "has no variant"):
+            builder._resolve_attr(proj, "sub.lib@asan")
+
+    def test_own_target_still_unsanitized(self):
+        # Regression: own-target hyphenated variant must not get sanitized
+        # — the rec block emits it with a hyphen.
+        from rigx.config import LocalDep
+        proj = Project(
+            name="p",
+            version="0.1.0",
+            nixpkgs_ref="nixos-24.11",
+            git_deps={},
+            targets={
+                "h": Target(
+                    name="h",
+                    kind="executable",
+                    sources=["m.cpp"],
+                    variants={"release": Variant(name="release")},
+                ),
+            },
+            root=Path("/tmp"),
+        )
+        self.assertEqual(builder._resolve_attr(proj, "h@release"), "h-release")
+
+    def test_b_merged_module_target_sanitized(self):
+        # B-merged (qualified) name: `frontend.greet` resolves directly
+        # against project.targets (no local-deps needed) and the result is
+        # sanitized for Nix.
+        proj = Project(
+            name="p",
+            version="0.1.0",
+            nixpkgs_ref="nixos-24.11",
+            git_deps={},
+            targets={
+                "frontend.greet": Target(
+                    name="greet",
+                    namespace="frontend",
+                    kind="executable",
+                    sources=["frontend/m.cpp"],
+                    variants={"release": Variant(name="release")},
+                ),
+            },
+            root=Path("/tmp"),
+        )
+        self.assertEqual(builder._resolve_attr(proj, "frontend.greet"), "frontend_greet")
+        self.assertEqual(
+            builder._resolve_attr(proj, "frontend.greet@release"),
+            "frontend_greet_release",
+        )
+
+
 class AllAttrs(unittest.TestCase):
     def test_expands_variants(self):
         proj = _project_with(

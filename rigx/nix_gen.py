@@ -2,12 +2,46 @@
 
 from __future__ import annotations
 
+import re
+
 from rigx.config import GitDep, Project, Target, Variant
 
 
 def _nix_str(s: str) -> str:
     """Quote a Python string for Nix (double-quoted form)."""
     return '"' + s.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$") + '"'
+
+
+def _nix_id(qualified: str) -> str:
+    """Map a possibly-dotted name ('frontend.app') to a Nix identifier
+    ('frontend_app'). Used for `let` bindings and `rec` attrs — Nix accepts
+    dots only in quoted attr keys, and they break `${name}` interpolation."""
+    return qualified.replace(".", "_").replace("-", "_")
+
+
+# Matches `${X.Y}` (and `${X.Y.Z}` etc.) where each segment is identifier-ish
+# (hyphens allowed, since `lib-release` is a valid variant attr). Used to
+# rewrite cross-flake interpolations in args and user scripts so
+# `${frontend.app}` → `${frontend_app}`.
+_INTERP_DOTTED = re.compile(
+    r"\$\{([A-Za-z_][A-Za-z0-9_\-]*(?:\.[A-Za-z_][A-Za-z0-9_\-]*)+)\}"
+)
+
+
+def _rewrite_interp(s: str, project: Project) -> str:
+    """Rewrite `${X.Y}` to `${X_Y}` when the dotted ref names either:
+    - a cross-flake (`[dependencies.local.X]`) target, or
+    - a `[modules]`-merged target (`X.Y` is a key in `project.targets`).
+    Other dotted forms (e.g. `pkgs.foo`) are left alone — those are Nix
+    attribute paths the user wrote intentionally."""
+    def sub(m):
+        qual = m.group(1)
+        if qual.split(".", 1)[0] in project.local_deps:
+            return "${" + _nix_id(qual) + "}"
+        if qual in project.targets:
+            return "${" + _nix_id(qual) + "}"
+        return m.group(0)
+    return _INTERP_DOTTED.sub(sub, s)
 
 
 def _nix_list(exprs: list[str]) -> str:
@@ -51,6 +85,14 @@ def _effective_ldflags(target: Target, variant: Variant | None) -> list[str]:
     return flags
 
 
+def _is_cross_flake_ref(d: str, project: Project) -> bool:
+    """True if `d` is a `<localdep>.<target>` reference into a sibling flake."""
+    if "." not in d:
+        return False
+    head = d.split(".", 1)[0]
+    return head in project.local_deps
+
+
 def _build_inputs(target: Target, project: Project) -> list[str]:
     exprs: list[str] = []
     for d in target.deps.nixpkgs:
@@ -60,33 +102,47 @@ def _build_inputs(target: Target, project: Project) -> list[str]:
         attr = dep.attr or "default"
         exprs.append(f"inputs.{d}.packages.${{system}}.{attr}")
     for d in target.deps.internal:
-        exprs.append(d)
-    # If `run` names an internal target, add it to buildInputs implicitly so
-    # it resolves via ${name} interpolation. If it's a bare command, the user
-    # must supply it via deps.nixpkgs/deps.git (on PATH in the sandbox).
+        # Cross-flake refs and same-project refs both render as a single Nix
+        # identifier — both end up in the parent's `rec` block (own targets
+        # directly; cross-flake targets via re-export bindings).
+        exprs.append(_nix_id(d))
     if (
         target.run
-        and target.run in project.targets
+        and (target.run in project.targets or _is_cross_flake_ref(target.run, project))
         and target.run not in target.deps.internal
     ):
-        exprs.append(target.run)
+        exprs.append(_nix_id(target.run))
     return exprs
 
 
 def _internal_link_args(target: Target, project: Project) -> list[str]:
-    """Positional linker args for internal static-library deps."""
+    """Positional linker args for internal static-library deps. Cross-flake
+    refs are skipped — the parent has no metadata about the dep's kind, so it
+    can't synthesize the `${dep}/lib/lib<dep>.a` line. Users wanting to link
+    against a sibling-flake static_library should add a `custom` target that
+    consumes the artifact explicitly.
+
+    For B-merged deps (`frontend.greet`), the rec attr is sanitized
+    (`frontend_greet`), but the actual library file uses the dep's *raw*
+    target name (`libgreet.a`)."""
     args: list[str] = []
     for d in target.deps.internal:
+        if _is_cross_flake_ref(d, project):
+            continue
         dep_target = project.targets[d]
         if dep_target.kind == "static_library":
-            args.append(f"${{{d}}}/lib/lib{d}.a")
+            args.append(f"${{{_nix_id(d)}}}/lib/lib{dep_target.name}.a")
     return args
 
 
 def _internal_include_args(target: Target, project: Project) -> list[str]:
+    """Include flags for same-project internal deps. Cross-flake refs are
+    skipped (see `_internal_link_args`)."""
     args: list[str] = []
     for d in target.deps.internal:
-        args.append(f"-I${{{d}}}/include")
+        if _is_cross_flake_ref(d, project):
+            continue
+        args.append(f"-I${{{_nix_id(d)}}}/include")
     return args
 
 
@@ -201,12 +257,23 @@ def _shell_quote(s: str) -> str:
 def _build_phase_run(target: Target, project: Project) -> str:
     assert target.run is not None
     if target.run in project.targets:
-        # internal target: absolute path into its store output
-        binary = f"${{{target.run}}}/bin/{target.run}"
+        # internal target: absolute path into its store output. For B-merged
+        # targets (`frontend.greet`), the rec attr is sanitized but the
+        # binary inside is named after the dep's raw target name.
+        dep_target = project.targets[target.run]
+        binary = f"${{{_nix_id(target.run)}}}/bin/{dep_target.name}"
+    elif _is_cross_flake_ref(target.run, project):
+        # The sub-flake's binary lives at $out/bin/<last-segment>; the parent's
+        # re-export attr is the sanitized form of the full qualified name.
+        nix_ref = _nix_id(target.run)
+        bin_name = target.run.rsplit(".", 1)[1]
+        binary = f"${{{nix_ref}}}/bin/{bin_name}"
     else:
         # bare command name: resolved via PATH from deps.nixpkgs / deps.git
         binary = target.run
-    quoted_args = " ".join(_shell_quote(a) for a in target.args)
+    quoted_args = " ".join(
+        _shell_quote(_rewrite_interp(a, project)) for a in target.args
+    )
     cmd = f"{binary} {quoted_args}".rstrip()
     return (
         "runHook preBuild\n"
@@ -329,7 +396,7 @@ def _mk_python_derivation(target: Target, project: Project) -> str:
     lines.append(f"    outputHash = \"{venv_hash}\";")
     lines.append("  };")
     lines.append("in pkgs.stdenv.mkDerivation {")
-    lines.append(f"  pname = {_nix_str(target.name)};")
+    lines.append(f"  pname = {_nix_str(target.qualified_name)};")
     lines.append(f"  version = {_nix_str(project.version)};")
     lines.append("  inherit src;")
     lines.append("  nativeBuildInputs = [ pkgs.makeWrapper ];")
@@ -370,7 +437,7 @@ def _mk_custom_derivation(target: Target, project: Project) -> str:
 
     lines = [
         "pkgs.stdenv.mkDerivation {",
-        f"  pname = {_nix_str(target.name)};",
+        f"  pname = {_nix_str(target.qualified_name)};",
         f"  version = {_nix_str(project.version)};",
         "  inherit src;",
         f"  buildInputs = {_nix_list(build_inputs)};",
@@ -380,7 +447,7 @@ def _mk_custom_derivation(target: Target, project: Project) -> str:
     lines.append("  dontConfigure = true;")
 
     if target.build_script:
-        body = target.build_script.strip("\n")
+        body = _rewrite_interp(target.build_script.strip("\n"), project)
         lines.append("  buildPhase = ''")
         lines.append("    runHook preBuild")
         lines.append(_indent(body, 4))
@@ -389,7 +456,7 @@ def _mk_custom_derivation(target: Target, project: Project) -> str:
     else:
         lines.append("  dontBuild = true;")
 
-    install_body = (target.install_script or "").strip("\n")
+    install_body = _rewrite_interp((target.install_script or "").strip("\n"), project)
     lines.append("  installPhase = ''")
     lines.append("    runHook preInstall")
     lines.append(_indent(install_body, 4))
@@ -408,7 +475,11 @@ def _mk_derivation(
     if target.kind == "custom":
         return _mk_custom_derivation(target, project)
 
-    pname = target.name if variant is None else f"{target.name}-{variant.name}"
+    pname = (
+        target.qualified_name
+        if variant is None
+        else f"{target.qualified_name}-{variant.name}"
+    )
     build_inputs = _build_inputs(target, project)
 
     if target.kind == "executable":
@@ -448,20 +519,62 @@ def _mk_derivation(
     return "\n".join(lines)
 
 
+def _flake_attrs(project: Project) -> list[str]:
+    """All attribute names this project's flake exposes under
+    `packages.${system}`. Used by a parent flake to enumerate re-exports of a
+    local-dep (`<lname>.<attr>` for each `<attr>` here).
+
+    Variant attrs keep the hyphen (`hello-debug`) since that's what
+    `_target_block` emits; B-merged target names are sanitized
+    (`frontend_greet`) because dots aren't legal Nix identifier characters."""
+    out: list[str] = []
+    for tname, target in project.targets.items():
+        if target.kind == "script":
+            continue
+        attr_base = _nix_id(tname)
+        if not target.variants:
+            out.append(attr_base)
+        else:
+            for vname in sorted(target.variants.keys()):
+                out.append(f"{attr_base}-{vname}")
+            out.append(attr_base)
+    for lname, ldep in project.local_deps.items():
+        if not ldep.sub_project:
+            continue
+        for sub_attr in _flake_attrs(ldep.sub_project):
+            out.append(_nix_id(f"{lname}_{sub_attr}"))
+    return out
+
+
+def _local_dep_url(project: Project, ldep) -> str:
+    """Produce a Nix path: URL for a local-dep, preferring a path relative to
+    the parent root (cleaner lockfile, portable across checkouts)."""
+    parent_root = project.root.resolve()
+    try:
+        rel = ldep.path.relative_to(parent_root)
+        return f"path:./{rel.as_posix()}"
+    except ValueError:
+        return f"path:{ldep.path}"
+
+
 def _target_block(target: Target, project: Project) -> str:
+    # `attr_base` is the rec-attr key. For B-merged targets it's the sanitized
+    # qualified name (`frontend_greet`); for parent-owned targets it equals
+    # `target.name` since `_nix_id` is a no-op on plain identifiers.
+    attr_base = _nix_id(target.qualified_name)
     if not target.variants:
         body = _mk_derivation(target, None, project)
-        return f"{target.name} = {body};"
+        return f"{attr_base} = {body};"
 
     lines: list[str] = []
     first_variant = sorted(target.variants.keys())[0]
     for vname in sorted(target.variants.keys()):
         variant = target.variants[vname]
-        attr = f"{target.name}-{vname}"
+        attr = f"{attr_base}-{vname}"
         body = _mk_derivation(target, variant, project)
         lines.append(f"{attr} = {body};")
     # Alias unqualified name to first variant
-    lines.append(f"{target.name} = {target.name}-{first_variant};")
+    lines.append(f"{attr_base} = {attr_base}-{first_variant};")
     return "\n".join(lines)
 
 
@@ -478,6 +591,9 @@ def generate(project: Project) -> str:
     for name, dep in project.git_deps.items():
         w(f"    {name}.url = {_nix_str(_git_input_url(dep))};")
         w(f"    {name}.flake = {'true' if dep.flake else 'false'};")
+    for lname, ldep in project.local_deps.items():
+        w(f"    {lname}.url = {_nix_str(_local_dep_url(project, ldep))};")
+        w(f"    {lname}.flake = {'true' if ldep.flake else 'false'};")
     w("  };")
     w("")
     w("  outputs = { self, nixpkgs, ... }@inputs:")
@@ -507,6 +623,19 @@ def generate(project: Project) -> str:
             continue
         block = _target_block(target, project)
         w(_indent(block, 10))
+
+    # Re-export every attr exposed by each local-dep's flake so the parent
+    # can `nix build path:.#frontend_app` and so `${frontend.app}` (rewritten
+    # to `${frontend_app}`) interpolates inside the parent's `rec` scope.
+    for lname, ldep in project.local_deps.items():
+        if not ldep.sub_project:
+            continue
+        for sub_attr in _flake_attrs(ldep.sub_project):
+            parent_attr = _nix_id(f"{lname}_{sub_attr}")
+            w(_indent(
+                f"{parent_attr} = inputs.{lname}.packages.${{system}}.{sub_attr};",
+                10,
+            ))
 
     w("        });")
     w("    };")

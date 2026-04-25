@@ -63,7 +63,27 @@ def cmd_list(args: argparse.Namespace) -> int:
             print(f"  {name} [{target.kind}] variants: {variants}")
         else:
             print(f"  {name} [{target.kind}]")
+    # Cross-flake (local-dep) targets, recursively flattened. Shown with the
+    # dotted CLI form so the user can copy-paste into `rigx build`.
+    _list_local_deps(project, prefix="")
     return 0
+
+
+def _list_local_deps(project, prefix: str) -> None:
+    for lname, ldep in project.local_deps.items():
+        sub = ldep.sub_project
+        if not sub:
+            continue
+        for tname, target in sub.targets.items():
+            if target.kind == "script":
+                continue
+            qual = f"{prefix}{lname}.{tname}"
+            if target.variants:
+                variants = ", ".join(target.variant_names())
+                print(f"  {qual} [{target.kind}, local-dep] variants: {variants}")
+            else:
+                print(f"  {qual} [{target.kind}, local-dep]")
+        _list_local_deps(sub, prefix=f"{prefix}{lname}.")
 
 
 def cmd_clean(args: argparse.Namespace) -> int:

@@ -61,7 +61,13 @@ def _nix_bin() -> str:
 
 
 def write_flake(project: Project) -> Path:
-    """Regenerate flake.nix at the project root. Returns the file path."""
+    """Regenerate flake.nix at the project root. Returns the file path.
+
+    Recursively regenerates flake.nix for every transitive local-dep so the
+    sub-flakes referenced as path inputs are themselves valid flakes."""
+    for ldep in project.local_deps.values():
+        if ldep.sub_project:
+            write_flake(ldep.sub_project)
     flake_path = _flake_path(project)
     flake_path.write_text(nix_gen.generate(project))
     return flake_path
@@ -110,22 +116,55 @@ def update_lock(project: Project) -> None:
 
 
 def _resolve_attr(project: Project, spec: str) -> str:
-    """Map a user target spec ('hello' or 'hello@debug') to a Nix attr name."""
+    """Map a user target spec to a Nix attr name. Accepted shapes:
+
+    - `hello`                — own target, no variant.
+    - `hello@debug`          — own target, variant.
+    - `frontend.app`         — local-dep (cross-flake) target, no variant.
+    - `frontend.app@release` — local-dep target, variant.
+
+    Cross-flake variants are validated against the sub-project's metadata
+    (loaded recursively at config time), so a typo'd variant fails fast here
+    instead of producing a missing-attr error from `nix build`."""
     if "@" in spec:
         name, variant = spec.split("@", 1)
     else:
         name, variant = spec, None
-    if name not in project.targets:
-        raise BuildError(f"no such target: {name}")
-    target = project.targets[name]
-    if variant is None:
-        return name
-    if variant not in target.variants:
+
+    dotted = "." in name
+    if dotted and name in project.targets:
+        # B-merged target (`frontend.greet` is a key in this flake's targets).
+        target = project.targets[name]
+    elif dotted:
+        # A-style cross-flake ref into a sibling local-dep.
+        resolved = project.find_target(name)
+        if resolved is None:
+            raise BuildError(f"no such target: {name}")
+        owning, target_name = resolved
+        target = owning.targets[target_name]
+    else:
+        if name not in project.targets:
+            raise BuildError(f"no such target: {name}")
+        target = project.targets[name]
+
+    if variant is not None and variant not in target.variants:
         available = ", ".join(target.variant_names()) or "(none)"
         raise BuildError(
             f"target {name!r} has no variant {variant!r}; available: {available}"
         )
-    return f"{name}-{variant}"
+
+    raw = name if variant is None else f"{name}-{variant}"
+    # Any dotted form (B-merged or cross-flake) gets sanitized for the Nix
+    # attr; plain own-target names pass through unchanged so existing
+    # hyphenated variant attrs (`hello-debug`) keep working.
+    return _nix_id(raw) if dotted else raw
+
+
+def _nix_id(name: str) -> str:
+    """Map a possibly-dotted/hyphenated rigx name to a Nix identifier.
+    Mirrors `nix_gen._nix_id` — kept duplicated to avoid a builder→nix_gen
+    private-symbol import."""
+    return name.replace(".", "_").replace("-", "_")
 
 
 def _all_attrs(project: Project) -> list[str]:
@@ -134,16 +173,20 @@ def _all_attrs(project: Project) -> list[str]:
     `script`-kind targets are excluded so `rigx build` with no arguments does
     not inadvertently run side-effecting tasks (publish, deploy, etc.). Run
     them explicitly with `rigx build <name>`.
+
+    Names are sanitized when dotted (B-merged module targets) so they match
+    the Nix attrs emitted by `nix_gen._target_block`.
     """
     attrs: list[str] = []
     for name, target in project.targets.items():
         if target.kind == "script":
             continue
+        attr_base = _nix_id(name) if "." in name else name
         if not target.variants:
-            attrs.append(name)
+            attrs.append(attr_base)
         else:
             for v in target.variant_names():
-                attrs.append(f"{name}-{v}")
+                attrs.append(f"{attr_base}-{v}")
     return attrs
 
 

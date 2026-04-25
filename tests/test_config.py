@@ -482,6 +482,422 @@ class VarsExpansion(unittest.TestCase):
                 config.load(root)
 
 
+class LocalDeps(unittest.TestCase):
+    @staticmethod
+    def _write(root: Path, rel: str, body: str) -> None:
+        p = root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(dedent(body).lstrip())
+
+    def _setup(self, parent_body: str, sub_body: str | None = None) -> Path:
+        tmp = tempfile.mkdtemp()
+        root = Path(tmp)
+        self._write(root, "rigx.toml", parent_body)
+        if sub_body is not None:
+            self._write(root, "sub/rigx.toml", sub_body)
+        self.addCleanup(lambda: __import__("shutil").rmtree(tmp))
+        return root
+
+    def test_parses_path_and_loads_subproject(self):
+        parent = """
+            [project]
+            name = "parent"
+
+            [dependencies.local.sub]
+            path = "./sub"
+        """
+        sub = """
+            [project]
+            name = "sub"
+
+            [targets.app]
+            kind = "executable"
+            sources = ["m.cpp"]
+        """
+        root = self._setup(parent, sub)
+        proj = config.load(root)
+        self.assertIn("sub", proj.local_deps)
+        self.assertIsNotNone(proj.local_deps["sub"].sub_project)
+        self.assertIn("app", proj.local_deps["sub"].sub_project.targets)
+
+    def test_missing_path_field(self):
+        parent = """
+            [project]
+            name = "parent"
+
+            [dependencies.local.sub]
+        """
+        root = self._setup(parent)
+        with self.assertRaisesRegex(ConfigError, "missing 'path'"):
+            config.load(root)
+
+    def test_path_does_not_contain_rigx_toml(self):
+        parent = """
+            [project]
+            name = "parent"
+
+            [dependencies.local.sub]
+            path = "./sub"
+        """
+        root = self._setup(parent)
+        (root / "sub").mkdir()
+        with self.assertRaisesRegex(ConfigError, "no rigx.toml at"):
+            config.load(root)
+
+    def test_collision_with_git_dep(self):
+        parent = """
+            [project]
+            name = "parent"
+
+            [dependencies.git.sub]
+            url = "https://example.com/x"
+
+            [dependencies.local.sub]
+            path = "./sub"
+        """
+        sub = """
+            [project]
+            name = "sub"
+        """
+        root = self._setup(parent, sub)
+        with self.assertRaisesRegex(ConfigError, "collides with dependencies.git"):
+            config.load(root)
+
+    def test_deps_internal_dotted_validation(self):
+        parent = """
+            [project]
+            name = "parent"
+
+            [dependencies.local.sub]
+            path = "./sub"
+
+            [targets.bundle]
+            kind = "custom"
+            install_script = "true"
+            deps.internal = ["sub.app"]
+        """
+        sub = """
+            [project]
+            name = "sub"
+
+            [targets.app]
+            kind = "executable"
+            sources = ["m.cpp"]
+        """
+        root = self._setup(parent, sub)
+        proj = config.load(root)
+        self.assertIn("sub.app", proj.targets["bundle"].deps.internal)
+
+    def test_deps_internal_unknown_local_dep(self):
+        parent = """
+            [project]
+            name = "parent"
+
+            [targets.bundle]
+            kind = "custom"
+            install_script = "true"
+            deps.internal = ["sub.app"]
+        """
+        root = self._setup(parent)
+        with self.assertRaisesRegex(ConfigError, "is not a defined target"):
+            config.load(root)
+
+    def test_deps_internal_unknown_target_in_local_dep(self):
+        parent = """
+            [project]
+            name = "parent"
+
+            [dependencies.local.sub]
+            path = "./sub"
+
+            [targets.bundle]
+            kind = "custom"
+            install_script = "true"
+            deps.internal = ["sub.missing"]
+        """
+        sub = """
+            [project]
+            name = "sub"
+
+            [targets.app]
+            kind = "executable"
+            sources = ["m.cpp"]
+        """
+        root = self._setup(parent, sub)
+        with self.assertRaisesRegex(ConfigError, "target 'missing' not found"):
+            config.load(root)
+
+    def test_cycle_detected(self):
+        # parent depends on sub; sub depends back on parent → cycle.
+        parent = """
+            [project]
+            name = "parent"
+
+            [dependencies.local.sub]
+            path = "./sub"
+        """
+        sub = """
+            [project]
+            name = "sub"
+
+            [dependencies.local.up]
+            path = ".."
+        """
+        root = self._setup(parent, sub)
+        with self.assertRaisesRegex(ConfigError, "cycle detected"):
+            config.load(root)
+
+
+class Modules(unittest.TestCase):
+    @staticmethod
+    def _write(root: Path, rel: str, body: str) -> None:
+        p = root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(dedent(body).lstrip())
+
+    def _setup(self, files: dict[str, str]) -> Path:
+        tmp = tempfile.mkdtemp()
+        root = Path(tmp)
+        for rel, body in files.items():
+            self._write(root, rel, body)
+        self.addCleanup(lambda: __import__("shutil").rmtree(tmp))
+        return root
+
+    def test_module_targets_get_namespaced(self):
+        root = self._setup({
+            "rigx.toml": """
+                [project]
+                name = "p"
+
+                [modules]
+                include = ["frontend"]
+            """,
+            "frontend/rigx.toml": """
+                [targets.app]
+                kind = "executable"
+                sources = ["src/main.cpp"]
+            """,
+            "frontend/src/main.cpp": "",
+        })
+        proj = config.load(root)
+        self.assertIn("frontend.app", proj.targets)
+        self.assertNotIn("app", proj.targets)
+        # Source paths are rewritten to be relative to the parent root.
+        self.assertEqual(
+            proj.targets["frontend.app"].sources, ["frontend/src/main.cpp"]
+        )
+        # Namespace is recorded on the dataclass.
+        self.assertEqual(proj.targets["frontend.app"].namespace, "frontend")
+        self.assertEqual(proj.targets["frontend.app"].name, "app")
+        self.assertEqual(proj.targets["frontend.app"].qualified_name, "frontend.app")
+
+    def test_module_globs_resolve_against_module_root(self):
+        root = self._setup({
+            "rigx.toml": """
+                [project]
+                name = "p"
+
+                [modules]
+                include = ["frontend"]
+            """,
+            "frontend/rigx.toml": """
+                [targets.app]
+                kind = "executable"
+                sources = ["src/**/*.cpp"]
+            """,
+            "frontend/src/a.cpp": "",
+            "frontend/src/sub/b.cpp": "",
+        })
+        proj = config.load(root)
+        self.assertEqual(
+            proj.targets["frontend.app"].sources,
+            ["frontend/src/a.cpp", "frontend/src/sub/b.cpp"],
+        )
+
+    def test_intra_module_dep_internal_auto_qualifies(self):
+        # Inside `frontend`, `deps.internal = ["lib"]` should bind to the
+        # same module's `lib` target (i.e., `frontend.lib`).
+        root = self._setup({
+            "rigx.toml": """
+                [project]
+                name = "p"
+
+                [modules]
+                include = ["frontend"]
+            """,
+            "frontend/rigx.toml": """
+                [targets.lib]
+                kind = "static_library"
+                sources = ["src/lib.cpp"]
+
+                [targets.app]
+                kind = "executable"
+                sources = ["src/main.cpp"]
+                deps.internal = ["lib"]
+            """,
+            "frontend/src/lib.cpp": "",
+            "frontend/src/main.cpp": "",
+        })
+        proj = config.load(root)
+        self.assertEqual(
+            proj.targets["frontend.app"].deps.internal, ["frontend.lib"]
+        )
+
+    def test_module_rejects_project_section(self):
+        root = self._setup({
+            "rigx.toml": """
+                [project]
+                name = "p"
+
+                [modules]
+                include = ["frontend"]
+            """,
+            "frontend/rigx.toml": """
+                [project]
+                name = "frontend"
+
+                [targets.app]
+                kind = "executable"
+                sources = ["m.cpp"]
+            """,
+        })
+        with self.assertRaisesRegex(ConfigError, "must not contain \\[project\\]"):
+            config.load(root)
+
+    def test_module_rejects_nixpkgs_section(self):
+        root = self._setup({
+            "rigx.toml": """
+                [project]
+                name = "p"
+
+                [modules]
+                include = ["frontend"]
+            """,
+            "frontend/rigx.toml": """
+                [nixpkgs]
+                ref = "nixos-23.05"
+
+                [targets.app]
+                kind = "executable"
+                sources = ["m.cpp"]
+            """,
+        })
+        with self.assertRaisesRegex(ConfigError, "must not contain \\[nixpkgs\\]"):
+            config.load(root)
+
+    def test_vars_collision_across_modules(self):
+        root = self._setup({
+            "rigx.toml": """
+                [project]
+                name = "p"
+
+                [vars]
+                shared = ["a"]
+
+                [modules]
+                include = ["frontend"]
+            """,
+            "frontend/rigx.toml": """
+                [vars]
+                shared = ["b"]
+
+                [targets.app]
+                kind = "executable"
+                sources = ["m.cpp"]
+            """,
+        })
+        with self.assertRaisesRegex(ConfigError, "vars.shared collides"):
+            config.load(root)
+
+    def test_nested_modules_chain_namespaces(self):
+        root = self._setup({
+            "rigx.toml": """
+                [project]
+                name = "p"
+
+                [modules]
+                include = ["outer"]
+            """,
+            "outer/rigx.toml": """
+                [modules]
+                include = ["inner"]
+            """,
+            "outer/inner/rigx.toml": """
+                [targets.deep]
+                kind = "executable"
+                sources = ["m.cpp"]
+            """,
+            "outer/inner/m.cpp": "",
+        })
+        proj = config.load(root)
+        self.assertIn("outer.inner.deep", proj.targets)
+        self.assertEqual(
+            proj.targets["outer.inner.deep"].sources, ["outer/inner/m.cpp"]
+        )
+
+    def test_cross_module_dep_internal(self):
+        # Module `app` references `lib.foo` (cross-module ref).
+        root = self._setup({
+            "rigx.toml": """
+                [project]
+                name = "p"
+
+                [modules]
+                include = ["lib", "app"]
+            """,
+            "lib/rigx.toml": """
+                [targets.foo]
+                kind = "static_library"
+                sources = ["foo.cpp"]
+            """,
+            "lib/foo.cpp": "",
+            "app/rigx.toml": """
+                [targets.main]
+                kind = "executable"
+                sources = ["main.cpp"]
+                deps.internal = ["lib.foo"]
+            """,
+            "app/main.cpp": "",
+        })
+        proj = config.load(root)
+        self.assertEqual(
+            proj.targets["app.main"].deps.internal, ["lib.foo"]
+        )
+
+    def test_target_name_collision_across_modules_errors(self):
+        root = self._setup({
+            "rigx.toml": """
+                [project]
+                name = "p"
+
+                [modules]
+                include = ["a", "b"]
+
+                [targets.shared]
+                kind = "executable"
+                sources = ["x.cpp"]
+            """,
+            "x.cpp": "",
+            "a/rigx.toml": """
+                [targets.tool]
+                kind = "executable"
+                sources = ["t.cpp"]
+            """,
+            "a/t.cpp": "",
+            "b/rigx.toml": """
+                [targets.tool]
+                kind = "executable"
+                sources = ["t.cpp"]
+            """,
+            "b/t.cpp": "",
+        })
+        # `a.tool` and `b.tool` are distinct (different namespaces). No collision.
+        proj = config.load(root)
+        self.assertIn("a.tool", proj.targets)
+        self.assertIn("b.tool", proj.targets)
+        self.assertIn("shared", proj.targets)
+
+
 class SourceGlobs(unittest.TestCase):
     def test_star_glob_expands_to_sorted_files(self):
         body = """
