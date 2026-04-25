@@ -101,55 +101,23 @@ kind    = "executable"
 sources = ["src/hello.zig"]
 zigflags = ["-O", "ReleaseFast"]
 
-# ─── Cross-compilation to ARM64 Linux, via `zig cc` ────────────────────────
-# Zig ships with clang + a portable libc layer, so `zig cc -target …` is a
-# self-contained C cross-compiler — no separate cross-gcc toolchain needed.
-# A single `pkgs.zig` covers any platform Zig supports.
+# ─── Cross-compilation, first-class via `target = …` ────────────────────────
+# `target = "aarch64-linux"` routes c/cxx through `pkgsCross.aarch64-multi…
+# .stdenv`, sets `GOOS/GOARCH` for go, passes `-target` to zig, and emits a
+# zigcc shim for nim. Same target shape, different language, different
+# platform — no custom build_script needed.
 
-# Plain C cross-compiled to aarch64-linux. Confirm with:
-#   file ./output/hello_c_arm64/bin/hello_c_arm64
 [targets.hello_c_arm64]
-kind         = "custom"
-deps.nixpkgs = ["zig"]
-build_script = """
-export HOME=$TMPDIR
-zig cc -target aarch64-linux-musl -O2 -o hello_c_arm64 src/hello.c
-"""
-install_script = """
-mkdir -p $out/bin
-cp hello_c_arm64 $out/bin/
-"""
+kind    = "executable"
+sources = ["src/hello.c"]
+target  = "aarch64-linux"
+cflags  = ["-O2"]
 
-# Nim cross-compiled to aarch64-linux. Nim emits C and shells out to a C
-# compiler; we plug `zig cc` in as that compiler via a tiny wrapper script.
-# Recipe adapted from https://codeberg.org/janAkali/nim_zigcc_guide
 [targets.hello_nim_arm64]
-kind         = "custom"
-deps.nixpkgs = ["nim", "zig"]
-build_script = """
-export HOME=$TMPDIR
-mkdir -p $TMPDIR/bin
-cat > $TMPDIR/bin/zigcc <<'SH'
-#!/usr/bin/env bash
-exec zig cc -target aarch64-linux-musl "$@"
-SH
-chmod +x $TMPDIR/bin/zigcc
-
-nim c \\
-  --cc:clang \\
-  --clang.exe:$TMPDIR/bin/zigcc \\
-  --clang.linkerexe:$TMPDIR/bin/zigcc \\
-  --cpu:arm64 \\
-  --os:linux \\
-  -d:release \\
-  --nimcache:$TMPDIR/nimcache \\
-  --out:hello_nim_arm64 \\
-  src/hello.nim
-"""
-install_script = """
-mkdir -p $out/bin
-cp hello_nim_arm64 $out/bin/
-"""
+kind      = "executable"
+sources   = ["src/hello.nim"]
+target    = "aarch64-linux"
+nim_flags = ["-d:release"]
 
 # `custom` is the escape hatch for non-trivial workflows the first-class
 # kinds don't cover. Here it stitches together previously-built targets

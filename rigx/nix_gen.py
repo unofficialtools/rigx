@@ -124,9 +124,19 @@ def _effective_compiler(target: Target, variant: Variant | None) -> str:
 
 
 def _stdenv_attr(target: Target, variant: Variant | None) -> str:
-    """Pick the nixpkgs stdenv attr for a c/cxx target. `compiler = "clang"`
-    → `clangStdenv`; `"gcc13"` → `gcc13Stdenv`. Empty / non-c/cxx returns the
-    default `stdenv`."""
+    """Pick the nixpkgs stdenv attr for a c/cxx target.
+
+    With a `target = …` set, route through `pkgsCross.<x>.stdenv` (or
+    `pkgsCross.<x>.<compiler>Stdenv` for a non-default compiler). Otherwise:
+    `compiler = "clang"` → `clangStdenv`; `"gcc13"` → `gcc13Stdenv`; empty
+    / non-c/cxx returns the default `stdenv`."""
+    triple = _effective_target(target, variant)
+    if target.language in ("c", "cxx") and triple:
+        info = _cross_info(triple)
+        cross_attr = info.get("pkgsCross", triple)
+        comp = _effective_compiler(target, variant)
+        sub = "stdenv" if (not comp or comp == "gcc") else f"{comp}Stdenv"
+        return f"pkgsCross.{cross_attr}.{sub}"
     if target.language not in ("c", "cxx"):
         return "stdenv"
     comp = _effective_compiler(target, variant)
@@ -136,12 +146,18 @@ def _stdenv_attr(target: Target, variant: Variant | None) -> str:
 
 
 def _toolchain_pkgs(target: Target, variant: Variant | None) -> list[str]:
-    """nixpkgs attrs auto-added to nativeBuildInputs for go/rust/zig
-    targets. C/cxx come from the stdenv directly, so this is empty."""
+    """nixpkgs attrs auto-added to nativeBuildInputs for go/rust/zig/nim
+    targets. C/cxx come from the stdenv directly, so this is empty.
+
+    Cross-compiling Nim adds `zig` (used as the C compiler shim — see
+    `_build_phase_nim_executable`)."""
     if target.language not in DEFAULT_COMPILER_FOR_LANG:
         return []
     comp = _effective_compiler(target, variant) or DEFAULT_COMPILER_FOR_LANG[target.language]
-    return [comp]
+    pkgs = [comp]
+    if target.language == "nim" and _effective_target(target, variant):
+        pkgs.append("zig")
+    return pkgs
 
 
 # Mirrors `config.DEFAULT_COMPILER` but kept here so nix_gen doesn't have to
@@ -152,6 +168,63 @@ DEFAULT_COMPILER_FOR_LANG = {
     "zig":  "zig",
     "nim":  "nim",
 }
+
+
+# Friendly cross-compilation target alias → details for each backend.
+# `pkgsCross` is the nixpkgs `pkgsCross.<attr>` used for c/cxx (provides the
+# cross stdenv). `zig_triple` is what `zig cc -target …` and `--cpu/--os`
+# expect. `goos`/`goarch` set Go's environment.
+CROSS_TARGETS: dict[str, dict[str, str]] = {
+    "aarch64-linux": {
+        "pkgsCross":  "aarch64-multiplatform",
+        "zig_triple": "aarch64-linux-musl",
+        "nim_cpu":    "arm64",
+        "nim_os":     "linux",
+        "goos":       "linux",
+        "goarch":     "arm64",
+    },
+    "armv7-linux": {
+        "pkgsCross":  "armv7l-hf-multiplatform",
+        "zig_triple": "arm-linux-musleabihf",
+        "nim_cpu":    "arm",
+        "nim_os":     "linux",
+        "goos":       "linux",
+        "goarch":     "arm",
+    },
+    "x86_64-linux-musl": {
+        "pkgsCross":  "musl64",
+        "zig_triple": "x86_64-linux-musl",
+        "nim_cpu":    "amd64",
+        "nim_os":     "linux",
+        "goos":       "linux",
+        "goarch":     "amd64",
+    },
+    "x86_64-windows": {
+        "pkgsCross":  "mingwW64",
+        "zig_triple": "x86_64-windows-gnu",
+        "nim_cpu":    "amd64",
+        "nim_os":     "windows",
+        "goos":       "windows",
+        "goarch":     "amd64",
+    },
+}
+
+
+def _cross_info(triple: str) -> dict[str, str]:
+    """Resolve a `target = …` value to the per-backend cross details. The
+    raw string is also accepted as a fallback (caller is on their own to
+    make sure the underlying tools recognize it)."""
+    if not triple:
+        return {}
+    if triple in CROSS_TARGETS:
+        return CROSS_TARGETS[triple]
+    return {"pkgsCross": triple, "zig_triple": triple}
+
+
+def _effective_target(target: Target, variant: Variant | None) -> str:
+    if variant and variant.target:
+        return variant.target
+    return target.target
 
 
 def _is_cross_flake_ref(d: str, project: Project) -> bool:
@@ -276,6 +349,16 @@ def _build_phase_go_executable(
     parts += ["-o", target.name]
     parts += target.sources
     cmd = " ".join(parts)
+    triple = _effective_target(target, variant)
+    cross_env = ""
+    if triple:
+        info = _cross_info(triple)
+        if "goos" in info and "goarch" in info:
+            cross_env = (
+                f"export GOOS={info['goos']}\n"
+                f"export GOARCH={info['goarch']}\n"
+                f"export CGO_ENABLED=0\n"
+            )
     # Go wants writable HOME and module/cache dirs; stdenv's defaults are
     # read-only or unset.
     return (
@@ -283,6 +366,7 @@ def _build_phase_go_executable(
         "export HOME=$TMPDIR\n"
         "export GOCACHE=$TMPDIR/go-cache\n"
         "export GOPATH=$TMPDIR/go\n"
+        f"{cross_env}"
         f"{cmd}\n"
         "runHook postBuild\n"
     )
@@ -314,7 +398,10 @@ def _build_phase_zig_executable(
         raise ValueError(f"zig executable {target.name!r} needs at least one source")
     entry = target.sources[0]
     flags = _effective_zigflags(target, variant)
+    triple = _effective_target(target, variant)
     parts = ["zig", "build-exe"]
+    if triple:
+        parts += ["-target", _cross_info(triple).get("zig_triple", triple)]
     parts += flags
     parts += [f"-femit-bin={target.name}", entry]
     cmd = " ".join(parts)
@@ -385,6 +472,78 @@ def _build_phase_c_static_library(
     return "\n".join(lines) + "\n"
 
 
+def _build_phase_cxx_shared_library(
+    target: Target, variant: Variant | None, project: Project
+) -> str:
+    cxxflags = _effective_cxxflags(target, variant)
+    ldflags = _effective_ldflags(target, variant)
+    includes = [f"-I{i}" for i in target.includes]
+    internal_includes = _internal_include_args(target, project)
+    parts = ["$CXX", "-shared", "-fPIC"]
+    parts += cxxflags
+    parts += includes
+    parts += internal_includes
+    parts += target.sources
+    parts += ldflags
+    parts += ["-o", f"lib{target.name}.so"]
+    return (
+        "runHook preBuild\n"
+        f"{' '.join(parts)}\n"
+        "runHook postBuild\n"
+    )
+
+
+def _build_phase_c_shared_library(
+    target: Target, variant: Variant | None, project: Project
+) -> str:
+    cflags = _effective_cflags(target, variant)
+    ldflags = _effective_ldflags(target, variant)
+    includes = [f"-I{i}" for i in target.includes]
+    internal_includes = _internal_include_args(target, project)
+    parts = ["$CC", "-shared", "-fPIC"]
+    parts += cflags
+    parts += includes
+    parts += internal_includes
+    parts += target.sources
+    parts += ldflags
+    parts += ["-o", f"lib{target.name}.so"]
+    return (
+        "runHook preBuild\n"
+        f"{' '.join(parts)}\n"
+        "runHook postBuild\n"
+    )
+
+
+def _build_phase_rust_shared_library(
+    target: Target, variant: Variant | None, project: Project
+) -> str:
+    if not target.sources:
+        raise ValueError(f"rust shared_library {target.name!r} needs at least one source")
+    entry = target.sources[0]
+    flags = _effective_rustflags(target, variant)
+    parts = ["rustc", "--crate-type=cdylib", f"--crate-name={target.name}"]
+    parts += flags
+    parts += ["-o", f"lib{target.name}.so", entry]
+    return (
+        "runHook preBuild\n"
+        "export HOME=$TMPDIR\n"
+        f"{' '.join(parts)}\n"
+        "runHook postBuild\n"
+    )
+
+
+def _install_phase_shared_library(target: Target) -> str:
+    lines = [
+        "runHook preInstall",
+        "mkdir -p $out/lib $out/include",
+        f"cp lib{target.name}.so $out/lib/",
+    ]
+    for ph in target.public_headers:
+        lines.append(f"cp -r {ph}/. $out/include/")
+    lines.append("runHook postInstall")
+    return "\n".join(lines) + "\n"
+
+
 def _build_phase_rust_static_library(
     target: Target, variant: Variant | None, project: Project
 ) -> str:
@@ -422,17 +581,45 @@ def _build_phase_nim_executable(
         raise ValueError(f"nim executable {target.name!r} needs at least one source")
     entry = target.sources[0]
     flags = _effective_nim_flags(target, variant)
+    triple = _effective_target(target, variant)
 
     parts = ["nim", "c"]
+    if triple:
+        # Auto-emit a zigcc shim and point Nim at it. The shim wraps
+        # `zig cc -target <zig_triple>` so Nim's clang invocation produces
+        # cross-compiled output. Recipe per the nim_zigcc guide.
+        info = _cross_info(triple)
+        nim_cpu = info.get("nim_cpu") or info.get("zig_triple", "").split("-")[0]
+        nim_os = info.get("nim_os") or info.get("zig_triple", "").split("-")[1]
+        parts += [
+            "--cc:clang",
+            "--clang.exe:$TMPDIR/bin/zigcc",
+            "--clang.linkerexe:$TMPDIR/bin/zigcc",
+            f"--cpu:{nim_cpu}",
+            f"--os:{nim_os}",
+        ]
     parts += flags
     parts += ["--nimcache:./nimcache", f"--out:{target.name}", entry]
     cmd = " ".join(parts)
+
+    shim = ""
+    if triple:
+        zig_target = _cross_info(triple).get("zig_triple", triple)
+        # Avoid heredocs here — `_indent` would break their terminator. Two
+        # plain echos write the shim with no escaping pitfalls.
+        shim = (
+            "mkdir -p $TMPDIR/bin\n"
+            "echo '#!/usr/bin/env bash' > $TMPDIR/bin/zigcc\n"
+            f"echo 'exec zig cc -target {zig_target} \"$@\"' >> $TMPDIR/bin/zigcc\n"
+            "chmod +x $TMPDIR/bin/zigcc\n"
+        )
 
     # Nim wants a writable HOME (for nimcache defaults etc.); stdenv's default
     # /homeless-shelter is read-only.
     return (
         "runHook preBuild\n"
         "export HOME=$TMPDIR\n"
+        f"{shim}"
         f"{cmd}\n"
         "runHook postBuild\n"
     )
@@ -715,11 +902,23 @@ def _mk_derivation(
                 f"{target.language!r}"
             )
         install_phase = _install_phase_static_library(target)
+    elif target.kind == "shared_library":
+        if language == "cxx":
+            build_phase = _build_phase_cxx_shared_library(target, variant, project)
+        elif language == "c":
+            build_phase = _build_phase_c_shared_library(target, variant, project)
+        elif language == "rust":
+            build_phase = _build_phase_rust_shared_library(target, variant, project)
+            extra_native = _toolchain_pkgs(target, variant)
+        else:
+            raise ValueError(
+                f"shared_library {target.name!r}: unsupported language "
+                f"{target.language!r}"
+            )
+        install_phase = _install_phase_shared_library(target)
     elif target.kind == "run":
         build_phase = _build_phase_run(target, project)
         install_phase = _install_phase_run(target)
-    elif target.kind == "shared_library":
-        raise NotImplementedError("shared_library kind not yet supported")
     else:
         raise ValueError(f"unknown kind {target.kind!r}")
 
@@ -760,7 +959,7 @@ def _flake_attrs(project: Project) -> list[str]:
     (`frontend_greet`) because dots aren't legal Nix identifier characters."""
     out: list[str] = []
     for tname, target in project.targets.items():
-        if target.kind == "script":
+        if target.kind in ("script", "test"):
             continue
         attr_base = _nix_id(tname)
         if not target.variants:
@@ -849,8 +1048,9 @@ def generate(project: Project) -> str:
     w("        in rec {")
 
     for tname, target in project.targets.items():
-        # `script` targets are host-side tasks; they don't become Nix derivations.
-        if target.kind == "script":
+        # `script` and `test` targets are host-side tasks; they don't become
+        # Nix derivations (they run via `rigx run` / `rigx test`).
+        if target.kind in ("script", "test"):
             continue
         block = _target_block(target, project)
         w(_indent(block, 10))

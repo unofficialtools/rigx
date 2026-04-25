@@ -87,6 +87,19 @@ What's different:
 - **Multi-language, first-class**: C, C++, Go, Rust, Zig, Nim, Python — pick
   by extension or set `language = "..."` explicitly. Anything else (Cargo
   workspaces, `cmake`, custom build pipelines) goes through `kind = "custom"`.
+- **Cross-compilation** built in: `target = "aarch64-linux"` (or
+  `armv7-linux`, `x86_64-windows`, …) routes c/cxx through `pkgsCross.<x>`,
+  sets `GOOS`/`GOARCH` for Go, passes `-target` to Zig, auto-emits a `zigcc`
+  shim for Nim. Combine with variants for one-source / multi-platform builds.
+- **Multi-folder projects**: split a project into subfolders via
+  `[modules]` (merged into one flake) or `[dependencies.local.*]` (each
+  subfolder is its own flake, parent depends on built artifacts).
+- **Sharable vars** (`[vars]` + `extends`) keep flag/source/dep lists
+  DRY across targets and across files.
+- **Built-in workflow tools**: `rigx watch` (rebuild on change),
+  `rigx test` (discover-and-run `kind = "test"` targets), `rigx new`
+  (scaffold a target + stub source), `rigx fmt` (canonical TOML),
+  `rigx graph` (Mermaid dep graph), `rigx build --json` (CI-friendly output).
 
 ## Requirements
 
@@ -153,8 +166,14 @@ rigx lock                 # generate flake.nix and update flake.lock
 rigx build                # build every target (and variant)
 rigx build hello          # build one target
 rigx build hello@release  # build a specific variant
-rigx flake                # print generated flake.nix (for debugging)
+rigx build --json         # machine-readable output for CI / scripts
+rigx watch [target]       # rebuild on source change (Ctrl-C to stop)
+rigx test                 # discover & run all kind=test targets
+rigx test smoke perf      # run only the named tests
 rigx graph hello          # print a Mermaid dep graph for one target
+rigx flake                # print generated flake.nix (for debugging)
+rigx fmt [--write]        # canonical-format rigx.toml (comments not preserved)
+rigx new executable foo   # scaffold a new target + stub source files
 rigx clean                # remove output/
 rigx run publish          # execute a script-kind target (publish/deploy/etc.)
 rigx run deploy -- --dry-run prod   # forward args after `--` as $1, $2, …
@@ -219,6 +238,25 @@ cxxflags = ["$vars.opt_release", "-DNDEBUG"]
 - Works in every list field of a target or variant: `sources`, `includes`,
   `public_headers`, `cxxflags`, `ldflags`, `nim_flags`, `args`, `outputs`,
   `native_build_inputs`, and all three `deps.*` lists.
+
+**Sharing vars across files** — the reserved key `extends` pulls in `[vars]`
+from another TOML file, useful when independent rigx projects (e.g. siblings
+declared via `[dependencies.local.*]`) want a common toolchain config:
+
+```toml
+# shared.toml
+[vars]
+cxx_libs = ["fmt", "spdlog"]
+opt      = ["-O2", "-flto"]
+
+# rigx.toml
+[vars]
+extends = ["../shared.toml"]    # paths relative to this file
+local   = ["x"]
+```
+
+Extended files are loaded recursively (with cycle detection); collisions
+across `extends` chains and the local table are config errors.
 
 ### `[dependencies.git.<name>]`
 
@@ -331,8 +369,9 @@ Fields common to several kinds:
 | `kind`                 | string          | One of the kinds listed below. **Required.**     |
 | `sources`              | list[string]    | Source files (paths or globs, relative to root). |
 | `includes`             | list[string]    | Header / include search paths.                   |
-| `language`             | string          | Override extension-based inference: `c`, `cxx`, `go`, `rust`, `zig`. |
-| `compiler`             | string          | Toolchain selector: stdenv variant (c/cxx) or nixpkgs attr (go/rust/zig). |
+| `language`             | string          | Override extension-based inference: `c`, `cxx`, `go`, `rust`, `zig`, `nim`. |
+| `compiler`             | string          | Toolchain selector: stdenv variant (c/cxx) or nixpkgs attr (go/rust/zig/nim). |
+| `target`               | string          | Cross-compilation triple (e.g. `aarch64-linux`). See Cross-compilation below. |
 | `cflags`               | list[string]    | Compiler flags (C).                              |
 | `cxxflags`             | list[string]    | Compiler flags (C++).                            |
 | `goflags`              | list[string]    | Flags forwarded to `go build` (Go).              |
@@ -380,7 +419,7 @@ compiler = "gcc13"
 
 ## Kinds
 
-### `executable` — C, C++, Go, Rust, or Zig program
+### `executable` — C, C++, Go, Rust, Zig, or Nim program
 
 ```toml
 [targets.hello]
@@ -394,8 +433,9 @@ deps.nixpkgs  = ["fmt"]
 ```
 
 - **Language is inferred from source extensions**: `.c` → C, `.cpp`/`.cxx`/
-  `.cc`/`.C` → C++, `.go` → Go, `.rs` → Rust, `.zig` → Zig. Mixed sources
-  require an explicit `language = "cxx"` (etc.) to disambiguate.
+  `.cc`/`.C` → C++, `.go` → Go, `.rs` → Rust, `.zig` → Zig, `.nim` → Nim.
+  Mixed sources require an explicit `language = "cxx"` (etc.) to
+  disambiguate.
 - **Compiler choice** with `compiler = "..."`:
   - C/C++: names a stdenv variant — `"clang"` → `clangStdenv`, `"gcc13"` →
     `gcc13Stdenv`, etc. Default is `pkgs.stdenv` (gcc on Linux, clang on macOS).
@@ -465,6 +505,42 @@ deps.nixpkgs   = ["fmt"]
 > file in `sources` and the `nim` toolchain is auto-pulled from nixpkgs.
 > See `executable` above for the Nim example. The earlier `nim_executable`
 > kind has been retired.
+
+### `shared_library` — C, C++, or Rust shared object
+
+```toml
+[targets.mylib]
+kind           = "shared_library"
+sources        = ["src/mylib.cpp"]
+public_headers = ["include"]
+cxxflags       = ["-std=c++17", "-Wall"]
+```
+
+- Build line: `$CXX -shared -fPIC … -o lib<name>.so` (analogous for C and
+  Rust's `--crate-type=cdylib`).
+- Output: `$out/lib/lib<name>.so` and `$out/include/<public_headers…>`.
+- Same language constraints as `static_library` (`c`, `cxx`, `rust`); same
+  per-language flag fields.
+- macOS produces `.so` for cross-platform parity. If you need `.dylib`
+  conventions specifically, `kind = "custom"` is the right escape hatch.
+
+### `test` — host-side check, discovered by `rigx test`
+
+```toml
+[targets.unit_tests]
+kind         = "test"
+deps.nixpkgs = ["bash"]
+script       = """
+./output/myapp/bin/myapp --self-test
+"""
+```
+
+- Same shape as `script` (host-side, runs in `nix shell` with
+  `deps.nixpkgs` on PATH, `bash -eo pipefail`).
+- Discovered by `rigx test` (which runs each, exit-0=pass, prints a
+  summary, returns the worst exit code).
+- Excluded from `rigx build`. Naming a test target there errors with a
+  pointer to `rigx test`.
 
 ### `python_script` — Python entry-point + uv-managed venv
 
@@ -618,75 +694,62 @@ keys, …) are read from your shell environment — set them before invoking
 
 ## Cross-compilation
 
-rigx doesn't have a first-class `target = "aarch64-linux"` field yet, but
-cross-compiling to a different CPU/OS works cleanly through `kind = "custom"`
-plus **`zig cc`** as the compiler. Zig ships with clang and a portable libc
-layer, so a single `pkgs.zig` covers every platform Zig supports — no
-separate cross-gcc toolchain to install.
-
-### C → aarch64-linux
+Set `target = "<triple>"` on an `executable` or `static_library` and rigx
+routes the build through the right cross toolchain. No `kind = "custom"`,
+no zigcc shim to maintain by hand. Works for c, cxx, go, zig, and nim.
 
 ```toml
 [targets.hello_c_arm64]
-kind         = "custom"
-deps.nixpkgs = ["zig"]
-build_script = """
-export HOME=$TMPDIR
-zig cc -target aarch64-linux-musl -O2 -o hello_c_arm64 src/hello.c
-"""
-install_script = """
-mkdir -p $out/bin
-cp hello_c_arm64 $out/bin/
-"""
+kind    = "executable"
+sources = ["src/hello.c"]
+target  = "aarch64-linux"      # → pkgs.pkgsCross.aarch64-multiplatform.stdenv
+
+[targets.hello_nim_arm64]
+kind      = "executable"
+sources   = ["src/hello.nim"]
+target    = "aarch64-linux"    # → auto-emit zigcc shim, set --cpu/--os
+nim_flags = ["-d:release"]
 ```
 
-```
-rigx build hello_c_arm64
-file ./output/hello_c_arm64/bin/hello_c_arm64
-# → ELF 64-bit LSB executable, ARM aarch64, statically linked, …
-```
+What each backend does with `target`:
 
-### Nim → aarch64-linux
+| Language | Behavior |
+|---|---|
+| `c`, `cxx`            | Routes through `pkgs.pkgsCross.<x>.stdenv` (or `<compiler>Stdenv`). $CC/$CXX point at the cross-gcc/cross-clang. |
+| `go`                  | Sets `GOOS=…`, `GOARCH=…`, `CGO_ENABLED=0` before `go build`. |
+| `zig`                 | Adds `-target <triple>` to `zig build-exe` (Zig is a cross-compiler natively). |
+| `nim`                 | Auto-emits a `zigcc` shim wrapping `zig cc -target …`, points Nim at it via `--cc:clang --clang.exe:zigcc`, sets `--cpu` / `--os`. Pulls `pkgs.zig` automatically. Recipe per the [nim_zigcc guide](https://codeberg.org/janAkali/nim_zigcc_guide). |
+| `rust`                | (not yet wired through `target` — fall back to `kind = "custom"` for cross-Rust until then). |
 
-Nim invokes a C compiler under the hood. Wrap `zig cc` in a tiny shim and
-point Nim at it via `--clang.exe` / `--clang.linkerexe`. Recipe adapted from
-[the nim_zigcc guide](https://codeberg.org/janAkali/nim_zigcc_guide):
+Built-in target aliases (resolve to the right `pkgsCross.<x>` / Zig triple
+/ `GOOS`/`GOARCH`):
+
+| `target = …`         | Meaning                                              |
+|----------------------|------------------------------------------------------|
+| `aarch64-linux`      | ARM64 Linux (musl on Zig/Nim, glibc on c/cxx)        |
+| `armv7-linux`        | ARMv7 hard-float Linux                               |
+| `x86_64-linux-musl`  | x86_64 Linux, musl libc                              |
+| `x86_64-windows`     | x86_64 Windows (mingw-w64)                           |
+
+Anything else passes through verbatim (you're responsible for the spelling
+matching whatever the underlying tool expects).
+
+Use variants to produce both native and cross binaries from the same source:
 
 ```toml
-[targets.hello_nim_arm64]
-kind         = "custom"
-deps.nixpkgs = ["nim", "zig"]
-build_script = """
-export HOME=$TMPDIR
-mkdir -p $TMPDIR/bin
-cat > $TMPDIR/bin/zigcc <<'SH'
-#!/usr/bin/env bash
-exec zig cc -target aarch64-linux-musl "$@"
-SH
-chmod +x $TMPDIR/bin/zigcc
+[targets.hello]
+kind    = "executable"
+sources = ["src/hello.c"]
 
-nim c \\
-  --cc:clang \\
-  --clang.exe:$TMPDIR/bin/zigcc \\
-  --clang.linkerexe:$TMPDIR/bin/zigcc \\
-  --cpu:arm64 \\
-  --os:linux \\
-  -d:release \\
-  --nimcache:$TMPDIR/nimcache \\
-  --out:hello_nim_arm64 \\
-  src/hello.nim
-"""
-install_script = """
-mkdir -p $out/bin
-cp hello_nim_arm64 $out/bin/
-"""
+[targets.hello.variants.arm64]
+target = "aarch64-linux"
+
+[targets.hello.variants.windows]
+target = "x86_64-windows"
 ```
 
-To target a different platform, swap the `-target` triple — `zig cc -h` on
-the host lists everything Zig knows (Linux/macOS/Windows on
-x86_64/aarch64/armv7/riscv/…). For variants of the same target across
-platforms, factor the triple into `[vars]` and reference it from each
-build_script.
+Then `rigx build hello@arm64`, `rigx build hello@windows`, or just
+`rigx build hello` for all of them.
 
 ---
 
@@ -750,6 +813,81 @@ Notes:
   has the metadata.
 - The `run` field on a `kind = "run"` target is treated as an implicit
   dep edge to the named target.
+
+---
+
+## Workflow tools
+
+A handful of small commands round out day-to-day use:
+
+### `rigx new <kind> <name>` — scaffold a target
+
+Appends a `[targets.<name>]` block to `rigx.toml` and writes a stub source
+file (when applicable). Refuses to overwrite an existing target name or
+existing files.
+
+```
+rigx new executable hello                 # cxx default; src/hello.cpp
+rigx new executable tool --language go    # src/tool.go
+rigx new static_library mylib             # src/mylib.cpp + include/mylib.h
+rigx new test smoke                       # kind=test stub; run via `rigx test`
+rigx new run gen --run my_tool            # kind=run, invokes my_tool
+```
+
+Supported kinds: `executable`, `static_library`, `python_script`,
+`custom`, `script`, `run`, `test`. Languages for the first two:
+`c`, `cxx`, `go`, `rust`, `zig`, `nim`.
+
+### `rigx watch [target …]` — rebuild on change
+
+Polls the project tree (skipping `output/`, `.git`, `flake.lock`) every
+0.5s and rebuilds the named targets whenever a file's mtime bumps. Cheap
+implementation deliberately — no `inotify` / `fsevents` dependency, works
+identically on Linux/macOS. Ctrl-C exits.
+
+```
+rigx watch              # all targets
+rigx watch hello        # one target
+rigx watch hello@arm64  # specific variant
+```
+
+### `rigx test [target …]` — discover-and-run tests
+
+`kind = "test"` targets are flagged as testable host-side tasks; they're
+*excluded* from `rigx build`. `rigx test` finds them all, runs each
+through `nix shell` (with `deps.nixpkgs` on PATH), and reports a
+PASS/FAIL summary. Exit code is the worst test's exit code so CI can
+gate on it.
+
+```
+rigx test                # run all kind=test targets
+rigx test smoke          # run just one
+```
+
+### `rigx fmt [--write]` — canonical TOML
+
+Re-emits `rigx.toml` in a stable shape: top-level sections in fixed
+order, schema-aware field ordering within each table, `=` aligned per
+section. Useful for code review and to settle nit-pick disagreements.
+
+```
+rigx fmt                 # print canonical to stdout
+rigx fmt --write         # overwrite rigx.toml in place
+```
+
+> Caveat: comments are not preserved. Python's stdlib `tomllib` strips
+> them on parse and re-emitting them faithfully needs a
+> comment-preserving parser. Pipe through stdout first if you have
+> comments you care about.
+
+### `rigx build --json` — machine-readable output
+
+Emits a JSON array of `{attr, output}` instead of the human-readable
+list, for CI/scripts that want to consume rigx's output.
+
+```
+rigx build --json | jq '.[] | select(.attr == "hello") | .output'
+```
 
 ---
 

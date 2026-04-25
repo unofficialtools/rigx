@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
-from rigx import builder, config, graph, nix_gen
+from rigx import builder, config, fmt, graph, nix_gen, scaffold
 
 
 def _find_project_root(start: Path) -> Path:
@@ -39,8 +40,16 @@ def cmd_build(args: argparse.Namespace) -> int:
     except builder.BuildError as e:
         _report_build_error(e)
         return 1
-    for attr, link in results:
-        print(f"  {attr} -> {link}")
+    if args.json:
+        # Machine-readable form for CI / scripts. One JSON array per call;
+        # each element is `{attr, output}` (the symlink path under output/).
+        print(json.dumps(
+            [{"attr": a, "output": str(p)} for a, p in results],
+            indent=2,
+        ))
+    else:
+        for attr, link in results:
+            print(f"  {attr} -> {link}")
     return 0
 
 
@@ -111,6 +120,141 @@ def cmd_graph(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_watch(args: argparse.Namespace) -> int:
+    """Re-build target(s) whenever a source file changes. Polls every 0.5s,
+    skipping output/, .git, flake.lock — keeps the implementation portable
+    (no inotify/fsevents dependency). Exit with Ctrl-C."""
+    import time
+    project = _load(args)
+    targets = args.targets
+    print(f"[rigx] watching {project.root} (Ctrl-C to stop)")
+
+    def scan() -> float:
+        latest = 0.0
+        skip = {".git", "output", "result", ".rigx"}
+        skip_files = {"flake.lock"}
+        for path in project.root.rglob("*"):
+            if any(part in skip for part in path.relative_to(project.root).parts):
+                continue
+            if path.name in skip_files:
+                continue
+            if path.is_file():
+                m = path.stat().st_mtime
+                if m > latest:
+                    latest = m
+        return latest
+
+    last = scan()
+    # Trigger one build at startup so the user sees current state.
+    try:
+        results = builder.build(project, targets)
+        for attr, link in results:
+            print(f"  {attr} -> {link}")
+        print("[rigx] watching for changes…")
+    except builder.BuildError as e:
+        _report_build_error(e)
+        print("[rigx] (still watching — fix the error to retry)")
+    try:
+        while True:
+            time.sleep(0.5)
+            now = scan()
+            if now > last:
+                last = now
+                print("[rigx] change detected, rebuilding…")
+                try:
+                    results = builder.build(project, targets)
+                    for attr, link in results:
+                        print(f"  {attr} -> {link}")
+                    print("[rigx] OK")
+                except builder.BuildError as e:
+                    _report_build_error(e)
+    except KeyboardInterrupt:
+        print()
+        return 0
+
+
+def cmd_new(args: argparse.Namespace) -> int:
+    """Append a new `[targets.<name>]` block (and stub source files) to the
+    current rigx.toml. Refuses to overwrite existing target names or files."""
+    root = Path(args.project) if args.project else Path.cwd()
+    toml_path = root / "rigx.toml"
+    if not toml_path.is_file():
+        print(
+            f"rigx: no rigx.toml at {toml_path} — create one with a "
+            f"[project] section first.",
+            file=sys.stderr,
+        )
+        return 1
+    # Cheap target-name collision check via TOML parse (we don't need the
+    # full Project graph here — just to know which names are taken).
+    import tomllib
+    with toml_path.open("rb") as f:
+        data = tomllib.load(f)
+    if args.name in data.get("targets", {}):
+        print(
+            f"rigx: target {args.name!r} already exists in {toml_path}",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        s = scaffold.scaffold(args.kind, args.name, args.language, args.run)
+    except ValueError as e:
+        print(f"rigx: {e}", file=sys.stderr)
+        return 1
+    for rel, body in s.files.items():
+        path = root / rel
+        if path.exists():
+            print(f"rigx: refusing to overwrite existing file {path}", file=sys.stderr)
+            return 1
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body)
+        print(f"  wrote {rel}")
+    with toml_path.open("a") as f:
+        f.write(s.toml_block)
+    print(f"  appended [targets.{args.name}] to rigx.toml")
+    return 0
+
+
+def cmd_fmt(args: argparse.Namespace) -> int:
+    """Print a canonical reformat of rigx.toml to stdout. With `--write`,
+    overwrite the file in place. Comments are not preserved (tomllib
+    strips them on parse) — pipe through stdout to inspect first."""
+    root = Path(args.project) if args.project else Path.cwd()
+    toml_path = root / "rigx.toml"
+    if not toml_path.is_file():
+        print(f"rigx: no rigx.toml at {toml_path}", file=sys.stderr)
+        return 1
+    canonical = fmt.format_file(toml_path, write=args.write)
+    if not args.write:
+        sys.stdout.write(canonical)
+    return 0
+
+
+def cmd_test(args: argparse.Namespace) -> int:
+    """Discover and run every `kind = "test"` target. Prints a per-test
+    PASS/FAIL line plus a summary; exit code is the worst test exit code."""
+    project = _load(args)
+    try:
+        results = builder.run_tests(project, args.targets or None)
+    except builder.BuildError as e:
+        _report_build_error(e)
+        return 1
+    if not results:
+        msg = "no test targets found" if not args.targets else \
+            f"no matching test targets: {args.targets}"
+        print(f"rigx test: {msg}", file=sys.stderr)
+        return 0 if not args.targets else 1
+    passed = [n for n, rc in results if rc == 0]
+    failed = [(n, rc) for n, rc in results if rc != 0]
+    print()
+    for n in passed:
+        print(f"  PASS  {n}")
+    for n, rc in failed:
+        print(f"  FAIL  {n}  (exit {rc})")
+    print(f"\n{len(passed)} passed, {len(failed)} failed")
+    return 0 if not failed else max(rc for _, rc in failed)
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     """Execute a script-kind target (e.g. publish, deploy)."""
     project = _load(args)
@@ -144,6 +288,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("build", help="build targets (default: all)")
     sp.add_argument("targets", nargs="*", help="target[@variant] selectors")
+    sp.add_argument(
+        "--json",
+        action="store_true",
+        help="emit results as a JSON array (machine-readable; for CI/scripts)",
+    )
     sp.set_defaults(func=cmd_build)
 
     sp = sub.add_parser("lock", help="update lock file")
@@ -164,6 +313,56 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sp.add_argument("target", help="target name (with optional @variant; ignored)")
     sp.set_defaults(func=cmd_graph)
+
+    sp = sub.add_parser(
+        "fmt",
+        help="canonicalize rigx.toml (prints to stdout; comments are NOT preserved)",
+    )
+    sp.add_argument(
+        "--write",
+        action="store_true",
+        help="overwrite rigx.toml in place (default: print to stdout)",
+    )
+    sp.set_defaults(func=cmd_fmt)
+
+    sp = sub.add_parser(
+        "test",
+        help="discover and run all `kind = \"test\"` targets",
+    )
+    sp.add_argument(
+        "targets",
+        nargs="*",
+        help="test target names to run (default: all kind=test targets)",
+    )
+    sp.set_defaults(func=cmd_test)
+
+    sp = sub.add_parser(
+        "watch",
+        help="rebuild on source change (polling, Ctrl-C to stop)",
+    )
+    sp.add_argument("targets", nargs="*", help="target[@variant] selectors")
+    sp.set_defaults(func=cmd_watch)
+
+    sp = sub.add_parser(
+        "new",
+        help="scaffold a new target (appends to rigx.toml, writes stub sources)",
+    )
+    sp.add_argument(
+        "kind",
+        choices=[
+            "executable", "static_library", "python_script",
+            "custom", "script", "run", "test",
+        ],
+    )
+    sp.add_argument("name", help="target name")
+    sp.add_argument(
+        "--language",
+        default="cxx",
+        choices=["c", "cxx", "go", "rust", "zig", "nim"],
+        help="source language for executable/static_library (default cxx)",
+    )
+    sp.add_argument("--run", help="for `kind=run`: the target/command to invoke")
+    sp.set_defaults(func=cmd_new)
 
     sp = sub.add_parser(
         "run",

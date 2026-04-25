@@ -650,6 +650,90 @@ class LanguageDispatch(unittest.TestCase):
         self.assertIn("-o libmylib.a src/lib.rs", out)
 
 
+class SharedLibrary(unittest.TestCase):
+    def test_cxx_shared_library_uses_shared_fpic(self):
+        t = Target(
+            name="mylib", kind="shared_library", language="cxx",
+            sources=["src/lib.cpp"], cxxflags=["-std=c++17"],
+            public_headers=["include"],
+        )
+        out = nix_gen.generate(_project(targets={"mylib": t}))
+        self.assertIn("$CXX -shared -fPIC", out)
+        self.assertIn("-o libmylib.so", out)
+        self.assertIn("cp libmylib.so $out/lib/", out)
+        self.assertIn("cp -r include/. $out/include/", out)
+
+    def test_rust_shared_library_uses_cdylib(self):
+        t = Target(
+            name="mylib", kind="shared_library", language="rust",
+            sources=["src/lib.rs"],
+        )
+        out = nix_gen.generate(_project(targets={"mylib": t}))
+        self.assertIn("rustc --crate-type=cdylib --crate-name=mylib", out)
+        self.assertIn("-o libmylib.so", out)
+
+
+class CrossCompilation(unittest.TestCase):
+    def test_c_target_routes_through_pkgs_cross(self):
+        t = Target(
+            name="hello", kind="executable", language="c",
+            sources=["m.c"], target="aarch64-linux",
+        )
+        out = nix_gen.generate(_project(targets={"hello": t}))
+        self.assertIn("pkgs.pkgsCross.aarch64-multiplatform.stdenv.mkDerivation", out)
+
+    def test_cxx_target_with_clang_uses_cross_clangstdenv(self):
+        t = Target(
+            name="hello", kind="executable", language="cxx",
+            sources=["m.cpp"], target="aarch64-linux", compiler="clang",
+        )
+        out = nix_gen.generate(_project(targets={"hello": t}))
+        self.assertIn("pkgs.pkgsCross.aarch64-multiplatform.clangStdenv", out)
+
+    def test_go_target_sets_goos_goarch(self):
+        t = Target(
+            name="hello", kind="executable", language="go",
+            sources=["m.go"], target="aarch64-linux",
+        )
+        out = nix_gen.generate(_project(targets={"hello": t}))
+        self.assertIn("export GOOS=linux", out)
+        self.assertIn("export GOARCH=arm64", out)
+        self.assertIn("export CGO_ENABLED=0", out)
+
+    def test_zig_target_passes_minus_target_flag(self):
+        t = Target(
+            name="hello", kind="executable", language="zig",
+            sources=["m.zig"], target="aarch64-linux",
+        )
+        out = nix_gen.generate(_project(targets={"hello": t}))
+        self.assertIn("zig build-exe -target aarch64-linux-musl", out)
+
+    def test_nim_target_emits_zigcc_shim_and_pulls_zig(self):
+        t = Target(
+            name="hello", kind="executable", language="nim",
+            sources=["m.nim"], target="aarch64-linux",
+        )
+        out = nix_gen.generate(_project(targets={"hello": t}))
+        # Toolchain auto-pulls both nim and zig.
+        self.assertIn("nativeBuildInputs = [ pkgs.nim pkgs.zig ]", out)
+        # Shim is emitted (echo-based to survive nix_gen's indenter).
+        self.assertIn("echo '#!/usr/bin/env bash' > $TMPDIR/bin/zigcc", out)
+        # Nim is told to use the shim as its C compiler.
+        self.assertIn("--clang.exe:$TMPDIR/bin/zigcc", out)
+        self.assertIn("--cpu:arm64", out)
+        self.assertIn("--os:linux", out)
+
+    def test_variant_target_overrides_target(self):
+        t = Target(
+            name="hello", kind="executable", language="c",
+            sources=["m.c"],
+            variants={"arm": Variant(name="arm", target="aarch64-linux")},
+        )
+        out = nix_gen.generate(_project(targets={"hello": t}))
+        # Variant gets the cross stdenv; default does not.
+        self.assertIn("pkgs.pkgsCross.aarch64-multiplatform.stdenv", out)
+
+
 class NixIdHelper(unittest.TestCase):
     def test_replaces_dot_and_hyphen(self):
         self.assertEqual(nix_gen._nix_id("frontend.app"), "frontend_app")

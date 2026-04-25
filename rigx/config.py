@@ -32,6 +32,7 @@ EXT_TO_LANG = {
 KIND_LANGUAGES = {
     "executable":     {"c", "cxx", "go", "rust", "zig", "nim"},
     "static_library": {"c", "cxx", "rust"},
+    "shared_library": {"c", "cxx", "rust"},
 }
 
 # Default toolchain nixpkgs attr per language (used when `compiler` is unset).
@@ -52,6 +53,7 @@ VALID_KINDS = {
     "run",
     "custom",
     "script",
+    "test",
 }
 
 
@@ -97,6 +99,7 @@ class Variant:
     rustflags: list[str] = field(default_factory=list)
     zigflags: list[str] = field(default_factory=list)
     compiler: str = ""        # variant-level toolchain override
+    target: str = ""          # cross-compilation triple override
 
 
 @dataclass
@@ -123,6 +126,11 @@ class Target:
     # For go/rust/zig, names the nixpkgs attr providing the compiler binary
     # (`""` → "go" / "rustc" / "zig"; `"go_1_21"` to pin a specific version).
     compiler: str = ""
+    # Cross-compilation target triple. Friendly alias (e.g. "aarch64-linux"),
+    # the full Zig-style triple ("aarch64-linux-musl"), or a `pkgsCross.<x>`
+    # attr for c/cxx routing. See nix_gen.CROSS_TARGET_ALIASES for the
+    # mapping. Default ("") = same as the build host.
+    target: str = ""
     # Python (kind = "python_script")
     python_version: str = "3.12"
     python_project: str = "."
@@ -179,27 +187,69 @@ class ConfigError(ValueError):
     pass
 
 
-def _load_vars(data: dict) -> dict[str, list[str]]:
+def _load_vars(
+    data: dict, base_path: Path | None = None, _visited: set[Path] | None = None
+) -> dict[str, list[str]]:
     """Read `[vars]` as `dict[str, list[str]]`. Each value must be a list of
     strings — vars are only useful for sharing list fields between targets,
-    and rejecting other shapes upfront keeps the expansion rules simple."""
+    and rejecting other shapes upfront keeps the expansion rules simple.
+
+    The reserved key `extends = ["../path/to/rigx.toml", …]` pulls vars from
+    other TOML files (resolved against `base_path`). Extended files'
+    `[vars]` tables are merged in first; collisions are config errors;
+    cycles are detected via `_visited`."""
     raw = data.get("vars", {})
     if not isinstance(raw, dict):
         raise ConfigError("[vars] must be a table")
     out: dict[str, list[str]] = {}
+    if _visited is None:
+        _visited = set()
+
+    extends = raw.get("extends", [])
+    if extends and not isinstance(extends, list):
+        raise ConfigError("[vars].extends must be a list of paths")
+    for entry in extends:
+        if not isinstance(entry, str):
+            raise ConfigError(
+                f"[vars].extends: entries must be strings, got {entry!r}"
+            )
+        if base_path is None:
+            raise ConfigError(
+                "[vars].extends: base_path required to resolve relative paths"
+            )
+        ext_path = (base_path / entry).resolve()
+        if ext_path in _visited:
+            chain = " -> ".join(str(p) for p in [*_visited, ext_path])
+            raise ConfigError(f"[vars].extends cycle: {chain}")
+        if not ext_path.is_file():
+            raise ConfigError(f"[vars].extends: file not found: {ext_path}")
+        with ext_path.open("rb") as f:
+            ext_data = tomllib.load(f)
+        ext_vars = _load_vars(ext_data, ext_path.parent, _visited | {ext_path})
+        for k, v in ext_vars.items():
+            if k in out:
+                raise ConfigError(
+                    f"[vars].extends: '{k}' from {ext_path} collides with another extended file"
+                )
+            out[k] = v
+
     for vname, vval in raw.items():
+        if vname == "extends":
+            continue
         if not isinstance(vval, list) or not all(isinstance(x, str) for x in vval):
             raise ConfigError(
                 f"vars.{vname}: must be a list of strings"
             )
-        # Vars referencing other vars are not supported — keeps resolution
-        # one-pass and rules out cycles. Fail loudly so users notice.
         for x in vval:
             if _VARS_REF.match(x):
                 raise ConfigError(
                     f"vars.{vname}: nested $vars references are not supported "
                     f"(found {x!r})"
                 )
+        if vname in out:
+            raise ConfigError(
+                f"vars.{vname}: collides with vars inherited via extends"
+            )
         out[vname] = list(vval)
     return out
 
@@ -359,6 +409,7 @@ def _build_target(
             rustflags=_expand_list(vconf.get("rustflags", []), vars_table, f"{vctx}.rustflags"),
             zigflags=_expand_list(vconf.get("zigflags", []), vars_table, f"{vctx}.zigflags"),
             compiler=str(vconf.get("compiler", "")),
+            target=str(vconf.get("target", "")),
         )
 
     tctx = f"target {tname}"
@@ -398,6 +449,7 @@ def _build_target(
                 f"allowed: {sorted(KIND_LANGUAGES[kind])}"
             )
     compiler = str(tconf.get("compiler", ""))
+    target_triple = str(tconf.get("target", ""))
 
     return Target(
         name=tname,
@@ -416,6 +468,7 @@ def _build_target(
         zigflags=_expand_list(tconf.get("zigflags", []), vars_table, f"{tctx}.zigflags"),
         language=language,
         compiler=compiler,
+        target=target_triple,
         python_version=str(tconf.get("python_version", "3.12")),
         python_project=python_project,
         python_venv_hash=tconf.get("python_venv_hash"),
@@ -560,7 +613,7 @@ def _load(root: Path, _visited: set[Path]) -> Project:
     # Phase 2: merge top-level tables (vars, git_deps, local_deps) across the
     # parent and every module. Collisions are config errors so the user
     # always knows which module owns what.
-    vars_table = _load_vars(data)
+    vars_table = _load_vars(data, base_path=root)
     git_deps = _parse_git_deps(data.get("dependencies", {}).get("git", {}), "")
     local_deps = _parse_local_deps(
         data.get("dependencies", {}).get("local", {}),
@@ -568,7 +621,7 @@ def _load(root: Path, _visited: set[Path]) -> Project:
     )
     for ns, mod_root, mod_data in modules:
         label = f"module {ns}"
-        _merge_into(vars_table, _load_vars(mod_data), "vars", label)
+        _merge_into(vars_table, _load_vars(mod_data, base_path=mod_root), "vars", label)
         _merge_into(
             git_deps,
             _parse_git_deps(mod_data.get("dependencies", {}).get("git", {}), f"{label}: "),
@@ -642,6 +695,11 @@ def _load(root: Path, _visited: set[Path]) -> Project:
             if not target.script:
                 raise ConfigError(
                     f"target {tname}: kind='script' requires 'script'"
+                )
+        if target.kind == "test":
+            if not target.script:
+                raise ConfigError(
+                    f"target {tname}: kind='test' requires 'script'"
                 )
         if target.kind == "run":
             if not target.run:

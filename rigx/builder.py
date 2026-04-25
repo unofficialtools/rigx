@@ -179,7 +179,7 @@ def _all_attrs(project: Project) -> list[str]:
     """
     attrs: list[str] = []
     for name, target in project.targets.items():
-        if target.kind == "script":
+        if target.kind in ("script", "test"):
             continue
         attr_base = _nix_id(name) if "." in name else name
         if not target.variants:
@@ -242,6 +242,30 @@ def run_named_script(
         raise BuildError(f"script target {name!r} failed (exit {rc})")
 
 
+def run_tests(
+    project: Project, filters: list[str] | None = None
+) -> list[tuple[str, int]]:
+    """Discover and execute every `kind = "test"` target. Returns
+    [(qualified_name, exit_code), …] in execution order. A non-empty
+    `filters` list narrows discovery to those exact target names.
+
+    Tests reuse the `script` execution path: each runs in a `nix shell`
+    with `deps.nixpkgs` on PATH, host-side, exit 0 = pass."""
+    selected: list[tuple[str, object]] = []
+    for name, target in project.targets.items():
+        if target.kind != "test":
+            continue
+        if filters and name not in filters:
+            continue
+        selected.append((name, target))
+    results: list[tuple[str, int]] = []
+    for name, target in selected:
+        print(f"[rigx test] {name}")
+        rc = run_script_target(project, target)
+        results.append((name, rc))
+    return results
+
+
 def build(project: Project, specs: list[str]) -> list[tuple[str, Path]]:
     """Build the given target specs (empty list = all). Returns (attr, out_link).
 
@@ -252,10 +276,15 @@ def build(project: Project, specs: list[str]) -> list[tuple[str, Path]]:
     if specs:
         for spec in specs:
             name = spec.split("@", 1)[0]
-            if (
-                name in project.targets
-                and project.targets[name].kind == "script"
-            ):
+            tgt_kind = (
+                project.targets[name].kind
+                if name in project.targets else None
+            )
+            if tgt_kind == "test":
+                raise BuildError(
+                    f"target {name!r} is a test target; use `rigx test {name}` instead"
+                )
+            if tgt_kind == "script":
                 raise BuildError(
                     f"target {name!r} is a script target (produces no artifact); "
                     f"use `rigx run {name}` instead"
