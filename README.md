@@ -891,6 +891,23 @@ list, for CI/scripts that want to consume rigx's output.
 rigx build --json | jq '.[] | select(.attr == "hello") | .output'
 ```
 
+### Generated `flake.nix` / `flake.lock` and your git repo
+
+rigx writes `flake.nix` and `flake.lock` next to your `rigx.toml`. When
+their content changes inside a git work-tree, rigx prints a one-line
+hint to stderr:
+
+```
+[rigx] regenerated flake.nix — commit when stable so future runs reuse the same lock.
+```
+
+That's all it does — rigx never touches the git index or commits anything
+on your behalf. Commit both files once they've stabilized; future
+invocations will reuse the same lock and stop printing the reminder
+until something changes again.
+
+The hint is suppressed outside a git work-tree (no actionable advice).
+
 ---
 
 ## Complete example (matches `example-project/rigx.toml`)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 from rigx import nix_gen
@@ -69,8 +70,40 @@ def write_flake(project: Project) -> Path:
         if ldep.sub_project:
             write_flake(ldep.sub_project)
     flake_path = _flake_path(project)
-    flake_path.write_text(nix_gen.generate(project))
+    new_content = nix_gen.generate(project)
+    changed = (
+        not flake_path.is_file()
+        or flake_path.read_text() != new_content
+    )
+    flake_path.write_text(new_content)
+    if changed:
+        _hint_commit_generated(project, ["flake.nix"])
     return flake_path
+
+
+def _is_git_work_tree(root: Path) -> bool:
+    git = shutil.which("git")
+    if not git:
+        return False
+    r = subprocess.run(
+        [git, "rev-parse", "--is-inside-work-tree"],
+        cwd=root, check=False, capture_output=True, text=True,
+    )
+    return r.returncode == 0 and r.stdout.strip() == "true"
+
+
+def _hint_commit_generated(project: Project, files: list[str]) -> None:
+    """Print a one-line reminder when rigx-generated files change inside a
+    git work-tree. Stays silent outside git (no actionable advice). rigx
+    never touches the index itself — committing is the user's call."""
+    if not _is_git_work_tree(project.root):
+        return
+    joined = " ".join(files)
+    print(
+        f"[rigx] regenerated {joined} — commit when stable so future "
+        f"runs reuse the same lock.",
+        file=sys.stderr,
+    )
 
 
 def _flake_ref(project: Project, attr: str | None = None) -> str:
@@ -108,11 +141,16 @@ def run_nixpkgs_tool(
 
 def update_lock(project: Project) -> None:
     write_flake(project)
+    lock_path = project.root / "flake.lock"
+    before = lock_path.read_bytes() if lock_path.is_file() else b""
     nix = _nix_bin()
     cmd = [nix, *NIX_EXPERIMENTAL, "flake", "lock", _flake_ref(project)]
     result = subprocess.run(cmd, check=False)
     if result.returncode != 0:
         raise BuildError(f"nix flake lock failed (exit {result.returncode})")
+    after = lock_path.read_bytes() if lock_path.is_file() else b""
+    if before != after:
+        _hint_commit_generated(project, ["flake.lock"])
 
 
 def _resolve_attr(project: Project, spec: str) -> str:

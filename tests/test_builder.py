@@ -268,5 +268,33 @@ class FlakeRef(unittest.TestCase):
         self.assertNotIn("#", ref)
 
 
+class HintCommitGenerated(unittest.TestCase):
+    """The reminder is opt-in by environment: only inside a git work-tree,
+    only on stderr, never staged. We mock the git probe so the test stays
+    fast and platform-independent."""
+
+    def _proj(self) -> Project:
+        return Project(
+            name="p", version="0.1.0", nixpkgs_ref="nixos-24.11",
+            git_deps={}, targets={}, root=Path("/tmp"),
+        )
+
+    def test_silent_outside_git(self):
+        import io
+        with mock.patch("rigx.builder._is_git_work_tree", return_value=False), \
+             mock.patch("rigx.builder.sys.stderr", new=io.StringIO()) as err:
+            builder._hint_commit_generated(self._proj(), ["flake.nix"])
+        self.assertEqual(err.getvalue(), "")
+
+    def test_prints_inside_git(self):
+        import io
+        with mock.patch("rigx.builder._is_git_work_tree", return_value=True), \
+             mock.patch("rigx.builder.sys.stderr", new=io.StringIO()) as err:
+            builder._hint_commit_generated(self._proj(), ["flake.nix", "flake.lock"])
+        out = err.getvalue()
+        self.assertIn("regenerated flake.nix flake.lock", out)
+        self.assertIn("commit when stable", out)
+
+
 if __name__ == "__main__":
     unittest.main()
