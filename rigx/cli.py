@@ -36,7 +36,7 @@ def _report_build_error(e: builder.BuildError) -> None:
 def cmd_build(args: argparse.Namespace) -> int:
     project = _load(args)
     try:
-        results = builder.build(project, args.targets)
+        results = builder.build(project, args.targets, jobs=args.jobs)
     except builder.BuildError as e:
         _report_build_error(e)
         return 1
@@ -309,6 +309,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--json",
         action="store_true",
         help="emit results as a JSON array (machine-readable; for CI/scripts)",
+    )
+    sp.add_argument(
+        "-j",
+        "--jobs",
+        type=int,
+        metavar="N",
+        default=None,
+        help="forward to `nix build --max-jobs N` (parallel derivations)",
     )
     sp.set_defaults(func=cmd_build)
 

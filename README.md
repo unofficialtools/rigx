@@ -82,6 +82,9 @@ What's different:
 - **Lock file** (`flake.lock`) pins every input revision.
 - **Sandboxed builds**: compilation never touches the local filesystem; each
   derivation runs against the Nix store's layered filesystem.
+- **Parallel by default**: `rigx build` collapses every requested attr into a
+  single `nix build` call so independent targets run concurrently. Pass
+  `-j N` to forward `--max-jobs N`.
 - **Outputs** only appear under `output/` as symlinks into the Nix store.
 - **Parameterized targets** via variants (e.g. `debug` / `release`).
 - **Multi-language, first-class**: C, C++, Go, Rust, Zig, Nim, Python — pick
@@ -169,6 +172,7 @@ rigx build                # build every target (and variant)
 rigx build hello          # build one target
 rigx build hello@release  # build a specific variant
 rigx build 'hello*'       # glob over target names (variants expanded)
+rigx build -j 8           # forward to `nix build --max-jobs 8` (parallel derivs)
 rigx build --json         # machine-readable output for CI / scripts
 rigx watch [target]       # rebuild on source change (Ctrl-C to stop)
 rigx test                 # discover & run all kind=test targets
@@ -353,18 +357,10 @@ You can use both in the same parent — they share the dotted CLI surface
 
 ## Targets
 
-Every target lives under `[targets.<name>]` and has a `kind`.
-
-**Naming — dashes ≡ underscores.** Target and variant names treat `-` and
-`_` as equivalent. `[targets.actarus-test-runner]` and
-`[targets.actarus_test_runner]` refer to the same target; declaring both
-in one project is a config error. Internally everything is stored in the
-canonical underscore form, so `rigx list` shows `actarus_test_runner` and
-the build artifact lands at `$out/bin/actarus_test_runner`. On the CLI you
-can type either spelling — `rigx build actarus-test-runner` and
-`rigx build actarus_test_runner` both work; same for `deps.internal`,
-`run`, `@variant` suffixes, and globs (`actarus-*` matches the canonical
-`actarus_*` keys).
+Every target lives under `[targets.<name>]` and has a `kind`. Target and
+variant names are taken verbatim — `[targets.foo-bar]` and
+`[targets.foo_bar]` are different targets, just like `[targets.Foo]` and
+`[targets.foo]` are.
 
 **Source globs.** Entries in `sources` may use `*`, `**`, `?`, and `[…]`
 patterns (Python `Path.glob` semantics). Globs are resolved against the

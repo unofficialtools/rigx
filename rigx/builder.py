@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 from rigx import nix_gen
-from rigx.config import Project, canonicalize_qualified
+from rigx.config import Project
 
 OUTPUT_DIR = "output"
 FLAKE_FILE = "flake.nix"
@@ -170,12 +170,6 @@ def _resolve_attr(project: Project, spec: str) -> str:
     else:
         name, variant = spec, None
 
-    # Canonicalize: dashes and underscores are equivalent, so the lookup
-    # uses the same key shape `project.targets` was built with.
-    name = canonicalize_qualified(name)
-    if variant is not None:
-        variant = variant.replace("-", "_")
-
     dotted = "." in name
     if dotted and name in project.targets:
         # B-merged target (`frontend.greet` is a key in this flake's targets).
@@ -300,16 +294,11 @@ def run_tests(
 
     Tests reuse the `script` execution path: each runs in a `nix shell`
     with `deps.nixpkgs` on PATH, host-side, exit 0 = pass."""
-    canonical_filters = (
-        [canonicalize_qualified(f) for f in filters] if filters else None
-    )
     selected: list[tuple[str, object]] = []
     for name, target in project.targets.items():
         if target.kind != "test":
             continue
-        if canonical_filters and not any(
-            fnmatch.fnmatchcase(name, f) for f in canonical_filters
-        ):
+        if filters and not any(fnmatch.fnmatchcase(name, f) for f in filters):
             continue
         selected.append((name, target))
     results: list[tuple[str, int]] = []
@@ -344,12 +333,8 @@ def _expand_build_spec(project: Project, spec: str) -> list[str]:
                 f"glob spec {spec!r} cannot include @variant — variants "
                 f"are expanded automatically for matched targets"
             )
-        # Canonicalize the pattern's name segments (dashes → underscores)
-        # so user-typed dashed globs match canonical keys.
-        canonical_pattern = canonicalize_qualified(base)
         names = sorted(
-            n for n in project.targets
-            if fnmatch.fnmatchcase(n, canonical_pattern)
+            n for n in project.targets if fnmatch.fnmatchcase(n, base)
         )
         if not names:
             raise BuildError(f"glob {spec!r} matched no targets")
@@ -370,28 +355,25 @@ def _expand_build_spec(project: Project, spec: str) -> list[str]:
                 f"(script/test)"
             )
         return attrs
-    # Canonicalize for the lookup — `project.targets` keys are stored in the
-    # underscore form, but the user might have typed dashes. (Without this,
-    # the test/script rejection silently misses dash-named targets and the
-    # build proceeds to `nix build .#a_b`, which fails for non-buildable
-    # kinds with a confusing "attribute … not provided" error.)
-    name = canonicalize_qualified(base)
+    name = base
     tgt_kind = (
         project.targets[name].kind if name in project.targets else None
     )
     if tgt_kind == "test":
         raise BuildError(
-            f"target {base!r} is a test target; use `rigx test {base}` instead"
+            f"target {name!r} is a test target; use `rigx test {name}` instead"
         )
     if tgt_kind == "script":
         raise BuildError(
-            f"target {base!r} is a script target (produces no artifact); "
-            f"use `rigx run {base}` instead"
+            f"target {name!r} is a script target (produces no artifact); "
+            f"use `rigx run {name}` instead"
         )
     return [_resolve_attr(project, spec)]
 
 
-def build(project: Project, specs: list[str]) -> list[tuple[str, Path]]:
+def build(
+    project: Project, specs: list[str], jobs: int | None = None,
+) -> list[tuple[str, Path]]:
     """Build the given target specs (empty list = all). Returns (attr, out_link).
 
     Specs accept three shapes:
@@ -420,23 +402,54 @@ def build(project: Project, specs: list[str]) -> list[tuple[str, Path]]:
     output_dir.mkdir(exist_ok=True)
 
     nix = _nix_bin()
-    results: list[tuple[str, Path]] = []
+    flake_refs = [_flake_ref(project, attr) for attr in attrs]
 
-    for attr in attrs:
+    # Build everything in a single `nix build` call so Nix's daemon can:
+    #   - share the flake evaluation pass across attrs;
+    #   - schedule independent derivations concurrently up to `--max-jobs`
+    #     (forwarded from rigx's `--jobs N` flag).
+    # We use `--no-link` + `--print-out-paths` and create our own symlinks
+    # so the per-target `output/<attr>` UX is preserved exactly. Nix's
+    # progress goes to stderr (passthrough); the captured stdout is just
+    # the newline-separated store paths.
+    cmd = [
+        nix,
+        *NIX_EXPERIMENTAL,
+        "build",
+        *flake_refs,
+        "--no-link",
+        "--print-out-paths",
+    ]
+    if jobs is not None:
+        cmd += ["--max-jobs", str(jobs)]
+
+    print(f"[rigx] building {len(attrs)} target(s): {', '.join(attrs)}")
+    result = subprocess.run(
+        cmd,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=None,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise BuildError(f"nix build failed (exit {result.returncode})")
+
+    out_paths = [line for line in result.stdout.split("\n") if line.strip()]
+    if len(out_paths) != len(attrs):
+        raise BuildError(
+            f"nix build returned {len(out_paths)} store path(s) but "
+            f"{len(attrs)} attr(s) were requested ({attrs!r}); cannot pair "
+            f"outputs to symlinks"
+        )
+
+    results: list[tuple[str, Path]] = []
+    for attr, store_path in zip(attrs, out_paths):
         out_link = output_dir / attr
-        flake_ref = _flake_ref(project, attr)
-        cmd = [
-            nix,
-            *NIX_EXPERIMENTAL,
-            "build",
-            flake_ref,
-            "--out-link",
-            str(out_link),
-        ]
-        print(f"[rigx] building {attr}")
-        result = subprocess.run(cmd, check=False)
-        if result.returncode != 0:
-            raise BuildError(f"nix build {attr} failed (exit {result.returncode})")
+        # Replace any existing symlink/file in-place so re-runs always point
+        # at the freshest store path.
+        if out_link.is_symlink() or out_link.exists():
+            out_link.unlink()
+        out_link.symlink_to(store_path)
         results.append((attr, out_link))
 
     return results

@@ -271,88 +271,52 @@ class FlakeRef(unittest.TestCase):
 
 
 class DashNamedTargets(unittest.TestCase):
-    """Regression: dash-named targets and underscore-named targets are the
-    same thing. The loader stores the canonical (underscore) form; both
-    spellings on the CLI resolve to the same flake attr."""
+    """Regression: dash-named targets must round-trip identically through
+    `_resolve_attr` and the flake. Previously rigx rewrote
+    `actarus-test-runner` → `actarus_test_runner` in the flake but asked
+    `nix build .#actarus-test-runner`. Names are now verbatim — `_nix_id`
+    only handles `.` (the actually-illegal Nix bare-attr char), and Nix
+    accepts hyphens natively (we've been emitting `hello-debug` variant
+    attrs since day one)."""
 
-    def _proj(self, with_variant: bool = False) -> Project:
-        # The loader canonicalizes the target key. Mirror that here so the
-        # fixture matches reality.
-        target = Target(
-            name="actarus_test_runner",
-            kind="executable", sources=["m.cpp"],
-            variants={"release": Variant(name="release")} if with_variant else {},
+    def test_resolve_attr_preserves_hyphens(self):
+        proj = _project_with(**{
+            "actarus-test-runner": Target(
+                name="actarus-test-runner",
+                kind="executable", sources=["m.cpp"],
+            ),
+        })
+        self.assertEqual(
+            builder._resolve_attr(proj, "actarus-test-runner"),
+            "actarus-test-runner",
         )
-        return _project_with(**{"actarus_test_runner": target})
 
-    def test_dash_input_resolves_to_canonical(self):
-        attr = builder._resolve_attr(self._proj(), "actarus-test-runner")
-        self.assertEqual(attr, "actarus_test_runner")
-
-    def test_underscore_input_resolves_to_canonical(self):
-        attr = builder._resolve_attr(self._proj(), "actarus_test_runner")
-        self.assertEqual(attr, "actarus_test_runner")
-
-    def test_mixed_input_resolves_to_canonical(self):
-        attr = builder._resolve_attr(self._proj(), "actarus_test-runner")
-        self.assertEqual(attr, "actarus_test_runner")
-
-    def test_dash_variant_resolves_to_canonical(self):
-        attr = builder._resolve_attr(
-            self._proj(with_variant=True), "actarus-test-runner@release",
+    def test_resolve_attr_preserves_hyphens_with_variant(self):
+        proj = _project_with(**{
+            "actarus-test-runner": Target(
+                name="actarus-test-runner",
+                kind="executable", sources=["m.cpp"],
+                variants={"release": Variant(name="release")},
+            ),
+        })
+        self.assertEqual(
+            builder._resolve_attr(proj, "actarus-test-runner@release"),
+            "actarus-test-runner-release",
         )
-        self.assertEqual(attr, "actarus_test_runner-release")
 
     def test_flake_attr_matches_resolve(self):
         # End-to-end: flake.nix declares the same attr name `_resolve_attr`
-        # asks for, regardless of which spelling the user typed.
+        # asks for, so `nix build .#<name>` finds the derivation.
         from rigx import nix_gen
-        proj = self._proj()
+        proj = _project_with(**{
+            "actarus-test-runner": Target(
+                name="actarus-test-runner",
+                kind="executable", sources=["m.cpp"],
+            ),
+        })
         out = nix_gen.generate(proj)
-        for spelling in ("actarus-test-runner", "actarus_test_runner",
-                         "actarus_test-runner"):
-            attr = builder._resolve_attr(proj, spelling)
-            self.assertIn(f"{attr} = pkgs.stdenv.mkDerivation", out)
-
-    def test_dashed_glob_matches_canonical_targets(self):
-        proj = _project_with(**{
-            "actarus_test_runner": Target(
-                name="actarus_test_runner", kind="executable", sources=["m.cpp"],
-            ),
-            "actarus_helper": Target(
-                name="actarus_helper", kind="executable", sources=["m.cpp"],
-            ),
-        })
-        # User types dashes in the glob; matches canonical underscore keys.
-        attrs = sorted(builder._expand_build_spec(proj, "actarus-*"))
-        self.assertEqual(attrs, ["actarus_helper", "actarus_test_runner"])
-
-    def test_dashed_test_target_rejected_with_pointer_to_rigx_test(self):
-        # Regression: when the canonical form was stored but the kind-check
-        # used the raw user input, dashed test/script targets bypassed
-        # rejection and `rigx build a-b` got a confusing nix-build error.
-        proj = _project_with(**{
-            "a_b": Target(name="a_b", kind="test", script="exit 0"),
-        })
-        for spelling in ("a-b", "a_b"):
-            with self.assertRaisesRegex(BuildError, "is a test target"):
-                builder._expand_build_spec(proj, spelling)
-
-    def test_dashed_test_filter_matches_canonical(self):
-        from rigx.config import Variant  # noqa
-        proj = Project(
-            name="p", version="0.1.0", nixpkgs_ref="nixos-24.11",
-            git_deps={}, root=Path("/tmp"),
-            targets={
-                "smoke_test": Target(name="smoke_test", kind="test", script="exit 0"),
-                "perf_test":  Target(name="perf_test",  kind="test", script="exit 0"),
-            },
-        )
-        with mock.patch("rigx.builder.run_script_target", return_value=0):
-            results = builder.run_tests(proj, filters=["*-test"])
-        self.assertEqual(
-            sorted(n for n, _ in results), ["perf_test", "smoke_test"]
-        )
+        attr = builder._resolve_attr(proj, "actarus-test-runner")
+        self.assertIn(f"{attr} = pkgs.stdenv.mkDerivation", out)
 
 
 class BuildGlob(unittest.TestCase):
@@ -471,6 +435,89 @@ class TestGlob(unittest.TestCase):
         self.assertEqual(
             sorted(n for n, _ in results), ["integ", "unit_a", "unit_b"]
         )
+
+
+class BuildSingleNixInvocation(unittest.TestCase):
+    """`builder.build` collapses N attrs into one `nix build` call so Nix
+    can share evaluation and schedule independent derivations in parallel.
+    Per-target symlinks at `output/<attr>` are recreated by rigx after Nix
+    prints the store paths via `--print-out-paths`."""
+
+    def _proj(self) -> Project:
+        return Project(
+            name="p", version="0.1.0", nixpkgs_ref="nixos-24.11",
+            git_deps={}, root=Path("/tmp/proj"),
+            targets={
+                "a": Target(name="a", kind="executable", sources=["m.cpp"]),
+                "b": Target(name="b", kind="executable", sources=["m.cpp"]),
+                "c": Target(name="c", kind="executable", sources=["m.cpp"]),
+            },
+        )
+
+    def _run_build(self, jobs=None, attrs=("a", "b", "c")):
+        proj = self._proj()
+        fake_stdout = "\n".join(f"/nix/store/fake-{a}" for a in attrs) + "\n"
+        result = mock.Mock(returncode=0, stdout=fake_stdout)
+        with mock.patch("rigx.builder.write_flake"), \
+             mock.patch("rigx.builder._nix_bin", return_value="/usr/bin/nix"), \
+             mock.patch("rigx.builder.subprocess.run", return_value=result) as run, \
+             mock.patch("pathlib.Path.unlink"), \
+             mock.patch("pathlib.Path.symlink_to") as symlink_to, \
+             mock.patch("pathlib.Path.is_symlink", return_value=False), \
+             mock.patch("pathlib.Path.exists", return_value=False), \
+             mock.patch("pathlib.Path.mkdir"):
+            results = builder.build(proj, list(attrs), jobs=jobs)
+        return run, symlink_to, results
+
+    def test_one_invocation_with_all_refs(self):
+        run, _, _ = self._run_build()
+        # exactly one subprocess.run call, regardless of attr count
+        self.assertEqual(run.call_count, 1)
+        cmd = run.call_args.args[0]
+        # all three attrs appear as flake refs in the same command
+        self.assertEqual(
+            sum(1 for tok in cmd if tok.endswith("#a")
+                or tok.endswith("#b") or tok.endswith("#c")),
+            3,
+        )
+        self.assertIn("--no-link", cmd)
+        self.assertIn("--print-out-paths", cmd)
+        # No --max-jobs unless `jobs` is set.
+        self.assertNotIn("--max-jobs", cmd)
+
+    def test_jobs_flag_forwards_max_jobs(self):
+        run, _, _ = self._run_build(jobs=8)
+        cmd = run.call_args.args[0]
+        i = cmd.index("--max-jobs")
+        self.assertEqual(cmd[i + 1], "8")
+
+    def test_symlinks_created_per_attr(self):
+        _, symlink_to, results = self._run_build()
+        # One `symlink_to` per attr, pointing at the matching store path.
+        self.assertEqual(symlink_to.call_count, 3)
+        attrs = [a for a, _ in results]
+        self.assertEqual(attrs, ["a", "b", "c"])
+
+    def test_path_count_mismatch_raises(self):
+        proj = self._proj()
+        # Nix returned only 2 paths but we asked for 3 — error out clearly.
+        result = mock.Mock(returncode=0, stdout="/nix/store/x\n/nix/store/y\n")
+        with mock.patch("rigx.builder.write_flake"), \
+             mock.patch("rigx.builder._nix_bin", return_value="/usr/bin/nix"), \
+             mock.patch("rigx.builder.subprocess.run", return_value=result), \
+             mock.patch("pathlib.Path.mkdir"):
+            with self.assertRaisesRegex(BuildError, "store path"):
+                builder.build(proj, ["a", "b", "c"])
+
+    def test_failed_nix_build_raises(self):
+        proj = self._proj()
+        result = mock.Mock(returncode=1, stdout="")
+        with mock.patch("rigx.builder.write_flake"), \
+             mock.patch("rigx.builder._nix_bin", return_value="/usr/bin/nix"), \
+             mock.patch("rigx.builder.subprocess.run", return_value=result), \
+             mock.patch("pathlib.Path.mkdir"):
+            with self.assertRaisesRegex(BuildError, "exit 1"):
+                builder.build(proj, ["a"])
 
 
 class HintCommitGenerated(unittest.TestCase):
