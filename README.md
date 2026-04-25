@@ -168,10 +168,12 @@ rigx lock                 # generate flake.nix and update flake.lock
 rigx build                # build every target (and variant)
 rigx build hello          # build one target
 rigx build hello@release  # build a specific variant
+rigx build 'hello*'       # glob over target names (variants expanded)
 rigx build --json         # machine-readable output for CI / scripts
 rigx watch [target]       # rebuild on source change (Ctrl-C to stop)
 rigx test                 # discover & run all kind=test targets
-rigx test smoke perf      # run only the named tests
+rigx test smoke perf      # run only the named tests (literal names)
+rigx test 'unit_*'        # filters are fnmatch patterns — globs work too
 rigx graph hello          # print a Mermaid dep graph for one target
 rigx flake                # print generated flake.nix (for debugging)
 rigx fmt [--write]        # canonical-format rigx.toml (comments not preserved)
@@ -884,10 +886,19 @@ through `nix shell` (with `deps.nixpkgs` on PATH), and reports a
 PASS/FAIL summary. Exit code is the worst test's exit code so CI can
 gate on it.
 
+Filters accept both literal names and **fnmatch globs** (`*`, `?`, `[…]`):
+a target runs if it matches *any* filter. No filter = `*` = all.
+
 ```
 rigx test                # run all kind=test targets
-rigx test smoke          # run just one
+rigx test smoke          # literal name
+rigx test 'unit_*'       # all tests starting with `unit_`
+rigx test smoke 'integ_*' # mix literal + glob
+rigx test '*'            # explicit "all" (same as no args)
 ```
+
+Quote globs in your shell so the shell doesn't expand them against
+filesystem paths first.
 
 ### `rigx fmt [--write]` — canonical TOML
 

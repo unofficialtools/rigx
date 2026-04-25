@@ -268,6 +268,124 @@ class FlakeRef(unittest.TestCase):
         self.assertNotIn("#", ref)
 
 
+class BuildGlob(unittest.TestCase):
+    """Glob specs select targets by name (variants ignored when matching)
+    and expand all variants of each match."""
+
+    def _proj(self) -> Project:
+        return Project(
+            name="p", version="0.1.0", nixpkgs_ref="nixos-24.11",
+            git_deps={}, root=Path("/tmp"),
+            targets={
+                "hello":      Target(name="hello", kind="executable", sources=["m.cpp"],
+                                     variants={
+                                         "debug":   Variant(name="debug"),
+                                         "release": Variant(name="release"),
+                                     }),
+                "hello_go":   Target(name="hello_go", kind="executable", sources=["g.go"]),
+                "hello_rust": Target(name="hello_rust", kind="executable", sources=["r.rs"]),
+                "tool":       Target(name="tool", kind="executable", sources=["t.cpp"]),
+                "publish":    Target(name="publish", kind="script", script="echo"),
+                "smoke":      Target(name="smoke", kind="test", script="exit 0"),
+            },
+        )
+
+    def test_glob_expands_to_matched_targets_and_variants(self):
+        proj = self._proj()
+        attrs = builder._expand_build_spec(proj, "hello*")
+        # `hello` has variants, expand to hello-debug + hello-release.
+        # hello_go and hello_rust are plain.
+        self.assertEqual(
+            sorted(attrs),
+            sorted(["hello-debug", "hello-release", "hello_go", "hello_rust"]),
+        )
+
+    def test_glob_skips_script_and_test_targets(self):
+        proj = self._proj()
+        # `*` would technically include publish/smoke, but glob-mode skips
+        # non-buildables silently (cf. literal naming, which errors).
+        attrs = builder._expand_build_spec(proj, "*")
+        self.assertNotIn("publish", attrs)
+        self.assertNotIn("smoke", attrs)
+        self.assertIn("hello-debug", attrs)
+        self.assertIn("tool", attrs)
+
+    def test_glob_no_match_errors(self):
+        proj = self._proj()
+        with self.assertRaisesRegex(BuildError, "matched no targets"):
+            builder._expand_build_spec(proj, "nonexistent*")
+
+    def test_glob_with_variant_suffix_errors(self):
+        proj = self._proj()
+        with self.assertRaisesRegex(BuildError, "cannot include @variant"):
+            builder._expand_build_spec(proj, "hello*@release")
+
+    def test_glob_matching_only_unbuildables_errors(self):
+        proj = self._proj()
+        # Only matches `publish` (script) and `smoke` (test) — both skipped.
+        # Build the project with just those reachable so the empty-result
+        # path triggers.
+        only_unbuildable = Project(
+            name="p", version="0.1.0", nixpkgs_ref="nixos-24.11",
+            git_deps={}, root=Path("/tmp"),
+            targets={
+                "publish": Target(name="publish", kind="script", script="echo"),
+                "smoke":   Target(name="smoke", kind="test", script="exit 0"),
+            },
+        )
+        with self.assertRaisesRegex(BuildError, "non-buildable"):
+            builder._expand_build_spec(only_unbuildable, "*")
+
+    def test_literal_name_unchanged(self):
+        # Non-glob spec → existing _resolve_attr path (alias, no variant
+        # expansion).
+        proj = self._proj()
+        attrs = builder._expand_build_spec(proj, "hello")
+        self.assertEqual(attrs, ["hello"])
+
+    def test_literal_with_variant_unchanged(self):
+        proj = self._proj()
+        attrs = builder._expand_build_spec(proj, "hello@release")
+        self.assertEqual(attrs, ["hello-release"])
+
+
+class TestGlob(unittest.TestCase):
+    """run_tests treats each filter entry as an fnmatch pattern."""
+
+    def _proj(self) -> Project:
+        return Project(
+            name="p", version="0.1.0", nixpkgs_ref="nixos-24.11",
+            git_deps={}, root=Path("/tmp"),
+            targets={
+                "unit_a":  Target(name="unit_a",  kind="test", script="exit 0"),
+                "unit_b":  Target(name="unit_b",  kind="test", script="exit 0"),
+                "integ":   Target(name="integ",   kind="test", script="exit 0"),
+            },
+        )
+
+    def test_glob_filter(self):
+        with mock.patch("rigx.builder.run_script_target", return_value=0):
+            results = builder.run_tests(self._proj(), filters=["unit_*"])
+        self.assertEqual([n for n, _ in results], ["unit_a", "unit_b"])
+
+    def test_literal_filter_still_exact(self):
+        with mock.patch("rigx.builder.run_script_target", return_value=0):
+            results = builder.run_tests(self._proj(), filters=["integ"])
+        self.assertEqual([n for n, _ in results], ["integ"])
+
+    def test_mixed_literal_and_glob(self):
+        with mock.patch("rigx.builder.run_script_target", return_value=0):
+            results = builder.run_tests(self._proj(), filters=["integ", "unit_a"])
+        self.assertEqual(sorted(n for n, _ in results), ["integ", "unit_a"])
+
+    def test_star_filter_matches_all(self):
+        with mock.patch("rigx.builder.run_script_target", return_value=0):
+            results = builder.run_tests(self._proj(), filters=["*"])
+        self.assertEqual(
+            sorted(n for n, _ in results), ["integ", "unit_a", "unit_b"]
+        )
+
+
 class HintCommitGenerated(unittest.TestCase):
     """The reminder is opt-in by environment: only inside a git work-tree,
     only on stderr, never staged. We mock the git probe so the test stays

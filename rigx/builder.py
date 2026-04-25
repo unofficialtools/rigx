@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import shutil
 import subprocess
 import sys
@@ -284,8 +285,11 @@ def run_tests(
     project: Project, filters: list[str] | None = None
 ) -> list[tuple[str, int]]:
     """Discover and execute every `kind = "test"` target. Returns
-    [(qualified_name, exit_code), …] in execution order. A non-empty
-    `filters` list narrows discovery to those exact target names.
+    [(qualified_name, exit_code), …] in execution order.
+
+    Each entry in `filters` is treated as an fnmatch pattern (literal names
+    work because fnmatch is exact-match for non-wildcard patterns). A test
+    is selected if it matches *any* filter. `None`/empty filters → all.
 
     Tests reuse the `script` execution path: each runs in a `nix shell`
     with `deps.nixpkgs` on PATH, host-side, exit 0 = pass."""
@@ -293,7 +297,7 @@ def run_tests(
     for name, target in project.targets.items():
         if target.kind != "test":
             continue
-        if filters and name not in filters:
+        if filters and not any(fnmatch.fnmatchcase(name, f) for f in filters):
             continue
         selected.append((name, target))
     results: list[tuple[str, int]] = []
@@ -304,30 +308,86 @@ def run_tests(
     return results
 
 
+def _has_glob(s: str) -> bool:
+    return any(c in s for c in "*?[")
+
+
+def _expand_build_spec(project: Project, spec: str) -> list[str]:
+    """Resolve one CLI build spec to a list of Nix attrs.
+
+    - Literal `hello`            → existing alias resolution.
+    - Literal `hello@release`    → existing variant resolution.
+    - Glob `hello*`              → match target names (variants ignored when
+                                   matching), expand all variants per match.
+                                   `*` alone is equivalent to `rigx build`
+                                   with no args.
+
+    Globs match own and `[modules]`-merged target names (`project.targets`).
+    Cross-flake (A) refs aren't reachable through globs in v1 — name them
+    explicitly or run `rigx build` from inside the sibling project."""
+    base = spec.split("@", 1)[0]
+    if _has_glob(base):
+        if "@" in spec:
+            raise BuildError(
+                f"glob spec {spec!r} cannot include @variant — variants "
+                f"are expanded automatically for matched targets"
+            )
+        names = sorted(
+            n for n in project.targets if fnmatch.fnmatchcase(n, base)
+        )
+        if not names:
+            raise BuildError(f"glob {spec!r} matched no targets")
+        attrs: list[str] = []
+        for name in names:
+            target = project.targets[name]
+            if target.kind in ("script", "test"):
+                continue
+            attr_base = _nix_id(name) if "." in name else name
+            if not target.variants:
+                attrs.append(attr_base)
+            else:
+                for v in target.variant_names():
+                    attrs.append(f"{attr_base}-{v}")
+        if not attrs:
+            raise BuildError(
+                f"glob {spec!r} matched only non-buildable targets "
+                f"(script/test)"
+            )
+        return attrs
+    name = base
+    tgt_kind = (
+        project.targets[name].kind if name in project.targets else None
+    )
+    if tgt_kind == "test":
+        raise BuildError(
+            f"target {name!r} is a test target; use `rigx test {name}` instead"
+        )
+    if tgt_kind == "script":
+        raise BuildError(
+            f"target {name!r} is a script target (produces no artifact); "
+            f"use `rigx run {name}` instead"
+        )
+    return [_resolve_attr(project, spec)]
+
+
 def build(project: Project, specs: list[str]) -> list[tuple[str, Path]]:
     """Build the given target specs (empty list = all). Returns (attr, out_link).
 
-    `script`-kind targets are NOT buildable — they produce no artifact. Name a
-    script here and you'll get an error pointing at `rigx run`. `rigx build`
-    with no args skips them (see `_all_attrs`).
+    Specs accept three shapes:
+      - `hello`            — own / B-merged target by exact name.
+      - `hello@release`    — pick a specific variant.
+      - `hello*` / `*`     — fnmatch glob over target names. Variants are
+                             ignored when matching; matched targets expand
+                             all variants automatically.
+
+    `script` and `test` targets are NOT buildable — naming one literally
+    errors with a pointer at `rigx run` / `rigx test`; globs skip them
+    silently.
     """
     if specs:
+        attrs: list[str] = []
         for spec in specs:
-            name = spec.split("@", 1)[0]
-            tgt_kind = (
-                project.targets[name].kind
-                if name in project.targets else None
-            )
-            if tgt_kind == "test":
-                raise BuildError(
-                    f"target {name!r} is a test target; use `rigx test {name}` instead"
-                )
-            if tgt_kind == "script":
-                raise BuildError(
-                    f"target {name!r} is a script target (produces no artifact); "
-                    f"use `rigx run {name}` instead"
-                )
-        attrs = [_resolve_attr(project, s) for s in specs]
+            attrs.extend(_expand_build_spec(project, spec))
     else:
         attrs = _all_attrs(project)
 
