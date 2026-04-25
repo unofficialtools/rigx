@@ -5,20 +5,51 @@ version = "0.1.0"
 [nixpkgs]
 ref = "nixos-24.11"
 
-# `rigx build publish` — builds sdist + wheel with uv, then uploads to PyPI.
+# `rigx test` runs rigx's own unittest suite. Equivalent to running
+# `python3 -m unittest discover tests` in a clean environment, but goes
+# through the same nix-shell path as any other test target so a single
+# `rigx test` covers the project from the inside.
+[targets.unittests]
+kind         = "test"
+deps.nixpkgs = ["python3"]
+script       = """
+python3 -m unittest discover tests
+"""
+
+# `rigx run publish` — builds sdist + wheel with uv, then uploads to PyPI.
 #
-# Requires a PyPI publish token in the environment, for example:
-#   export UV_PUBLISH_TOKEN="pypi-..."
-# (or UV_PUBLISH_USERNAME/UV_PUBLISH_PASSWORD for a classic account token).
+# Token resolution (first match wins):
+#   1. UV_PUBLISH_TOKEN environment variable.
+#   2. The `[pypi]` section's `password` in ~/.pypirc.
+# (`uv publish` does NOT read ~/.pypirc on its own — that's a twine
+# convention. We extract it here for convenience.)
 #
-# This runs host-side via `nix shell` with the pinned nixpkgs `uv` — not
-# inside a sandbox — because publishing is a side-effecting network action.
+# Runs host-side via `nix shell` with the pinned nixpkgs `uv` — not inside
+# a sandbox — because publishing is a side-effecting network action.
 [targets.publish]
 kind = "script"
-deps.nixpkgs = ["uv"]
+deps.nixpkgs = ["uv", "python3"]
 script = """
 rm -rf dist
 uv build
+
+if [ -z "${UV_PUBLISH_TOKEN:-}" ] && [ -f "$HOME/.pypirc" ]; then
+  UV_PUBLISH_TOKEN=$(python3 -c '
+import configparser, os, sys
+c = configparser.ConfigParser()
+c.read(os.path.expanduser("~/.pypirc"))
+print(c.get("pypi", "password", fallback=""), end="")
+')
+  export UV_PUBLISH_TOKEN
+fi
+
+if [ -z "${UV_PUBLISH_TOKEN:-}" ]; then
+  echo "publish: no token found." >&2
+  echo "  Either: export UV_PUBLISH_TOKEN=pypi-…" >&2
+  echo "  Or:     add a [pypi] section with 'password = pypi-…' to ~/.pypirc" >&2
+  exit 1
+fi
+
 uv publish
 """
 
@@ -30,7 +61,6 @@ deps.nixpkgs = ["uv"]
 script = """
 rm -rf dist
 uv build --sdist --wheel
-uv publish
 """
 
 # `rigx run nixpkgs-stage` — generate a nixpkgs-style package.nix into
