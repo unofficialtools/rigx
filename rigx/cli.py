@@ -7,7 +7,7 @@ import json
 import sys
 from pathlib import Path
 
-from rigx import builder, config, fmt, graph, nix_gen, scaffold
+from rigx import __version__, builder, config, fmt, graph, nix_gen, scaffold
 
 
 def _find_project_root(start: Path) -> Path:
@@ -31,6 +31,12 @@ def _report_build_error(e: builder.BuildError) -> None:
         print(str(e), file=sys.stderr)
     else:
         print(f"rigx: {e}", file=sys.stderr)
+
+
+def cmd_version(args: argparse.Namespace) -> int:
+    """Print the rigx package version."""
+    print(f"rigx {__version__}")
+    return 0
 
 
 def cmd_build(args: argparse.Namespace) -> int:
@@ -303,7 +309,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="path to project root (containing rigx.toml)",
         default=None,
     )
+    p.add_argument(
+        "-V",
+        "--version",
+        action="version",
+        version=f"rigx {__version__}",
+        help="print the rigx version and exit",
+    )
     sub = p.add_subparsers(dest="command", required=True)
+
+    sp = sub.add_parser("version", help="print the rigx version")
+    sp.set_defaults(func=cmd_version)
 
     sp = sub.add_parser("build", help="build targets (default: all)")
     sp.add_argument("targets", nargs="*", help="target[@variant] selectors")

@@ -167,6 +167,7 @@ Restart your shell (or source `/nix/var/nix/profiles/default/etc/profile.d/nix-d
 From a project directory containing `rigx.toml`:
 
 ```
+rigx version              # print the rigx version (also: `--version` / `-V`)
 rigx list                 # list targets
 rigx list --kind test     # filter by kind (executable, test, run, …)
 rigx lock                 # generate flake.nix and update flake.lock
