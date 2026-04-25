@@ -357,5 +357,130 @@ class ValidationErrors(unittest.TestCase):
                 config.load(root)
 
 
+class VarsExpansion(unittest.TestCase):
+    def test_expands_in_sources_and_deps_nixpkgs(self):
+        body = """
+            [project]
+            name = "p"
+
+            [vars]
+            common = ["src/util.cpp", "src/log.cpp"]
+            cxxlibs = ["fmt", "spdlog"]
+
+            [targets.app]
+            kind = "executable"
+            sources = ["$vars.common", "src/main.cpp"]
+            deps.nixpkgs = ["$vars.cxxlibs"]
+        """
+        with TempProject(body) as root:
+            proj = config.load(root)
+        t = proj.targets["app"]
+        self.assertEqual(
+            t.sources, ["src/util.cpp", "src/log.cpp", "src/main.cpp"]
+        )
+        self.assertEqual(t.deps.nixpkgs, ["fmt", "spdlog"])
+
+    def test_expands_in_variants(self):
+        body = """
+            [project]
+            name = "p"
+
+            [vars]
+            opt = ["-O2", "-flto"]
+
+            [targets.app]
+            kind = "executable"
+            sources = ["m.cpp"]
+
+            [targets.app.variants.release]
+            cxxflags = ["$vars.opt", "-DNDEBUG"]
+        """
+        with TempProject(body) as root:
+            proj = config.load(root)
+        v = proj.targets["app"].variants["release"]
+        self.assertEqual(v.cxxflags, ["-O2", "-flto", "-DNDEBUG"])
+
+    def test_empty_var_expands_to_nothing(self):
+        body = """
+            [project]
+            name = "p"
+
+            [vars]
+            empty = []
+
+            [targets.app]
+            kind = "executable"
+            sources = ["$vars.empty", "m.cpp"]
+        """
+        with TempProject(body) as root:
+            proj = config.load(root)
+        self.assertEqual(proj.targets["app"].sources, ["m.cpp"])
+
+    def test_undefined_var_raises(self):
+        body = """
+            [project]
+            name = "p"
+
+            [targets.app]
+            kind = "executable"
+            sources = ["$vars.missing"]
+        """
+        with TempProject(body) as root:
+            with self.assertRaisesRegex(ConfigError, r"undefined var '\$vars\.missing'"):
+                config.load(root)
+
+    def test_partial_match_is_not_expanded(self):
+        # Substring matches are intentional literals — only whole-element
+        # `$vars.x` is expanded.
+        body = """
+            [project]
+            name = "p"
+
+            [vars]
+            inc = ["include"]
+
+            [targets.app]
+            kind = "executable"
+            sources = ["m.cpp"]
+            includes = ["prefix/$vars.inc"]
+        """
+        with TempProject(body) as root:
+            proj = config.load(root)
+        self.assertEqual(proj.targets["app"].includes, ["prefix/$vars.inc"])
+
+    def test_vars_must_be_table(self):
+        body = """
+            [project]
+            name = "p"
+            vars = "not a table"
+        """
+        # TOML-level: `vars` under [project] is fine, but a scalar at the
+        # top-level [vars] would actually be a TOML parse error. Test the
+        # dataclass-level guard via a non-list value instead.
+        body = """
+            [project]
+            name = "p"
+
+            [vars]
+            broken = "not a list"
+        """
+        with TempProject(body) as root:
+            with self.assertRaisesRegex(ConfigError, "must be a list of strings"):
+                config.load(root)
+
+    def test_nested_var_reference_is_rejected(self):
+        body = """
+            [project]
+            name = "p"
+
+            [vars]
+            a = ["$vars.b"]
+            b = ["x"]
+        """
+        with TempProject(body) as root:
+            with self.assertRaisesRegex(ConfigError, "nested \\$vars references"):
+                config.load(root)
+
+
 if __name__ == "__main__":
     unittest.main()

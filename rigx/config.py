@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
+
+# `"$vars.<name>"` references in list fields expand to the named entry of
+# `[vars]`. Anchored so embedded substrings ("path/$vars.x") don't match —
+# expansion is whole-element only.
+_VARS_REF = re.compile(r"^\$vars\.([A-Za-z_][A-Za-z0-9_]*)$")
 
 VALID_KINDS = {
     "executable",
@@ -86,6 +92,52 @@ class ConfigError(ValueError):
     pass
 
 
+def _load_vars(data: dict) -> dict[str, list[str]]:
+    """Read `[vars]` as `dict[str, list[str]]`. Each value must be a list of
+    strings — vars are only useful for sharing list fields between targets,
+    and rejecting other shapes upfront keeps the expansion rules simple."""
+    raw = data.get("vars", {})
+    if not isinstance(raw, dict):
+        raise ConfigError("[vars] must be a table")
+    out: dict[str, list[str]] = {}
+    for vname, vval in raw.items():
+        if not isinstance(vval, list) or not all(isinstance(x, str) for x in vval):
+            raise ConfigError(
+                f"vars.{vname}: must be a list of strings"
+            )
+        # Vars referencing other vars are not supported — keeps resolution
+        # one-pass and rules out cycles. Fail loudly so users notice.
+        for x in vval:
+            if _VARS_REF.match(x):
+                raise ConfigError(
+                    f"vars.{vname}: nested $vars references are not supported "
+                    f"(found {x!r})"
+                )
+        out[vname] = list(vval)
+    return out
+
+
+def _expand_list(items, vars: dict[str, list[str]], ctx: str) -> list[str]:
+    """Expand `"$vars.<name>"` entries in a list field. Non-matching items
+    pass through verbatim. `ctx` is used in error messages (e.g.
+    'target hello: sources')."""
+    if items is None:
+        return []
+    out: list[str] = []
+    for item in items:
+        if not isinstance(item, str):
+            raise ConfigError(f"{ctx}: list entries must be strings, got {item!r}")
+        m = _VARS_REF.match(item)
+        if m:
+            vname = m.group(1)
+            if vname not in vars:
+                raise ConfigError(f"{ctx}: undefined var '$vars.{vname}'")
+            out.extend(vars[vname])
+        else:
+            out.append(item)
+    return out
+
+
 def load(root: Path) -> Project:
     toml_path = root / "rigx.toml"
     if not toml_path.is_file():
@@ -101,6 +153,8 @@ def load(root: Path) -> Project:
 
     nixpkgs = data.get("nixpkgs", {})
     nixpkgs_ref = nixpkgs.get("ref", "nixos-24.11")
+
+    vars_table = _load_vars(data)
 
     git_deps: dict[str, GitDep] = {}
     deps_section = data.get("dependencies", {}).get("git", {})
@@ -127,9 +181,15 @@ def load(root: Path) -> Project:
         for unknown in deps_conf.keys() - {"internal", "nixpkgs", "git"}:
             raise ConfigError(f"target {tname}: unknown deps key '{unknown}'")
         deps = TargetDeps(
-            internal=list(deps_conf.get("internal", [])),
-            nixpkgs=list(deps_conf.get("nixpkgs", [])),
-            git=list(deps_conf.get("git", [])),
+            internal=_expand_list(
+                deps_conf.get("internal", []), vars_table, f"target {tname}: deps.internal"
+            ),
+            nixpkgs=_expand_list(
+                deps_conf.get("nixpkgs", []), vars_table, f"target {tname}: deps.nixpkgs"
+            ),
+            git=_expand_list(
+                deps_conf.get("git", []), vars_table, f"target {tname}: deps.git"
+            ),
         )
         for g in deps.git:
             if g not in git_deps:
@@ -139,34 +199,40 @@ def load(root: Path) -> Project:
 
         variants: dict[str, Variant] = {}
         for vname, vconf in tconf.get("variants", {}).items():
+            vctx = f"target {tname}: variants.{vname}"
             variants[vname] = Variant(
                 name=vname,
-                cxxflags=list(vconf.get("cxxflags", [])),
+                cxxflags=_expand_list(vconf.get("cxxflags", []), vars_table, f"{vctx}.cxxflags"),
                 defines=dict(vconf.get("defines", {})),
-                ldflags=list(vconf.get("ldflags", [])),
-                nim_flags=list(vconf.get("nim_flags", [])),
+                ldflags=_expand_list(vconf.get("ldflags", []), vars_table, f"{vctx}.ldflags"),
+                nim_flags=_expand_list(vconf.get("nim_flags", []), vars_table, f"{vctx}.nim_flags"),
             )
 
+        tctx = f"target {tname}"
         targets[tname] = Target(
             name=tname,
             kind=kind,
-            sources=list(tconf.get("sources", [])),
-            includes=list(tconf.get("includes", [])),
-            public_headers=list(tconf.get("public_headers", [])),
+            sources=_expand_list(tconf.get("sources", []), vars_table, f"{tctx}.sources"),
+            includes=_expand_list(tconf.get("includes", []), vars_table, f"{tctx}.includes"),
+            public_headers=_expand_list(
+                tconf.get("public_headers", []), vars_table, f"{tctx}.public_headers"
+            ),
             deps=deps,
-            cxxflags=list(tconf.get("cxxflags", [])),
-            ldflags=list(tconf.get("ldflags", [])),
+            cxxflags=_expand_list(tconf.get("cxxflags", []), vars_table, f"{tctx}.cxxflags"),
+            ldflags=_expand_list(tconf.get("ldflags", []), vars_table, f"{tctx}.ldflags"),
             defines=dict(tconf.get("defines", {})),
-            nim_flags=list(tconf.get("nim_flags", [])),
+            nim_flags=_expand_list(tconf.get("nim_flags", []), vars_table, f"{tctx}.nim_flags"),
             python_version=str(tconf.get("python_version", "3.12")),
             python_project=str(tconf.get("python_project", ".")),
             python_venv_hash=tconf.get("python_venv_hash"),
             run=tconf.get("run"),
-            args=list(tconf.get("args", [])),
-            outputs=list(tconf.get("outputs", [])),
+            args=_expand_list(tconf.get("args", []), vars_table, f"{tctx}.args"),
+            outputs=_expand_list(tconf.get("outputs", []), vars_table, f"{tctx}.outputs"),
             build_script=tconf.get("build_script"),
             install_script=tconf.get("install_script"),
-            native_build_inputs=list(tconf.get("native_build_inputs", [])),
+            native_build_inputs=_expand_list(
+                tconf.get("native_build_inputs", []), vars_table, f"{tctx}.native_build_inputs"
+            ),
             script=tconf.get("script"),
             variants=variants,
         )

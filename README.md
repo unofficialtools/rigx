@@ -101,7 +101,8 @@ If rigx isn't installed, invoke it as a module:
 # `rigx.toml` reference
 
 Every `rigx.toml` has a `[project]` section, an optional `[nixpkgs]` section,
-zero or more `[dependencies.git.*]` entries, and one or more `[targets.*]`.
+an optional `[vars]` table, zero or more `[dependencies.git.*]` entries, and
+one or more `[targets.*]`.
 
 ## Top-level sections
 
@@ -121,6 +122,34 @@ ref = "nixos-24.11"          # optional; default "nixos-24.11". Any nixpkgs bran
 ```
 
 The revision is resolved into `flake.lock` on `rigx lock`.
+
+### `[vars]`
+
+Reusable list values shared between targets. Each entry must be a list of
+strings. Reference one inside any list field with `"$vars.<name>"` — it
+expands inline (the entry is replaced by the var's contents).
+
+```toml
+[vars]
+common_sources = ["src/util.cpp", "src/log.cpp"]
+cxx_deps       = ["fmt", "spdlog"]
+opt_release    = ["-O2", "-flto"]
+
+[targets.app]
+kind          = "executable"
+sources       = ["$vars.common_sources", "src/main.cpp"]
+deps.nixpkgs  = ["$vars.cxx_deps"]
+
+[targets.app.variants.release]
+cxxflags = ["$vars.opt_release", "-DNDEBUG"]
+```
+
+- Expansion is **whole-element only**: `"prefix/$vars.x"` stays literal.
+- Vars cannot reference other vars (one-pass resolution, no cycles).
+- An undefined `$vars.<name>` is a config error.
+- Works in every list field of a target or variant: `sources`, `includes`,
+  `public_headers`, `cxxflags`, `ldflags`, `nim_flags`, `args`, `outputs`,
+  `native_build_inputs`, and all three `deps.*` lists.
 
 ### `[dependencies.git.<name>]`
 
