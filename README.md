@@ -553,6 +553,7 @@ sources         = ["src/greet.py"]   # sources[0] is the entry; all sources are 
 python_version  = "3.12"             # → pkgs.python312 from nixpkgs
 python_project  = "."                # dir with pyproject.toml + uv.lock (relative to root)
 python_venv_hash = "sha256-..."      # optional; see workflow below
+python_venv_extra = ["vendor", "wheels/*.whl"]  # optional; vendored wheels / path-deps
 ```
 
 - Output: `$out/bin/<name>` — a launcher that invokes the pinned Python
@@ -561,6 +562,28 @@ python_venv_hash = "sha256-..."      # optional; see workflow below
 - Dependencies come from `pyproject.toml` + `uv.lock`, **not** from
   `deps.nixpkgs`. `uv sync --frozen` runs inside a fixed-output derivation
   (FOD) that has network access for PyPI.
+
+**Vendored wheels / path-deps via `python_venv_extra`.** By default the venv
+FOD only sees `pyproject.toml` + `uv.lock`. That keeps the FOD hash a
+function of the lockfile alone — fast, stable. To make additional files
+visible to `uv sync` (typical case: an offline `vendor/` of pinned wheels,
+a `find-links` directory, or a `path = "../local-pkg"` dep), list them in
+`python_venv_extra`:
+
+```toml
+python_venv_extra = ["vendor", "wheels/*.whl"]
+```
+
+- Paths are **relative to `python_project`** (the directory holding
+  `pyproject.toml`). They land in the FOD source at the same relative
+  position, so `pyproject.toml`'s `tool.uv.find-links = ["vendor"]`
+  resolves naturally.
+- Both `$vars.X` substitution and globs (`*`, `**`, `?`, `[…]`) are
+  supported, the same as in `sources`.
+- Tradeoff: anything you list here re-runs `uv sync` (and shifts the
+  venv hash) when it changes. That's exactly what you want for vendored
+  wheels (deterministic), and not what you want for stray sibling files —
+  list only what `uv sync` actually needs.
 
 **`python_venv_hash` workflow** (optional but recommended):
 

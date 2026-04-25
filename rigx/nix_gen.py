@@ -681,6 +681,32 @@ def _python_pkg_attr(version: str) -> str:
     return f"python{major_minor}"
 
 
+def _venv_extra_pairs(target: Target) -> list[tuple[str, str]]:
+    """Map each `python_venv_extra` entry to (src_in_flake, dest_in_FOD).
+
+    Entries land in `target.python_venv_extra` as project-root-relative paths
+    (the loader's expansion already prefixed them with `python_project`).
+    The FOD source has `pyproject.toml` at its root, so destinations are
+    re-rooted to be python_project-relative."""
+    pdir = target.python_project.strip("/")
+    pairs: list[tuple[str, str]] = []
+    for entry in target.python_venv_extra:
+        src = entry
+        if pdir in (".", ""):
+            dest = entry
+        elif entry.startswith(pdir + "/"):
+            dest = entry[len(pdir) + 1:]
+        elif entry == pdir:
+            dest = ""
+        else:
+            # Path that's not under python_project — shouldn't happen given
+            # the loader's path-prefixing, but tolerate it by mirroring the
+            # entry verbatim into the FOD.
+            dest = entry
+        pairs.append((src, dest))
+    return pairs
+
+
 def _mk_python_derivation(target: Target, project: Project) -> str:
     """Python scripts: build a uv-managed venv (FOD) and wrap the entry script.
 
@@ -734,6 +760,15 @@ def _mk_python_derivation(target: Target, project: Project) -> str:
     lines.append("    mkdir -p $out")
     lines.append(f"    cp ${{{pyproject_nix}}} $out/pyproject.toml")
     lines.append(f"    cp ${{{uvlock_nix}}} $out/uv.lock")
+    # python_venv_extra: each entry is a project-root-relative path. We copy
+    # it into the FOD source at its python_project-relative location so
+    # `pyproject.toml` can reach it via the same relative ref the user wrote
+    # (e.g. `tool.uv.find-links = ["vendor"]`).
+    for src_rel, dest_rel in _venv_extra_pairs(target):
+        parent = "/".join(dest_rel.split("/")[:-1])
+        if parent:
+            lines.append(f"    mkdir -p $out/{parent}")
+        lines.append(f"    cp -r ${{./{src_rel}}} $out/{dest_rel}")
     lines.append("  '';")
     lines.append("  pythonVenv = pkgs.stdenv.mkDerivation {")
     lines.append(f"    name = \"{target.name}-venv\";")

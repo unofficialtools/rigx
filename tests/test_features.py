@@ -247,5 +247,120 @@ class BuildJson(unittest.TestCase):
         self.assertEqual(parsed, [{"attr": "a", "output": "/tmp/output/a"}])
 
 
+class PythonVenvExtra(unittest.TestCase):
+    """`python_venv_extra` lets python_script targets pull vendored wheels
+    or other sibling files into the venv FOD source. Paths are typed
+    relative to `python_project`; we glob+expand them and re-root the
+    destinations under the FOD root."""
+
+    def _write(self, root: Path, files: dict[str, str]) -> None:
+        for rel, body in files.items():
+            p = root / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(body)
+
+    def test_flat_layout_paths_unchanged(self):
+        from rigx import config
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(tmp))
+        root = Path(tmp)
+        self._write(root, {
+            "rigx.toml": dedent("""
+                [project]
+                name = "p"
+                [targets.app]
+                kind              = "python_script"
+                sources           = ["app.py"]
+                python_project    = "."
+                python_venv_extra = ["vendor"]
+            """).lstrip(),
+            "app.py": "",
+            "vendor/.keep": "",
+        })
+        proj = config.load(root)
+        self.assertEqual(proj.targets["app"].python_venv_extra, ["vendor"])
+
+    def test_glob_expands_in_python_project_dir(self):
+        from rigx import config
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(tmp))
+        root = Path(tmp)
+        self._write(root, {
+            "rigx.toml": dedent("""
+                [project]
+                name = "p"
+                [targets.app]
+                kind              = "python_script"
+                sources           = ["app.py"]
+                python_project    = "."
+                python_venv_extra = ["wheels/*.whl"]
+            """).lstrip(),
+            "app.py": "",
+            "wheels/a.whl": "",
+            "wheels/b.whl": "",
+        })
+        proj = config.load(root)
+        # Globs against python_project dir; results sorted; output paths
+        # preserve the relative location.
+        self.assertEqual(
+            proj.targets["app"].python_venv_extra,
+            ["wheels/a.whl", "wheels/b.whl"],
+        )
+
+    def test_nested_python_project_paths_get_prefixed(self):
+        from rigx import config
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(tmp))
+        root = Path(tmp)
+        self._write(root, {
+            "rigx.toml": dedent("""
+                [project]
+                name = "p"
+                [targets.app]
+                kind              = "python_script"
+                sources           = ["py/app.py"]
+                python_project    = "py"
+                python_venv_extra = ["vendor"]
+            """).lstrip(),
+            "py/app.py": "",
+            "py/vendor/.keep": "",
+        })
+        proj = config.load(root)
+        # Stored project-root-relative.
+        self.assertEqual(proj.targets["app"].python_venv_extra, ["py/vendor"])
+
+    def test_nix_gen_emits_copy_lines_with_correct_dests(self):
+        # Unit-level: the venv-extra-pairs helper re-roots paths under
+        # python_project so the FOD source stays pyproject-relative.
+        from rigx import nix_gen
+        from rigx.config import Target
+        t = Target(
+            name="app", kind="python_script",
+            sources=["py/app.py"],
+            python_project="py",
+            python_venv_extra=["py/vendor", "py/wheels/foo.whl"],
+        )
+        pairs = nix_gen._venv_extra_pairs(t)
+        self.assertEqual(pairs, [
+            ("py/vendor", "vendor"),
+            ("py/wheels/foo.whl", "wheels/foo.whl"),
+        ])
+
+    def test_nix_gen_flat_layout_dest_equals_src(self):
+        from rigx import nix_gen
+        from rigx.config import Target
+        t = Target(
+            name="app", kind="python_script",
+            sources=["app.py"],
+            python_project=".",
+            python_venv_extra=["vendor", "wheels/foo.whl"],
+        )
+        pairs = nix_gen._venv_extra_pairs(t)
+        self.assertEqual(pairs, [
+            ("vendor", "vendor"),
+            ("wheels/foo.whl", "wheels/foo.whl"),
+        ])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -135,6 +135,11 @@ class Target:
     python_version: str = "3.12"
     python_project: str = "."
     python_venv_hash: str | None = None
+    # Extra files to include in the venv FOD source (alongside pyproject.toml
+    # + uv.lock). Paths are relative to `python_project`. Anything you list
+    # here re-runs `uv sync` (and shifts the venv hash) when it changes —
+    # exactly what you want for vendored wheels / path-deps.
+    python_venv_extra: list[str] = field(default_factory=list)
     run: str | None = None                          # for kind = "run"
     args: list[str] = field(default_factory=list)   # for kind = "run"
     outputs: list[str] = field(default_factory=list)  # for kind = "run"
@@ -429,13 +434,35 @@ def _build_target(
             tconf.get("public_headers", []), vars_table, f"{tctx}.public_headers"
         )
     ]
-    python_project = str(tconf.get("python_project", "."))
+    raw_python_project = str(tconf.get("python_project", "."))
+    python_project = raw_python_project
     if path_prefix and python_project not in (".", ""):
         # python_project is a path relative to the declaring rigx.toml; rewrite
         # so it stays valid from the parent's root.
         python_project = path_prefix.rstrip("/") + "/" + python_project.lstrip("./")
     elif path_prefix and python_project in (".", ""):
         python_project = path_prefix.rstrip("/")
+
+    # python_venv_extra: paths the user types relative to `python_project`
+    # (i.e. relative to where their `pyproject.toml` lives). We glob against
+    # that directory on disk and emit project-root-relative paths so the
+    # nix_gen layer can reach them via `${./<path>}`.
+    if raw_python_project in (".", ""):
+        venv_glob_root = glob_root
+        venv_output_prefix = path_prefix
+    else:
+        venv_glob_root = glob_root / raw_python_project
+        venv_output_prefix = (python_project.rstrip("/") + "/") if python_project not in (".", "") else ""
+    python_venv_extra = _expand_globs(
+        _expand_list(
+            tconf.get("python_venv_extra", []),
+            vars_table,
+            f"{tctx}.python_venv_extra",
+        ),
+        venv_glob_root,
+        f"{tctx}.python_venv_extra",
+        output_prefix=venv_output_prefix,
+    )
 
     # Resolve language + validate compiler for executable/static_library.
     language = ""
@@ -472,6 +499,7 @@ def _build_target(
         python_version=str(tconf.get("python_version", "3.12")),
         python_project=python_project,
         python_venv_hash=tconf.get("python_venv_hash"),
+        python_venv_extra=python_venv_extra,
         run=tconf.get("run"),
         args=_expand_list(tconf.get("args", []), vars_table, f"{tctx}.args"),
         outputs=_expand_list(tconf.get("outputs", []), vars_table, f"{tctx}.outputs"),
