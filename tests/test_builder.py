@@ -95,8 +95,10 @@ class ResolveAttrCrossFlake(unittest.TestCase):
 
     def test_dotted_with_variant(self):
         proj = self._parent_with_sub()
+        # Variant suffix uses `-` because Nix allows hyphens in identifiers;
+        # only the dot in the qualified name gets sanitized to `_`.
         self.assertEqual(
-            builder._resolve_attr(proj, "sub.lib@release"), "sub_lib_release"
+            builder._resolve_attr(proj, "sub.lib@release"), "sub_lib-release"
         )
 
     def test_unknown_dotted_target(self):
@@ -153,7 +155,7 @@ class ResolveAttrCrossFlake(unittest.TestCase):
         self.assertEqual(builder._resolve_attr(proj, "frontend.greet"), "frontend_greet")
         self.assertEqual(
             builder._resolve_attr(proj, "frontend.greet@release"),
-            "frontend_greet_release",
+            "frontend_greet-release",
         )
 
 
@@ -266,6 +268,80 @@ class FlakeRef(unittest.TestCase):
         ref = builder._flake_ref(proj)
         self.assertTrue(ref.startswith("path:"))
         self.assertNotIn("#", ref)
+
+
+class DashNamedTargets(unittest.TestCase):
+    """Regression: dash-named targets and underscore-named targets are the
+    same thing. The loader stores the canonical (underscore) form; both
+    spellings on the CLI resolve to the same flake attr."""
+
+    def _proj(self, with_variant: bool = False) -> Project:
+        # The loader canonicalizes the target key. Mirror that here so the
+        # fixture matches reality.
+        target = Target(
+            name="actarus_test_runner",
+            kind="executable", sources=["m.cpp"],
+            variants={"release": Variant(name="release")} if with_variant else {},
+        )
+        return _project_with(**{"actarus_test_runner": target})
+
+    def test_dash_input_resolves_to_canonical(self):
+        attr = builder._resolve_attr(self._proj(), "actarus-test-runner")
+        self.assertEqual(attr, "actarus_test_runner")
+
+    def test_underscore_input_resolves_to_canonical(self):
+        attr = builder._resolve_attr(self._proj(), "actarus_test_runner")
+        self.assertEqual(attr, "actarus_test_runner")
+
+    def test_mixed_input_resolves_to_canonical(self):
+        attr = builder._resolve_attr(self._proj(), "actarus_test-runner")
+        self.assertEqual(attr, "actarus_test_runner")
+
+    def test_dash_variant_resolves_to_canonical(self):
+        attr = builder._resolve_attr(
+            self._proj(with_variant=True), "actarus-test-runner@release",
+        )
+        self.assertEqual(attr, "actarus_test_runner-release")
+
+    def test_flake_attr_matches_resolve(self):
+        # End-to-end: flake.nix declares the same attr name `_resolve_attr`
+        # asks for, regardless of which spelling the user typed.
+        from rigx import nix_gen
+        proj = self._proj()
+        out = nix_gen.generate(proj)
+        for spelling in ("actarus-test-runner", "actarus_test_runner",
+                         "actarus_test-runner"):
+            attr = builder._resolve_attr(proj, spelling)
+            self.assertIn(f"{attr} = pkgs.stdenv.mkDerivation", out)
+
+    def test_dashed_glob_matches_canonical_targets(self):
+        proj = _project_with(**{
+            "actarus_test_runner": Target(
+                name="actarus_test_runner", kind="executable", sources=["m.cpp"],
+            ),
+            "actarus_helper": Target(
+                name="actarus_helper", kind="executable", sources=["m.cpp"],
+            ),
+        })
+        # User types dashes in the glob; matches canonical underscore keys.
+        attrs = sorted(builder._expand_build_spec(proj, "actarus-*"))
+        self.assertEqual(attrs, ["actarus_helper", "actarus_test_runner"])
+
+    def test_dashed_test_filter_matches_canonical(self):
+        from rigx.config import Variant  # noqa
+        proj = Project(
+            name="p", version="0.1.0", nixpkgs_ref="nixos-24.11",
+            git_deps={}, root=Path("/tmp"),
+            targets={
+                "smoke_test": Target(name="smoke_test", kind="test", script="exit 0"),
+                "perf_test":  Target(name="perf_test",  kind="test", script="exit 0"),
+            },
+        )
+        with mock.patch("rigx.builder.run_script_target", return_value=0):
+            results = builder.run_tests(proj, filters=["*-test"])
+        self.assertEqual(
+            sorted(n for n, _ in results), ["perf_test", "smoke_test"]
+        )
 
 
 class BuildGlob(unittest.TestCase):

@@ -12,6 +12,24 @@ from pathlib import Path
 # expansion is whole-element only.
 _VARS_REF = re.compile(r"^\$vars\.([A-Za-z_][A-Za-z0-9_]*)$")
 
+def _canonical_name(name: str) -> str:
+    """A target/variant name's canonical form. Dashes and underscores are
+    treated as equivalent, with `_` as the canonical spelling — so
+    `actarus-test-runner` and `actarus_test_runner` refer to the same
+    target everywhere (TOML keys, `deps.internal`, `run`, CLI specs, the
+    flake attr, build artifacts).
+
+    Dotted (B-merged) names are canonicalized segment-by-segment so the
+    `.` separator survives: `frontend.greet-fn` → `frontend.greet_fn`.
+    For dotted names, callers should use `canonicalize_qualified()`."""
+    return name.replace("-", "_")
+
+
+def canonicalize_qualified(name: str) -> str:
+    """Canonicalize a possibly-dotted name, segment-by-segment."""
+    return ".".join(_canonical_name(seg) for seg in name.split("."))
+
+
 # Source-extension → language. Anchors `executable` / `static_library`'s
 # language inference so a `.cpp` source picks the C++ build phase, a `.go`
 # source picks the Go path, etc. Mixed extensions (without an explicit
@@ -375,10 +393,15 @@ def _build_target(
     deps_conf = tconf.get("deps", {})
     for unknown in deps_conf.keys() - {"internal", "nixpkgs", "git"}:
         raise ConfigError(f"target {tname}: unknown deps key '{unknown}'")
+    # Canonicalize each `deps.internal` entry (segment-by-segment for dotted
+    # refs like `frontend.greet-fn`) so the lookup matches the canonical
+    # target keys stored in `project.targets`.
+    raw_internal = _expand_list(
+        deps_conf.get("internal", []), vars_table, f"target {tname}: deps.internal"
+    )
+    canonical_internal = [canonicalize_qualified(d) for d in raw_internal]
     deps = TargetDeps(
-        internal=_expand_list(
-            deps_conf.get("internal", []), vars_table, f"target {tname}: deps.internal"
-        ),
+        internal=canonical_internal,
         nixpkgs=_expand_list(
             deps_conf.get("nixpkgs", []), vars_table, f"target {tname}: deps.nixpkgs"
         ),
@@ -402,6 +425,7 @@ def _build_target(
 
     variants: dict[str, Variant] = {}
     for vname, vconf in tconf.get("variants", {}).items():
+        vname = _canonical_name(vname)
         vctx = f"target {tname}: variants.{vname}"
         variants[vname] = Variant(
             name=vname,
@@ -669,8 +693,15 @@ def _load(root: Path, _visited: set[Path]) -> Project:
     # to the parent root.
     targets: dict[str, Target] = {}
     for tname, tconf in data.get("targets", {}).items():
-        targets[tname] = _build_target(
-            tname, tconf, vars_table, git_deps, root,
+        canonical = _canonical_name(tname)
+        if canonical in targets:
+            raise ConfigError(
+                f"target {tname!r} canonicalizes to {canonical!r} which is "
+                f"already declared by another target (dashes and underscores "
+                f"are equivalent)"
+            )
+        targets[canonical] = _build_target(
+            canonical, tconf, vars_table, git_deps, root,
             namespace="", path_prefix="",
         )
     for ns, mod_root, mod_data in modules:
@@ -681,15 +712,17 @@ def _load(root: Path, _visited: set[Path]) -> Project:
             raise ConfigError(
                 f"module {ns}: path {mod_root} is not under parent root {root}"
             )
+        canonical_ns = _canonical_name(ns)
         for tname, tconf in mod_data.get("targets", {}).items():
-            qual = f"{ns}.{tname}"
+            canonical = _canonical_name(tname)
+            qual = f"{canonical_ns}.{canonical}"
             if qual in targets:
                 raise ConfigError(
                     f"module {ns}: target name collision on '{qual}'"
                 )
             targets[qual] = _build_target(
-                tname, tconf, vars_table, git_deps, mod_root,
-                namespace=ns, path_prefix=prefix,
+                canonical, tconf, vars_table, git_deps, mod_root,
+                namespace=canonical_ns, path_prefix=prefix,
             )
 
     # Phase 4: validate deps.internal across the merged set. A ref is valid
@@ -732,15 +765,17 @@ def _load(root: Path, _visited: set[Path]) -> Project:
         if target.kind == "run":
             if not target.run:
                 raise ConfigError(f"target {tname}: kind='run' requires 'run = <name>'")
-            # If `run` matches an internal target, require it to be runnable.
-            # Otherwise, treat `run` as a bare command name resolved via PATH
-            # (supplied by deps.nixpkgs / deps.git).
-            if target.run in targets:
+            # If `run` matches an internal target (after canonicalization),
+            # require it to be runnable. Otherwise, treat `run` as a bare
+            # command name resolved via PATH (supplied by deps.nixpkgs /
+            # deps.git) — bare commands keep their dashes verbatim.
+            run_canonical = canonicalize_qualified(target.run)
+            if run_canonical in targets:
                 runnable_kinds = {"executable"}
-                if targets[target.run].kind not in runnable_kinds:
+                if targets[run_canonical].kind not in runnable_kinds:
                     raise ConfigError(
                         f"target {tname}: run target '{target.run}' must be one of "
-                        f"{sorted(runnable_kinds)}, got {targets[target.run].kind!r}"
+                        f"{sorted(runnable_kinds)}, got {targets[run_canonical].kind!r}"
                     )
             if not target.outputs:
                 raise ConfigError(

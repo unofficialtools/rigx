@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 
-from rigx.config import GitDep, Project, Target, Variant
+from rigx.config import GitDep, Project, Target, Variant, canonicalize_qualified
 
 
 def _nix_str(s: str) -> str:
@@ -15,8 +15,12 @@ def _nix_str(s: str) -> str:
 def _nix_id(qualified: str) -> str:
     """Map a possibly-dotted name ('frontend.app') to a Nix identifier
     ('frontend_app'). Used for `let` bindings and `rec` attrs — Nix accepts
-    dots only in quoted attr keys, and they break `${name}` interpolation."""
-    return qualified.replace(".", "_").replace("-", "_")
+    dots only in quoted attr keys, and they break `${name}` interpolation.
+
+    Hyphens stay verbatim: they're valid Nix identifier characters
+    (`hello-debug`, `actarus-test-runner` are legal `rec` attrs and
+    `nix build .#…` accepts them)."""
+    return qualified.replace(".", "_")
 
 
 # Matches `${X.Y}` (and `${X.Y.Z}` etc.) where each segment is identifier-ish
@@ -248,12 +252,14 @@ def _build_inputs(target: Target, project: Project) -> list[str]:
         # identifier — both end up in the parent's `rec` block (own targets
         # directly; cross-flake targets via re-export bindings).
         exprs.append(_nix_id(d))
-    if (
-        target.run
-        and (target.run in project.targets or _is_cross_flake_ref(target.run, project))
-        and target.run not in target.deps.internal
-    ):
-        exprs.append(_nix_id(target.run))
+    if target.run:
+        run_canonical = canonicalize_qualified(target.run)
+        if (
+            (run_canonical in project.targets
+             or _is_cross_flake_ref(run_canonical, project))
+            and run_canonical not in target.deps.internal
+        ):
+            exprs.append(_nix_id(run_canonical))
     return exprs
 
 
@@ -633,17 +639,20 @@ def _shell_quote(s: str) -> str:
 
 def _build_phase_run(target: Target, project: Project) -> str:
     assert target.run is not None
-    if target.run in project.targets:
+    # Try the canonical (`-` → `_`) form against project.targets first; that
+    # catches dash-named refs that match an internal target. If neither
+    # canonical nor raw resolves, fall back to a PATH command (where the
+    # raw form is preserved — bare commands legitimately have dashes).
+    run_canonical = canonicalize_qualified(target.run)
+    if run_canonical in project.targets:
         # internal target: absolute path into its store output. For B-merged
         # targets (`frontend.greet`), the rec attr is sanitized but the
         # binary inside is named after the dep's raw target name.
-        dep_target = project.targets[target.run]
-        binary = f"${{{_nix_id(target.run)}}}/bin/{dep_target.name}"
-    elif _is_cross_flake_ref(target.run, project):
-        # The sub-flake's binary lives at $out/bin/<last-segment>; the parent's
-        # re-export attr is the sanitized form of the full qualified name.
-        nix_ref = _nix_id(target.run)
-        bin_name = target.run.rsplit(".", 1)[1]
+        dep_target = project.targets[run_canonical]
+        binary = f"${{{_nix_id(run_canonical)}}}/bin/{dep_target.name}"
+    elif _is_cross_flake_ref(run_canonical, project):
+        nix_ref = _nix_id(run_canonical)
+        bin_name = run_canonical.rsplit(".", 1)[1]
         binary = f"${{{nix_ref}}}/bin/{bin_name}"
     else:
         # bare command name: resolved via PATH from deps.nixpkgs / deps.git

@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 from rigx import nix_gen
-from rigx.config import Project
+from rigx.config import Project, canonicalize_qualified
 
 OUTPUT_DIR = "output"
 FLAKE_FILE = "flake.nix"
@@ -170,6 +170,12 @@ def _resolve_attr(project: Project, spec: str) -> str:
     else:
         name, variant = spec, None
 
+    # Canonicalize: dashes and underscores are equivalent, so the lookup
+    # uses the same key shape `project.targets` was built with.
+    name = canonicalize_qualified(name)
+    if variant is not None:
+        variant = variant.replace("-", "_")
+
     dotted = "." in name
     if dotted and name in project.targets:
         # B-merged target (`frontend.greet` is a key in this flake's targets).
@@ -200,10 +206,11 @@ def _resolve_attr(project: Project, spec: str) -> str:
 
 
 def _nix_id(name: str) -> str:
-    """Map a possibly-dotted/hyphenated rigx name to a Nix identifier.
-    Mirrors `nix_gen._nix_id` — kept duplicated to avoid a builder→nix_gen
-    private-symbol import."""
-    return name.replace(".", "_").replace("-", "_")
+    """Map a possibly-dotted rigx name to a Nix identifier. Mirrors
+    `nix_gen._nix_id` — kept duplicated to avoid a builder→nix_gen
+    private-symbol import. Hyphens are valid Nix identifier characters
+    and pass through unchanged."""
+    return name.replace(".", "_")
 
 
 def _all_attrs(project: Project) -> list[str]:
@@ -293,11 +300,16 @@ def run_tests(
 
     Tests reuse the `script` execution path: each runs in a `nix shell`
     with `deps.nixpkgs` on PATH, host-side, exit 0 = pass."""
+    canonical_filters = (
+        [canonicalize_qualified(f) for f in filters] if filters else None
+    )
     selected: list[tuple[str, object]] = []
     for name, target in project.targets.items():
         if target.kind != "test":
             continue
-        if filters and not any(fnmatch.fnmatchcase(name, f) for f in filters):
+        if canonical_filters and not any(
+            fnmatch.fnmatchcase(name, f) for f in canonical_filters
+        ):
             continue
         selected.append((name, target))
     results: list[tuple[str, int]] = []
@@ -332,8 +344,12 @@ def _expand_build_spec(project: Project, spec: str) -> list[str]:
                 f"glob spec {spec!r} cannot include @variant — variants "
                 f"are expanded automatically for matched targets"
             )
+        # Canonicalize the pattern's name segments (dashes → underscores)
+        # so user-typed dashed globs match canonical keys.
+        canonical_pattern = canonicalize_qualified(base)
         names = sorted(
-            n for n in project.targets if fnmatch.fnmatchcase(n, base)
+            n for n in project.targets
+            if fnmatch.fnmatchcase(n, canonical_pattern)
         )
         if not names:
             raise BuildError(f"glob {spec!r} matched no targets")

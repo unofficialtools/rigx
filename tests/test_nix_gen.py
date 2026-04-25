@@ -373,14 +373,14 @@ class GenerateLocalDeps(unittest.TestCase):
             name="parent", root=Path("/tmp/parent"), local_deps={"sub": ldep},
         )
         out = nix_gen.generate(parent)
-        # Plain target → re-exported under sanitized name.
+        # Plain target → re-exported under sanitized name (only `.` → `_`).
         self.assertIn("sub_app = inputs.sub.packages.${system}.app;", out)
-        # Variant → re-exported with hyphenated sub-attr access.
+        # Variant → both sides keep the hyphen (Nix accepts it natively).
         self.assertIn(
-            "sub_lib_debug = inputs.sub.packages.${system}.lib-debug;", out
+            "sub_lib-debug = inputs.sub.packages.${system}.lib-debug;", out
         )
         self.assertIn(
-            "sub_lib_release = inputs.sub.packages.${system}.lib-release;", out
+            "sub_lib-release = inputs.sub.packages.${system}.lib-release;", out
         )
         # Unqualified alias also re-exported.
         self.assertIn("sub_lib = inputs.sub.packages.${system}.lib;", out)
@@ -735,10 +735,14 @@ class CrossCompilation(unittest.TestCase):
 
 
 class NixIdHelper(unittest.TestCase):
-    def test_replaces_dot_and_hyphen(self):
+    def test_replaces_only_dots(self):
+        # `.` → `_` because Nix forbids dots in bare attr names.
         self.assertEqual(nix_gen._nix_id("frontend.app"), "frontend_app")
-        self.assertEqual(nix_gen._nix_id("hello-debug"), "hello_debug")
-        self.assertEqual(nix_gen._nix_id("a.b-c"), "a_b_c")
+        # Hyphens stay verbatim — Nix identifiers permit them.
+        self.assertEqual(nix_gen._nix_id("hello-debug"), "hello-debug")
+        self.assertEqual(nix_gen._nix_id("actarus-test-runner"), "actarus-test-runner")
+        # Mixed: only the dot gets replaced.
+        self.assertEqual(nix_gen._nix_id("a.b-c"), "a_b-c")
 
     def test_no_op_on_clean_id(self):
         self.assertEqual(nix_gen._nix_id("hello"), "hello")
