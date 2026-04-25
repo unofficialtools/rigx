@@ -12,6 +12,36 @@ from pathlib import Path
 # expansion is whole-element only.
 _VARS_REF = re.compile(r"^\$vars\.([A-Za-z_][A-Za-z0-9_]*)$")
 
+# Source-extension → language. Anchors `executable` / `static_library`'s
+# language inference so a `.cpp` source picks the C++ build phase, a `.go`
+# source picks the Go path, etc. Mixed extensions (without an explicit
+# `language = …`) are rejected at config-load time.
+EXT_TO_LANG = {
+    ".c":   "c",
+    ".cpp": "cxx", ".cxx": "cxx", ".cc": "cxx", ".C": "cxx",
+    ".go":  "go",
+    ".rs":  "rust",
+    ".zig": "zig",
+}
+
+# Which `kind` accepts which `language`. `executable` works for everything;
+# `static_library` is limited to languages with a stable archive convention
+# (`.a` / rlib). Go and Zig static libraries exist but the conventions are
+# noisier — out of scope for v1.
+KIND_LANGUAGES = {
+    "executable":     {"c", "cxx", "go", "rust", "zig"},
+    "static_library": {"c", "cxx", "rust"},
+}
+
+# Default toolchain nixpkgs attr per language (used when `compiler` is unset).
+# For c/cxx we ride the default `pkgs.stdenv`; for the others we pull the
+# compiler explicitly into nativeBuildInputs.
+DEFAULT_COMPILER = {
+    "go":   "go",
+    "rust": "rustc",
+    "zig":  "zig",
+}
+
 VALID_KINDS = {
     "executable",
     "static_library",
@@ -61,6 +91,11 @@ class Variant:
     defines: dict[str, str] = field(default_factory=dict)
     ldflags: list[str] = field(default_factory=list)
     nim_flags: list[str] = field(default_factory=list)
+    cflags: list[str] = field(default_factory=list)
+    goflags: list[str] = field(default_factory=list)
+    rustflags: list[str] = field(default_factory=list)
+    zigflags: list[str] = field(default_factory=list)
+    compiler: str = ""        # variant-level toolchain override
 
 
 @dataclass
@@ -75,6 +110,18 @@ class Target:
     ldflags: list[str] = field(default_factory=list)
     defines: dict[str, str] = field(default_factory=dict)
     nim_flags: list[str] = field(default_factory=list)
+    cflags: list[str] = field(default_factory=list)
+    goflags: list[str] = field(default_factory=list)
+    rustflags: list[str] = field(default_factory=list)
+    zigflags: list[str] = field(default_factory=list)
+    # Language for `executable`/`static_library` kinds. Inferred from source
+    # extensions if omitted. Mixed-extension sources require an explicit value.
+    language: str = ""
+    # Toolchain selector. For c/cxx, names a stdenv variant
+    # (`""` → default stdenv, `"clang"` → clangStdenv, `"gcc13"` → gcc13Stdenv).
+    # For go/rust/zig, names the nixpkgs attr providing the compiler binary
+    # (`""` → "go" / "rustc" / "zig"; `"go_1_21"` to pin a specific version).
+    compiler: str = ""
     # Python (kind = "python_script")
     python_version: str = "3.12"
     python_project: str = "."
@@ -206,6 +253,45 @@ def _expand_globs(
     return out
 
 
+def _infer_language(
+    sources: list[str], explicit: str, kind: str, ctx: str
+) -> str:
+    """Resolve a target's `language` field.
+
+    With `explicit` set: validates it's one of the known languages.
+    Otherwise: scans source extensions; rejects mixed-language source lists
+    (forces an explicit override) and empty source lists (`executable`/
+    `static_library` always need at least one source)."""
+    if explicit:
+        if explicit not in {"c", "cxx", "go", "rust", "zig"}:
+            raise ConfigError(
+                f"{ctx}: language must be one of c, cxx, go, rust, zig "
+                f"(got {explicit!r})"
+            )
+        return explicit
+    if not sources:
+        raise ConfigError(
+            f"{ctx}: cannot infer language — `sources` is empty"
+        )
+    seen: set[str] = set()
+    for s in sources:
+        for ext, lang in EXT_TO_LANG.items():
+            if s.endswith(ext):
+                seen.add(lang)
+                break
+    if not seen:
+        raise ConfigError(
+            f"{ctx}: cannot infer language from sources {sources!r}; "
+            f"set `language = …` explicitly"
+        )
+    if len(seen) > 1:
+        raise ConfigError(
+            f"{ctx}: mixed source languages {sorted(seen)}; "
+            f"set `language = …` to disambiguate"
+        )
+    return next(iter(seen))
+
+
 def _build_target(
     tname: str,
     tconf: dict,
@@ -267,6 +353,11 @@ def _build_target(
             defines=dict(vconf.get("defines", {})),
             ldflags=_expand_list(vconf.get("ldflags", []), vars_table, f"{vctx}.ldflags"),
             nim_flags=_expand_list(vconf.get("nim_flags", []), vars_table, f"{vctx}.nim_flags"),
+            cflags=_expand_list(vconf.get("cflags", []), vars_table, f"{vctx}.cflags"),
+            goflags=_expand_list(vconf.get("goflags", []), vars_table, f"{vctx}.goflags"),
+            rustflags=_expand_list(vconf.get("rustflags", []), vars_table, f"{vctx}.rustflags"),
+            zigflags=_expand_list(vconf.get("zigflags", []), vars_table, f"{vctx}.zigflags"),
+            compiler=str(vconf.get("compiler", "")),
         )
 
     tctx = f"target {tname}"
@@ -294,6 +385,19 @@ def _build_target(
     elif path_prefix and python_project in (".", ""):
         python_project = path_prefix.rstrip("/")
 
+    # Resolve language + validate compiler for executable/static_library.
+    language = ""
+    if kind in KIND_LANGUAGES:
+        language = _infer_language(
+            sources, str(tconf.get("language", "")), kind, tctx,
+        )
+        if language not in KIND_LANGUAGES[kind]:
+            raise ConfigError(
+                f"{tctx}: kind={kind!r} does not support language {language!r}; "
+                f"allowed: {sorted(KIND_LANGUAGES[kind])}"
+            )
+    compiler = str(tconf.get("compiler", ""))
+
     return Target(
         name=tname,
         kind=kind,
@@ -305,6 +409,12 @@ def _build_target(
         ldflags=_expand_list(tconf.get("ldflags", []), vars_table, f"{tctx}.ldflags"),
         defines=dict(tconf.get("defines", {})),
         nim_flags=_expand_list(tconf.get("nim_flags", []), vars_table, f"{tctx}.nim_flags"),
+        cflags=_expand_list(tconf.get("cflags", []), vars_table, f"{tctx}.cflags"),
+        goflags=_expand_list(tconf.get("goflags", []), vars_table, f"{tctx}.goflags"),
+        rustflags=_expand_list(tconf.get("rustflags", []), vars_table, f"{tctx}.rustflags"),
+        zigflags=_expand_list(tconf.get("zigflags", []), vars_table, f"{tctx}.zigflags"),
+        language=language,
+        compiler=compiler,
         python_version=str(tconf.get("python_version", "3.12")),
         python_project=python_project,
         python_venv_hash=tconf.get("python_venv_hash"),

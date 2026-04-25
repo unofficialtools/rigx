@@ -78,11 +78,75 @@ def _effective_cxxflags(target: Target, variant: Variant | None) -> list[str]:
     return flags
 
 
+def _effective_cflags(target: Target, variant: Variant | None) -> list[str]:
+    flags = list(target.cflags)
+    defines = dict(target.defines)
+    if variant:
+        flags += variant.cflags
+        defines.update(variant.defines)
+    for k, v in defines.items():
+        flags.append(f"-D{k}={v}" if v else f"-D{k}")
+    return flags
+
+
 def _effective_ldflags(target: Target, variant: Variant | None) -> list[str]:
     flags = list(target.ldflags)
     if variant:
         flags += variant.ldflags
     return flags
+
+
+def _effective_goflags(target: Target, variant: Variant | None) -> list[str]:
+    flags = list(target.goflags)
+    if variant:
+        flags += variant.goflags
+    return flags
+
+
+def _effective_rustflags(target: Target, variant: Variant | None) -> list[str]:
+    flags = list(target.rustflags)
+    if variant:
+        flags += variant.rustflags
+    return flags
+
+
+def _effective_zigflags(target: Target, variant: Variant | None) -> list[str]:
+    flags = list(target.zigflags)
+    if variant:
+        flags += variant.zigflags
+    return flags
+
+
+def _effective_compiler(target: Target, variant: Variant | None) -> str:
+    if variant and variant.compiler:
+        return variant.compiler
+    return target.compiler
+
+
+def _stdenv_attr(target: Target, variant: Variant | None) -> str:
+    """Pick the nixpkgs stdenv attr for a c/cxx target. `compiler = "clang"`
+    → `clangStdenv`; `"gcc13"` → `gcc13Stdenv`. Empty / non-c/cxx returns the
+    default `stdenv`."""
+    if target.language not in ("c", "cxx"):
+        return "stdenv"
+    comp = _effective_compiler(target, variant)
+    if not comp or comp == "gcc":
+        return "stdenv"
+    return f"{comp}Stdenv"
+
+
+def _toolchain_pkgs(target: Target, variant: Variant | None) -> list[str]:
+    """nixpkgs attrs auto-added to nativeBuildInputs for go/rust/zig
+    targets. C/cxx come from the stdenv directly, so this is empty."""
+    if target.language not in DEFAULT_COMPILER_FOR_LANG:
+        return []
+    comp = _effective_compiler(target, variant) or DEFAULT_COMPILER_FOR_LANG[target.language]
+    return [comp]
+
+
+# Mirrors `config.DEFAULT_COMPILER` but kept here so nix_gen doesn't have to
+# import it. If the table grows or moves, sync both sides.
+DEFAULT_COMPILER_FOR_LANG = {"go": "go", "rust": "rustc", "zig": "zig"}
 
 
 def _is_cross_flake_ref(d: str, project: Project) -> bool:
@@ -146,7 +210,7 @@ def _internal_include_args(target: Target, project: Project) -> list[str]:
     return args
 
 
-def _build_phase_executable(
+def _build_phase_cxx_executable(
     target: Target, variant: Variant | None, project: Project
 ) -> str:
     cxxflags = _effective_cxxflags(target, variant)
@@ -172,6 +236,93 @@ def _build_phase_executable(
     )
 
 
+def _build_phase_c_executable(
+    target: Target, variant: Variant | None, project: Project
+) -> str:
+    cflags = _effective_cflags(target, variant)
+    ldflags = _effective_ldflags(target, variant)
+    includes = [f"-I{i}" for i in target.includes]
+    internal_includes = _internal_include_args(target, project)
+    internal_links = _internal_link_args(target, project)
+
+    parts = ["$CC"]
+    parts += cflags
+    parts += includes
+    parts += internal_includes
+    parts += target.sources
+    parts += internal_links
+    parts += ldflags
+    parts += ["-o", target.name]
+    cmd = " ".join(parts)
+
+    return (
+        "runHook preBuild\n"
+        f"{cmd}\n"
+        "runHook postBuild\n"
+    )
+
+
+def _build_phase_go_executable(
+    target: Target, variant: Variant | None, project: Project
+) -> str:
+    flags = _effective_goflags(target, variant)
+    parts = ["go", "build"]
+    parts += flags
+    parts += ["-o", target.name]
+    parts += target.sources
+    cmd = " ".join(parts)
+    # Go wants writable HOME and module/cache dirs; stdenv's defaults are
+    # read-only or unset.
+    return (
+        "runHook preBuild\n"
+        "export HOME=$TMPDIR\n"
+        "export GOCACHE=$TMPDIR/go-cache\n"
+        "export GOPATH=$TMPDIR/go\n"
+        f"{cmd}\n"
+        "runHook postBuild\n"
+    )
+
+
+def _build_phase_rust_executable(
+    target: Target, variant: Variant | None, project: Project
+) -> str:
+    if not target.sources:
+        raise ValueError(f"rust executable {target.name!r} needs at least one source")
+    entry = target.sources[0]
+    flags = _effective_rustflags(target, variant)
+    parts = ["rustc"]
+    parts += flags
+    parts += ["-o", target.name, entry]
+    cmd = " ".join(parts)
+    return (
+        "runHook preBuild\n"
+        "export HOME=$TMPDIR\n"
+        f"{cmd}\n"
+        "runHook postBuild\n"
+    )
+
+
+def _build_phase_zig_executable(
+    target: Target, variant: Variant | None, project: Project
+) -> str:
+    if not target.sources:
+        raise ValueError(f"zig executable {target.name!r} needs at least one source")
+    entry = target.sources[0]
+    flags = _effective_zigflags(target, variant)
+    parts = ["zig", "build-exe"]
+    parts += flags
+    parts += [f"-femit-bin={target.name}", entry]
+    cmd = " ".join(parts)
+    return (
+        "runHook preBuild\n"
+        "export HOME=$TMPDIR\n"
+        # Zig caches under $XDG_CACHE_HOME or $HOME/.cache; ensure a writable
+        # home is enough.
+        f"{cmd}\n"
+        "runHook postBuild\n"
+    )
+
+
 def _install_phase_executable(target: Target) -> str:
     return (
         "runHook preInstall\n"
@@ -181,7 +332,7 @@ def _install_phase_executable(target: Target) -> str:
     )
 
 
-def _build_phase_static_library(
+def _build_phase_cxx_static_library(
     target: Target, variant: Variant | None, project: Project
 ) -> str:
     cxxflags = _effective_cxxflags(target, variant)
@@ -203,6 +354,49 @@ def _build_phase_static_library(
     lines.append(f"$AR rcs lib{target.name}.a {' '.join(obj_files)}")
     lines.append("runHook postBuild")
     return "\n".join(lines) + "\n"
+
+
+def _build_phase_c_static_library(
+    target: Target, variant: Variant | None, project: Project
+) -> str:
+    cflags = _effective_cflags(target, variant)
+    includes = [f"-I{i}" for i in target.includes]
+    internal_includes = _internal_include_args(target, project)
+
+    lines = ["runHook preBuild"]
+    obj_files: list[str] = []
+    for src in target.sources:
+        obj = _obj_name(src)
+        obj_files.append(obj)
+        parts = ["$CC"]
+        parts += cflags
+        parts += ["-fPIC"]
+        parts += includes
+        parts += internal_includes
+        parts += ["-c", src, "-o", obj]
+        lines.append(" ".join(parts))
+    lines.append(f"$AR rcs lib{target.name}.a {' '.join(obj_files)}")
+    lines.append("runHook postBuild")
+    return "\n".join(lines) + "\n"
+
+
+def _build_phase_rust_static_library(
+    target: Target, variant: Variant | None, project: Project
+) -> str:
+    if not target.sources:
+        raise ValueError(f"rust static_library {target.name!r} needs at least one source")
+    entry = target.sources[0]
+    flags = _effective_rustflags(target, variant)
+    parts = ["rustc", "--crate-type=staticlib", f"--crate-name={target.name}"]
+    parts += flags
+    parts += ["-o", f"lib{target.name}.a", entry]
+    cmd = " ".join(parts)
+    return (
+        "runHook preBuild\n"
+        "export HOME=$TMPDIR\n"
+        f"{cmd}\n"
+        "runHook postBuild\n"
+    )
 
 
 def _effective_nim_flags(target: Target, variant: Variant | None) -> list[str]:
@@ -481,12 +675,46 @@ def _mk_derivation(
         else f"{target.qualified_name}-{variant.name}"
     )
     build_inputs = _build_inputs(target, project)
+    extra_native: list[str] = []
+
+    # `language` is normally populated by config._build_target's inference, but
+    # tests and direct API users can construct Target without it — default to
+    # cxx to match the pre-language behavior.
+    language = target.language or "cxx"
 
     if target.kind == "executable":
-        build_phase = _build_phase_executable(target, variant, project)
+        if language == "cxx":
+            build_phase = _build_phase_cxx_executable(target, variant, project)
+        elif language == "c":
+            build_phase = _build_phase_c_executable(target, variant, project)
+        elif language == "go":
+            build_phase = _build_phase_go_executable(target, variant, project)
+            extra_native = _toolchain_pkgs(target, variant)
+        elif language == "rust":
+            build_phase = _build_phase_rust_executable(target, variant, project)
+            extra_native = _toolchain_pkgs(target, variant)
+        elif language == "zig":
+            build_phase = _build_phase_zig_executable(target, variant, project)
+            extra_native = _toolchain_pkgs(target, variant)
+        else:
+            raise ValueError(
+                f"executable {target.name!r}: unsupported language "
+                f"{target.language!r}"
+            )
         install_phase = _install_phase_executable(target)
     elif target.kind == "static_library":
-        build_phase = _build_phase_static_library(target, variant, project)
+        if language == "cxx":
+            build_phase = _build_phase_cxx_static_library(target, variant, project)
+        elif language == "c":
+            build_phase = _build_phase_c_static_library(target, variant, project)
+        elif language == "rust":
+            build_phase = _build_phase_rust_static_library(target, variant, project)
+            extra_native = _toolchain_pkgs(target, variant)
+        else:
+            raise ValueError(
+                f"static_library {target.name!r}: unsupported language "
+                f"{target.language!r}"
+            )
         install_phase = _install_phase_static_library(target)
     elif target.kind == "nim_executable":
         build_phase = _build_phase_nim_executable(target, variant, project)
@@ -499,14 +727,21 @@ def _mk_derivation(
     else:
         raise ValueError(f"unknown kind {target.kind!r}")
 
+    stdenv_attr = _stdenv_attr(target, variant)
+    native_inputs = [f"pkgs.{n}" for n in extra_native]
+
     # Nix ''...'' multiline string. Inside it, ${foo} interpolates Nix; bash
     # vars like $CXX are left literal because they're not wrapped in ${}.
     lines = [
-        "pkgs.stdenv.mkDerivation {",
+        f"pkgs.{stdenv_attr}.mkDerivation {{",
         f"  pname = {_nix_str(pname)};",
         f"  version = {_nix_str(project.version)};",
         "  inherit src;",
         f"  buildInputs = {_nix_list(build_inputs)};",
+    ]
+    if native_inputs:
+        lines.append(f"  nativeBuildInputs = {_nix_list(native_inputs)};")
+    lines.extend([
         "  dontConfigure = true;",
         "  buildPhase = ''",
         _indent(build_phase, 4).rstrip() + "\n",
@@ -515,7 +750,7 @@ def _mk_derivation(
         _indent(install_phase, 4).rstrip() + "\n",
         "  '';",
         "}",
-    ]
+    ])
     return "\n".join(lines)
 
 

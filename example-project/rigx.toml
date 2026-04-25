@@ -78,17 +78,44 @@ deps.internal = ["headers_zip"]    # declares the build-order dependency
 args = ["-d", "extracted", "${headers_zip}/headers.zip"]
 outputs = ["extracted"]            # a directory; cp -r handles it
 
-# Escape hatch: an unsupported language (Go) whose compiler is in nixpkgs.
-# User supplies the build/install scripts directly.
+# Go: language inferred from `.go` extension; toolchain auto-pulled from nixpkgs.
 [targets.hello_go]
-kind = "custom"
-deps.nixpkgs = ["go"]
-build_script = """
-export GOCACHE=$TMPDIR/go-cache
-export GOPATH=$TMPDIR/go
-go build -o hello_go src/hello.go
-"""
+kind    = "executable"
+sources = ["src/hello.go"]
+
+# Rust: same idea — `.rs` → language=rust, rustc auto-pulled.
+[targets.hello_rust]
+kind    = "executable"
+sources = ["src/hello.rs"]
+rustflags = ["-Copt-level=2"]
+
+# Zig: `.zig` → language=zig, zig auto-pulled.
+[targets.hello_zig]
+kind    = "executable"
+sources = ["src/hello.zig"]
+zigflags = ["-O", "ReleaseFast"]
+
+# Pick a different C++ compiler per variant. `compiler = "clang"` →
+# nixpkgs `clangStdenv`; the default is gcc on Linux.
+[targets.hello.variants.clang]
+compiler = "clang"
+cxxflags = ["-O2"]
+
+# `custom` is the escape hatch for non-trivial workflows the first-class
+# kinds don't cover. Here it stitches together previously-built targets
+# into a release tarball — using ${dep} interpolation to reach into each
+# dep's $out, gnutar/gzip from nixpkgs, and producing a single artifact.
+[targets.release_bundle]
+kind          = "custom"
+deps.internal = ["hello", "hello_go", "hello_rust", "hello_zig"]
+deps.nixpkgs  = ["gnutar", "gzip"]
 install_script = """
-mkdir -p $out/bin
-cp hello_go $out/bin/
+mkdir -p $out
+staging=$TMPDIR/release
+mkdir -p $staging
+cp ${hello}/bin/hello              $staging/
+cp ${hello_go}/bin/hello_go        $staging/
+cp ${hello_rust}/bin/hello_rust    $staging/
+cp ${hello_zig}/bin/hello_zig      $staging/
+tar -C $TMPDIR -czf $out/release.tar.gz release
 """

@@ -898,6 +898,91 @@ class Modules(unittest.TestCase):
         self.assertIn("shared", proj.targets)
 
 
+class LanguageInference(unittest.TestCase):
+    def test_cxx_inferred_from_extensions(self):
+        body = """
+            [project]
+            name = "p"
+            [targets.app]
+            kind    = "executable"
+            sources = ["a.cpp", "b.cc"]
+        """
+        with TempProject(body) as root:
+            (root / "a.cpp").write_text("")
+            (root / "b.cc").write_text("")
+            proj = config.load(root)
+        self.assertEqual(proj.targets["app"].language, "cxx")
+
+    def test_go_inferred(self):
+        body = """
+            [project]
+            name = "p"
+            [targets.app]
+            kind    = "executable"
+            sources = ["m.go"]
+        """
+        with TempProject(body) as root:
+            (root / "m.go").write_text("")
+            proj = config.load(root)
+        self.assertEqual(proj.targets["app"].language, "go")
+
+    def test_mixed_extensions_rejected(self):
+        body = """
+            [project]
+            name = "p"
+            [targets.app]
+            kind    = "executable"
+            sources = ["a.cpp", "b.go"]
+        """
+        with TempProject(body) as root:
+            (root / "a.cpp").write_text("")
+            (root / "b.go").write_text("")
+            with self.assertRaisesRegex(ConfigError, "mixed source languages"):
+                config.load(root)
+
+    def test_explicit_language_overrides_extension(self):
+        body = """
+            [project]
+            name = "p"
+            [targets.app]
+            kind     = "executable"
+            sources  = ["a.cpp", "b.go"]
+            language = "cxx"
+        """
+        with TempProject(body) as root:
+            (root / "a.cpp").write_text("")
+            (root / "b.go").write_text("")
+            proj = config.load(root)
+        self.assertEqual(proj.targets["app"].language, "cxx")
+
+    def test_static_library_rejects_zig(self):
+        body = """
+            [project]
+            name = "p"
+            [targets.lib]
+            kind    = "static_library"
+            sources = ["m.zig"]
+        """
+        with TempProject(body) as root:
+            (root / "m.zig").write_text("")
+            with self.assertRaisesRegex(ConfigError, "does not support language 'zig'"):
+                config.load(root)
+
+    def test_unknown_language_rejected(self):
+        body = """
+            [project]
+            name = "p"
+            [targets.app]
+            kind     = "executable"
+            sources  = ["m.cpp"]
+            language = "fortran"
+        """
+        with TempProject(body) as root:
+            (root / "m.cpp").write_text("")
+            with self.assertRaisesRegex(ConfigError, "language must be one of"):
+                config.load(root)
+
+
 class SourceGlobs(unittest.TestCase):
     def test_star_glob_expands_to_sorted_files(self):
         body = """

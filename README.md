@@ -81,8 +81,9 @@ What's different:
   derivation runs against the Nix store's layered filesystem.
 - **Outputs** only appear under `output/` as symlinks into the Nix store.
 - **Parameterized targets** via variants (e.g. `debug` / `release`).
-- **Multi-language**: C++, Nim, Python, Go (via `custom`), or any
-  nixpkgs-supplied toolchain.
+- **Multi-language, first-class**: C, C++, Go, Rust, Zig, Nim, Python — pick
+  by extension or set `language = "..."` explicitly. Anything else (Cargo
+  workspaces, `cmake`, custom build pipelines) goes through `kind = "custom"`.
 
 ## Requirements
 
@@ -358,12 +359,12 @@ defines  = { NDEBUG = "1" }
 
 ## Kinds
 
-### `executable` — C/C++ program
+### `executable` — C, C++, Go, Rust, or Zig program
 
 ```toml
 [targets.hello]
 kind     = "executable"
-sources  = ["src/main.cpp"]
+sources  = ["src/main.cpp"]          # extension picks the language
 includes = ["include"]
 cxxflags = ["-std=c++17", "-Wall"]
 ldflags  = ["-lfmt"]                 # linker flags (e.g. -lNAME for nixpkgs libs)
@@ -371,13 +372,53 @@ deps.internal = ["greet"]            # static_library deps are linked in automat
 deps.nixpkgs  = ["fmt"]
 ```
 
+- **Language is inferred from source extensions**: `.c` → C, `.cpp`/`.cxx`/
+  `.cc`/`.C` → C++, `.go` → Go, `.rs` → Rust, `.zig` → Zig. Mixed sources
+  require an explicit `language = "cxx"` (etc.) to disambiguate.
+- **Compiler choice** with `compiler = "..."`:
+  - C/C++: names a stdenv variant — `"clang"` → `clangStdenv`, `"gcc13"` →
+    `gcc13Stdenv`, etc. Default is `pkgs.stdenv` (gcc on Linux, clang on macOS).
+  - Go/Rust/Zig: names a nixpkgs attr providing the toolchain — `"go_1_21"`,
+    a specific `"rustc_1_75"`, or whatever is available. Default is `go`,
+    `rustc`, `zig`.
+  - Per-variant override (`hello@gcc` vs `hello@clang`) lets one target
+    produce two binaries with different toolchains.
+- **Per-language flag fields**: `cflags` (C), `cxxflags` (C++), `goflags`
+  (Go), `rustflags` (Rust), `zigflags` (Zig). Only the field matching the
+  resolved language is used.
 - Output: `$out/bin/<name>` in the Nix store, symlinked to `output/<name>`.
-- Linking: static_library internal deps are added to the link line as
-  `${dep}/lib/lib<dep>.a`. Nixpkgs deps are added to `buildInputs` (their
-  include/lib paths appear on `NIX_CFLAGS_COMPILE` / `NIX_LDFLAGS`); add
-  `-l<name>` in `ldflags` to pick up a shared library by soname.
+- Linking (C/C++ only): `static_library` internal deps are added to the link
+  line as `${dep}/lib/lib<dep>.a`. Nixpkgs deps go on `buildInputs` (so
+  `NIX_CFLAGS_COMPILE` / `NIX_LDFLAGS` pick them up); add `-l<name>` in
+  `ldflags` to link a shared lib by soname.
 
-### `static_library` — C/C++ archive
+```toml
+# Go (toolchain auto-pulled; no need to list it in deps.nixpkgs)
+[targets.hello_go]
+kind    = "executable"
+sources = ["src/hello.go"]
+goflags = ["-trimpath"]
+
+# Rust (single source compiled with rustc; for Cargo workspaces use `custom`)
+[targets.hello_rust]
+kind      = "executable"
+sources   = ["src/hello.rs"]
+rustflags = ["-Copt-level=2"]
+
+# Zig (single source via `zig build-exe`; for `build.zig` projects use `custom`)
+[targets.hello_zig]
+kind     = "executable"
+sources  = ["src/hello.zig"]
+zigflags = ["-O", "ReleaseFast"]
+
+# Pick a different C++ compiler per variant.
+[targets.hello.variants.clang]
+compiler = "clang"
+[targets.hello.variants.gcc13]
+compiler = "gcc13"
+```
+
+### `static_library` — C, C++, or Rust archive
 
 ```toml
 [targets.greet]
@@ -389,6 +430,12 @@ cxxflags       = ["-std=c++17", "-Wall"]
 deps.nixpkgs   = ["fmt"]
 ```
 
+- Same language inference as `executable`, but limited to `c`, `cxx`, and
+  `rust` (Go/Zig static libraries are out of scope for v1 — use `custom` if
+  you need them).
+- Rust archives are built with `rustc --crate-type=staticlib`; the result is
+  `lib<name>.a` (so it links naturally into a downstream C/C++ executable
+  via `deps.internal`).
 - Output: `$out/lib/lib<name>.a` and `$out/include/<public_headers…>`.
 - Downstream targets that list this in `deps.internal` automatically get the
   include path and the archive on the link line.
@@ -481,18 +528,26 @@ outputs        = ["extracted"]       # directory; cp -r handles it
 
 ### `custom` — user-supplied build/install scripts (escape hatch)
 
+Use `custom` when the first-class kinds aren't enough — e.g. a Cargo
+workspace, a `cmake` project, a `make`-driven external build, generated
+sources, or a *post-build orchestration* like packaging multiple targets
+into a single artifact.
+
 ```toml
-[targets.hello_go]
-kind         = "custom"
-deps.nixpkgs = ["go"]
-build_script = """
-export GOCACHE=$TMPDIR/go-cache
-export GOPATH=$TMPDIR/go
-go build -o hello_go src/hello.go
-"""
+# Stitch already-built targets into a release tarball, using ${dep} to
+# reach into each dep's $out and gnutar/gzip from nixpkgs.
+[targets.release_bundle]
+kind          = "custom"
+deps.internal = ["hello", "hello_go", "hello_rust"]
+deps.nixpkgs  = ["gnutar", "gzip"]
 install_script = """
-mkdir -p $out/bin
-cp hello_go $out/bin/
+mkdir -p $out
+staging=$TMPDIR/release
+mkdir -p $staging
+cp ${hello}/bin/hello           $staging/
+cp ${hello_go}/bin/hello_go     $staging/
+cp ${hello_rust}/bin/hello_rust $staging/
+tar -C $TMPDIR -czf $out/release.tar.gz release
 """
 # native_build_inputs = ["makeWrapper"]   # optional; mapped to nativeBuildInputs
 ```
@@ -641,18 +696,37 @@ deps.internal = ["headers_zip"]
 args          = ["-d", "extracted", "${headers_zip}/headers.zip"]
 outputs       = ["extracted"]
 
-# Custom kind: unsupported language (Go) via user-supplied scripts
+# Go: language inferred from the .go extension; `go` toolchain auto-pulled.
 [targets.hello_go]
-kind         = "custom"
-deps.nixpkgs = ["go"]
-build_script = """
-export GOCACHE=$TMPDIR/go-cache
-export GOPATH=$TMPDIR/go
-go build -o hello_go src/hello.go
-"""
+kind    = "executable"
+sources = ["src/hello.go"]
+
+# Rust and Zig work the same way; rustc / zig are auto-pulled.
+[targets.hello_rust]
+kind      = "executable"
+sources   = ["src/hello.rs"]
+rustflags = ["-Copt-level=2"]
+
+[targets.hello_zig]
+kind     = "executable"
+sources  = ["src/hello.zig"]
+zigflags = ["-O", "ReleaseFast"]
+
+# `custom` for orchestration: stitch multiple already-built targets into
+# a release tarball.
+[targets.release_bundle]
+kind          = "custom"
+deps.internal = ["hello", "hello_go", "hello_rust", "hello_zig"]
+deps.nixpkgs  = ["gnutar", "gzip"]
 install_script = """
-mkdir -p $out/bin
-cp hello_go $out/bin/
+mkdir -p $out
+staging=$TMPDIR/release
+mkdir -p $staging
+cp ${hello}/bin/hello           $staging/
+cp ${hello_go}/bin/hello_go     $staging/
+cp ${hello_rust}/bin/hello_rust $staging/
+cp ${hello_zig}/bin/hello_zig   $staging/
+tar -C $TMPDIR -czf $out/release.tar.gz release
 """
 ```
 

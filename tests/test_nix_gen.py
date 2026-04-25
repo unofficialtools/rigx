@@ -535,6 +535,121 @@ class GenerateModuleTargets(unittest.TestCase):
         self.assertNotIn("${frontend.greet}/lib", out)
 
 
+class LanguageDispatch(unittest.TestCase):
+    def test_go_executable_uses_go_build_and_pulls_toolchain(self):
+        t = Target(
+            name="hello_go",
+            kind="executable",
+            language="go",
+            sources=["src/hello.go"],
+        )
+        out = nix_gen.generate(_project(targets={"hello_go": t}))
+        self.assertIn("go build", out)
+        self.assertIn("-o hello_go", out)
+        # Auto-included toolchain in nativeBuildInputs.
+        self.assertIn("nativeBuildInputs = [ pkgs.go ]", out)
+        # GOCACHE / GOPATH redirected to TMPDIR (stdenv's HOME is read-only).
+        self.assertIn("export GOCACHE=$TMPDIR/go-cache", out)
+
+    def test_rust_executable_uses_rustc(self):
+        t = Target(
+            name="hello_rust",
+            kind="executable",
+            language="rust",
+            sources=["src/hello.rs"],
+        )
+        out = nix_gen.generate(_project(targets={"hello_rust": t}))
+        self.assertIn("rustc", out)
+        self.assertIn("-o hello_rust src/hello.rs", out)
+        self.assertIn("nativeBuildInputs = [ pkgs.rustc ]", out)
+
+    def test_zig_executable_uses_zig_build_exe(self):
+        t = Target(
+            name="hello_zig",
+            kind="executable",
+            language="zig",
+            sources=["src/hello.zig"],
+        )
+        out = nix_gen.generate(_project(targets={"hello_zig": t}))
+        self.assertIn("zig build-exe", out)
+        self.assertIn("-femit-bin=hello_zig", out)
+        self.assertIn("nativeBuildInputs = [ pkgs.zig ]", out)
+
+    def test_c_executable_uses_cc_and_cflags(self):
+        t = Target(
+            name="hello_c",
+            kind="executable",
+            language="c",
+            sources=["src/main.c"],
+            cflags=["-Wall", "-O2"],
+        )
+        out = nix_gen.generate(_project(targets={"hello_c": t}))
+        self.assertIn("$CC -Wall -O2", out)
+        self.assertIn("src/main.c", out)
+        self.assertIn("-o hello_c", out)
+
+    def test_clang_compiler_picks_clang_stdenv(self):
+        t = Target(
+            name="hello",
+            kind="executable",
+            language="cxx",
+            sources=["m.cpp"],
+            compiler="clang",
+        )
+        out = nix_gen.generate(_project(targets={"hello": t}))
+        self.assertIn("pkgs.clangStdenv.mkDerivation", out)
+
+    def test_default_compiler_uses_default_stdenv(self):
+        t = Target(
+            name="hello",
+            kind="executable",
+            language="cxx",
+            sources=["m.cpp"],
+        )
+        out = nix_gen.generate(_project(targets={"hello": t}))
+        self.assertIn("pkgs.stdenv.mkDerivation", out)
+        self.assertNotIn("clangStdenv", out)
+
+    def test_compiler_variant_overrides_target_compiler(self):
+        t = Target(
+            name="hello",
+            kind="executable",
+            language="cxx",
+            sources=["m.cpp"],
+            variants={
+                "gcc":   Variant(name="gcc", compiler="gcc"),
+                "clang": Variant(name="clang", compiler="clang"),
+            },
+        )
+        out = nix_gen.generate(_project(targets={"hello": t}))
+        # Both stdenv variants present.
+        self.assertIn("pkgs.clangStdenv.mkDerivation", out)
+        # Default gcc lands on plain stdenv.
+        self.assertIn("pkgs.stdenv.mkDerivation", out)
+
+    def test_versioned_gcc_attr(self):
+        t = Target(
+            name="hello",
+            kind="executable",
+            language="cxx",
+            sources=["m.cpp"],
+            compiler="gcc13",
+        )
+        out = nix_gen.generate(_project(targets={"hello": t}))
+        self.assertIn("pkgs.gcc13Stdenv.mkDerivation", out)
+
+    def test_rust_static_library(self):
+        t = Target(
+            name="mylib",
+            kind="static_library",
+            language="rust",
+            sources=["src/lib.rs"],
+        )
+        out = nix_gen.generate(_project(targets={"mylib": t}))
+        self.assertIn("rustc --crate-type=staticlib --crate-name=mylib", out)
+        self.assertIn("-o libmylib.a src/lib.rs", out)
+
+
 class NixIdHelper(unittest.TestCase):
     def test_replaces_dot_and_hyphen(self):
         self.assertEqual(nix_gen._nix_id("frontend.app"), "frontend_app")
