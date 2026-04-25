@@ -7,12 +7,12 @@
 > notice. If you use it, please report issues, but don't rely on it
 > for production builds yet.
 
-A small build system for C, C++, Nim, and Python (and anything else you can
-script). You list your targets and their sources in `rigx.toml`, run
-`rigx build`, and get reproducible binaries — the compiler and every library
-come from a pinned snapshot, so the same command produces the same bytes on
-your laptop, your CI, and your colleague's machine. No `apt install`, no
-Docker, no version drift.
+A small build system for C, C++, Go, Rust, Zig, Nim, and Python (and
+anything else you can script). You list your targets and their sources in
+`rigx.toml`, run `rigx build`, and get reproducible binaries — the compiler
+and every library come from a pinned snapshot, so the same command produces
+the same bytes on your laptop, your CI, and your colleague's machine. No
+`apt install`, no Docker, no version drift.
 
 Under the hood rigx writes a Nix flake and lets Nix do the work. You don't
 have to know any of that — install Nix once and forget about it.
@@ -66,8 +66,12 @@ What's different:
   and gets reused next time.
 - No `.PHONY`, no `genrule` — for side-effecting tasks (publish, deploy, run
   a script) use `kind = "script"` and `rigx run <name>`.
-- Need a different language? Set `kind = "nim_executable"`, `"python_script"`,
-  or use `"custom"` with your own build/install scripts (Go, Rust, etc.).
+- Need a different language? Just drop `.go`, `.rs`, or `.zig` files into
+  `sources` — language is inferred from the extension, the toolchain comes
+  from nixpkgs, and you get the same `kind = "executable"` shape. Use
+  `kind = "nim_executable"` / `"python_script"` for those, or
+  `kind = "custom"` for project-managed builds (Cargo workspaces, `cmake`,
+  etc.).
 - `rigx.toml` is pure data — no Starlark, no Make macros. Sharing values
   across targets is `[vars]`; sharing across folders is `[modules]` or
   `[dependencies.local.*]` (see below).
@@ -151,6 +155,7 @@ rigx build                # build every target (and variant)
 rigx build hello          # build one target
 rigx build hello@release  # build a specific variant
 rigx flake                # print generated flake.nix (for debugging)
+rigx graph hello          # print a Mermaid dep graph for one target
 rigx clean                # remove output/
 rigx run publish          # execute a script-kind target (publish/deploy/etc.)
 rigx run deploy -- --dry-run prod   # forward args after `--` as $1, $2, …
@@ -327,8 +332,14 @@ Fields common to several kinds:
 | `kind`                 | string          | One of the kinds listed below. **Required.**     |
 | `sources`              | list[string]    | Source files (paths or globs, relative to root). |
 | `includes`             | list[string]    | Header / include search paths.                   |
-| `cxxflags`             | list[string]    | Compiler flags (C/C++).                          |
-| `ldflags`              | list[string]    | Linker flags (C/C++).                            |
+| `language`             | string          | Override extension-based inference: `c`, `cxx`, `go`, `rust`, `zig`. |
+| `compiler`             | string          | Toolchain selector: stdenv variant (c/cxx) or nixpkgs attr (go/rust/zig). |
+| `cflags`               | list[string]    | Compiler flags (C).                              |
+| `cxxflags`             | list[string]    | Compiler flags (C++).                            |
+| `goflags`              | list[string]    | Flags forwarded to `go build` (Go).              |
+| `rustflags`            | list[string]    | Flags forwarded to `rustc` (Rust).               |
+| `zigflags`             | list[string]    | Flags forwarded to `zig build-exe` (Zig).        |
+| `ldflags`              | list[string]    | Linker flags (C/C++ only).                       |
 | `defines`              | table           | Preprocessor defines: `{ DEBUG = "1" }`.         |
 | `deps.internal`        | list[string]    | Other targets in this `rigx.toml`.               |
 | `deps.nixpkgs`         | list[string]    | Nixpkgs attrs (e.g. `fmt`, `uv`, `go`).          |
@@ -347,10 +358,21 @@ defines  = { DEBUG = "1" }
 [targets.hello.variants.release]
 cxxflags = ["-O2"]
 defines  = { NDEBUG = "1" }
+
+# Toolchain-swap variants: `rigx build hello@gcc` and `rigx build hello@clang`
+# produce two binaries from the same sources but different compilers.
+[targets.hello.variants.clang]
+compiler = "clang"
+[targets.hello.variants.gcc13]
+compiler = "gcc13"
 ```
 
-- Variant fields **append** to the target's base `cxxflags` / `ldflags` /
-  `nim_flags` and **merge over** `defines`.
+- Variant fields **append** to the target's base flag fields (`cxxflags`,
+  `cflags`, `ldflags`, `nim_flags`, `goflags`, `rustflags`, `zigflags`) and
+  **merge over** `defines`.
+- A variant's `compiler` overrides the target's `compiler` (and so picks a
+  different stdenv variant for c/cxx, or a different toolchain attr for
+  go/rust/zig).
 - Variants produce independent Nix derivations (`hello-debug`, `hello-release`).
 - `rigx build hello` builds all variants; the unqualified attribute
   aliases the alphabetically-first variant.
@@ -608,6 +630,69 @@ keys, …) are read from your shell environment — set them before invoking
 
 ---
 
+## Inspecting the build graph
+
+`rigx graph <target>` prints a [Mermaid](https://mermaid.js.org/) `graph TD`
+for the dep tree rooted at the named target. GitHub renders Mermaid code
+blocks inline, so the simplest way to use it is:
+
+```
+rigx graph release_bundle > graph.md
+# or paste into any Mermaid-aware viewer (GitHub PR, Obsidian, mermaid.live, …)
+```
+
+Running it on the `release_bundle` target from `example-project/` yields:
+
+```mermaid
+graph TD
+    release_bundle["release_bundle [custom]"]
+    hello["hello [executable]"]
+    greet["greet [static_library]"]
+    pkg_fmt(["pkgs.fmt"])
+    hello_go["hello_go [executable]"]
+    hello_rust["hello_rust [executable]"]
+    hello_zig["hello_zig [executable]"]
+    pkg_gnutar(["pkgs.gnutar"])
+    pkg_gzip(["pkgs.gzip"])
+    release_bundle --> hello
+    hello --> greet
+    greet --> pkg_fmt
+    hello --> pkg_fmt
+    release_bundle --> hello_go
+    release_bundle --> hello_rust
+    release_bundle --> hello_zig
+    release_bundle --> pkg_gnutar
+    release_bundle --> pkg_gzip
+    classDef internal fill:#e1f5fe,stroke:#01579b
+    classDef nixpkgs fill:#f3e5f5,stroke:#4a148c
+    classDef git fill:#fff3e0,stroke:#e65100
+    classDef cross_flake fill:#e0f7fa,stroke:#006064,stroke-dasharray:4 2
+    class release_bundle,hello,greet,hello_go,hello_rust,hello_zig internal
+    class pkg_fmt,pkg_gnutar,pkg_gzip nixpkgs
+```
+
+Visual key:
+
+- **Rectangles** — internal targets in this flake (your own and any
+  `[modules]`-merged ones).
+- **Stadium shapes (rounded ends)** — leaf dependencies: `pkgs.<name>`
+  (nixpkgs), `git:<name>` (git flake inputs), or `<localdep>.<target>`
+  (`[dependencies.local.*]`, dashed cyan border).
+- **Edges** — `A --> B` means *A depends on B* (B is built first).
+
+Notes:
+
+- `target@variant` works as input but the variant suffix is stripped — rigx
+  variants vary *flags*, not deps, so the graph is identical across
+  variants.
+- A-style cross-flake refs render as opaque leaves. To see *their* graph,
+  `cd` into the sibling project and run `rigx graph` there — that flake
+  has the metadata.
+- The `run` field on a `kind = "run"` target is treated as an implicit
+  dep edge to the named target.
+
+---
+
 ## Complete example (matches `example-project/rigx.toml`)
 
 ```toml
@@ -759,5 +844,4 @@ BSD 2-Clause License. See [`LICENSE.md`](LICENSE.md) for the full text.
 ## Credits
 
 Created by Massimo Di Pierro &lt;massimo.dipierro@gmail.com&gt; in collaboration
-with Claude and ChatGPT (the author's own accounts), in his own free time, for
-the greater good.
+with Claude (author's own account), in his own free time, with his own resources, for the greater good.

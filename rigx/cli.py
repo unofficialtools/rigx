@@ -6,7 +6,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from rigx import builder, config, nix_gen
+from rigx import builder, config, graph, nix_gen
 
 
 def _find_project_root(start: Path) -> Path:
@@ -100,6 +100,17 @@ def cmd_flake(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_graph(args: argparse.Namespace) -> int:
+    """Print a Mermaid `graph TD` for the dep tree of the given target."""
+    project = _load(args)
+    try:
+        sys.stdout.write(graph.mermaid(project, args.target))
+    except ValueError as e:
+        print(f"rigx: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     """Execute a script-kind target (e.g. publish, deploy)."""
     project = _load(args)
@@ -146,6 +157,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("flake", help="print the generated flake.nix")
     sp.set_defaults(func=cmd_flake)
+
+    sp = sub.add_parser(
+        "graph",
+        help="print a Mermaid dependency graph for a target",
+    )
+    sp.add_argument("target", help="target name (with optional @variant; ignored)")
+    sp.set_defaults(func=cmd_graph)
 
     sp = sub.add_parser(
         "run",
