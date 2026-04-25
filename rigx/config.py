@@ -147,10 +147,21 @@ class Target:
     install_script: str | None = None               # for kind = "custom"
     native_build_inputs: list[str] = field(default_factory=list)  # nixpkgs attrs
     script: str | None = None                       # for kind = "script"
-    # `kind = "test"` only: when true, this test never runs in parallel
-    # with any other test (even under `rigx test -j N`). Use it for tests
-    # that touch shared state — a port, a temp dir, a daemon — that would
-    # interfere with concurrent runs.
+    # `kind = "test"` only. By default, tests run as Nix derivations —
+    # sandboxed (no host filesystem, no network), automatically cached on
+    # input hash, safely parallel under `rigx test -j N`. Set
+    # `sandbox = false` to run host-side instead (`nix shell` + `bash -c
+    # <script>` in cwd = project root, no caching, parallelism only safe
+    # if the test's body is). Other kinds are always sandboxed
+    # (`executable`/`static_library`/`shared_library`/`run`/`custom`/
+    # `python_script`) or always host-side (`script`); the field is
+    # ignored on them.
+    sandbox: bool = True
+    # `kind = "test"` with `sandbox = false` only: when true, this test
+    # never runs in parallel with any other test (even under
+    # `rigx test -j N`). Use it for tests that touch shared host state —
+    # a port, a temp dir, a daemon — that would interfere with concurrent
+    # runs. Sandboxed tests don't need this; the sandbox provides isolation.
     exclusive: bool = False
     variants: dict[str, Variant] = field(default_factory=dict)
     # Module namespace (`[modules]` form). Empty for parent-owned targets.
@@ -514,6 +525,7 @@ def _build_target(
             tconf.get("native_build_inputs", []), vars_table, f"{tctx}.native_build_inputs"
         ),
         script=tconf.get("script"),
+        sandbox=bool(tconf.get("sandbox", True)),
         exclusive=bool(tconf.get("exclusive", False)),
         variants=variants,
         namespace=namespace,

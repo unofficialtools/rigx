@@ -882,12 +882,42 @@ def _mk_custom_derivation(target: Target, project: Project) -> str:
     return "\n".join(lines)
 
 
+def _mk_test_derivation(target: Target, project: Project) -> str:
+    """Sandboxed test (`kind = "test"`): the user's `script` becomes the
+    derivation's buildPhase, success means the build succeeds. We
+    synthesize a minimal `$out` so Nix doesn't complain about a missing
+    output. Caching is automatic — unchanged inputs → cached pass."""
+    build_inputs = _build_inputs(target, project)
+    body = _rewrite_interp((target.script or "").strip("\n"), project)
+    lines = [
+        "pkgs.stdenv.mkDerivation {",
+        f"  pname = {_nix_str(target.qualified_name)};",
+        f"  version = {_nix_str(project.version)};",
+        "  inherit src;",
+        f"  buildInputs = {_nix_list(build_inputs)};",
+        "  dontConfigure = true;",
+        "  buildPhase = ''",
+        "    runHook preBuild",
+        _indent(body, 4),
+        "    runHook postBuild",
+        "  '';",
+        "  installPhase = ''",
+        "    mkdir -p $out",
+        "    touch $out/passed",
+        "  '';",
+        "}",
+    ]
+    return "\n".join(lines)
+
+
 def _mk_derivation(
     target: Target, variant: Variant | None, project: Project
 ) -> str:
     if target.kind == "python_script":
         # variants on python_script are ignored for now (no compile step to differ).
         return _mk_python_derivation(target, project)
+    if target.kind == "test":
+        return _mk_test_derivation(target, project)
     if target.kind == "custom":
         return _mk_custom_derivation(target, project)
 
@@ -998,7 +1028,11 @@ def _flake_attrs(project: Project) -> list[str]:
     (`frontend_greet`) because dots aren't legal Nix identifier characters."""
     out: list[str] = []
     for tname, target in project.targets.items():
-        if target.kind in ("script", "test"):
+        # Skip host-side targets — they don't become Nix derivations.
+        # `script` is always host. `test` is only a derivation when sandboxed.
+        if target.kind == "script":
+            continue
+        if target.kind == "test" and not target.sandbox:
             continue
         attr_base = _nix_id(tname)
         if not target.variants:
@@ -1089,7 +1123,11 @@ def generate(project: Project) -> str:
     for tname, target in project.targets.items():
         # `script` and `test` targets are host-side tasks; they don't become
         # Nix derivations (they run via `rigx run` / `rigx test`).
-        if target.kind in ("script", "test"):
+        # Skip host-side targets — they don't become Nix derivations.
+        # `script` is always host. `test` is only a derivation when sandboxed.
+        if target.kind == "script":
+            continue
+        if target.kind == "test" and not target.sandbox:
             continue
         block = _target_block(target, project)
         w(_indent(block, 10))

@@ -286,38 +286,104 @@ def run_tests(
     project: Project, filters: list[str] | None = None, jobs: int | None = None,
 ) -> list[tuple[str, int]]:
     """Discover and execute every `kind = "test"` target. Returns
-    [(qualified_name, exit_code), …] (order: exclusives in declaration
-    order, then parallel tests in completion order).
+    [(qualified_name, exit_code), …].
 
-    Each entry in `filters` is treated as an fnmatch pattern (literal names
-    work because fnmatch is exact-match for non-wildcard patterns). A test
-    is selected if it matches *any* filter. `None`/empty filters → all.
+    A test's `sandbox` field decides how it runs:
+      - `sandbox = true` (default): the test is its own Nix derivation.
+        `nix build` it; success = build succeeds. Sandbox isolation, no
+        host filesystem, no network, **automatic input-hash caching**.
+      - `sandbox = false`: host-side via `nix shell` + `bash -c <script>`,
+        cwd = project root. No caching; parallelism only safe if the test
+        body is. Mark such tests with `exclusive = true` if they touch
+        shared state.
 
-    `jobs` controls outer parallelism. Default (None or ≤ 1) is fully
-    sequential — each test streams its output live in declaration order.
-    With `jobs > 1`, rigx runs in two phases:
-      1. Tests with `exclusive = true` run one at a time, streaming.
-      2. Remaining tests run in a `ThreadPoolExecutor` of size `jobs`,
-         output captured per-test and printed as a block on completion
-         so failures don't get sliced through with another test's stdout.
+    `filters` are fnmatch patterns; a target runs if it matches any.
 
-    Tests run on the host (not in Nix's sandbox), so authors are responsible
-    for isolation when opting into parallelism — `exclusive = true` is the
-    escape hatch for tests that touch shared state."""
-    selected: list[tuple[str, object]] = []
+    `jobs` controls outer parallelism. Default (None or ≤ 1) is sequential.
+    With `jobs > 1`:
+      - **Sandboxed tests** run in a `ThreadPoolExecutor` of size `jobs`.
+      - **Host tests** run in two phases: `exclusive = true` ones first
+        sequentially (streaming), then non-exclusives in a pool of size
+        `jobs` (output captured).
+
+    The pools never overlap (sandboxed first, then host)."""
+    host_tests: list[tuple[str, object]] = []
+    sandboxed: list[tuple[str, object]] = []
     for name, target in project.targets.items():
         if target.kind != "test":
             continue
         if filters and not any(fnmatch.fnmatchcase(name, f) for f in filters):
             continue
-        selected.append((name, target))
+        if target.sandbox:
+            sandboxed.append((name, target))
+        else:
+            host_tests.append((name, target))
 
-    if not selected:
+    if not host_tests and not sandboxed:
         return []
-    if not jobs or jobs <= 1 or len(selected) == 1:
-        return _run_tests_sequential(project, selected)
 
-    return _run_tests_parallel(project, selected, jobs)
+    results: list[tuple[str, int]] = []
+    if sandboxed:
+        results.extend(_run_sandboxed_tests(project, sandboxed, jobs))
+    if host_tests:
+        if not jobs or jobs <= 1 or len(host_tests) == 1:
+            results.extend(_run_tests_sequential(project, host_tests))
+        else:
+            results.extend(_run_tests_parallel(project, host_tests, jobs))
+    return results
+
+
+def _run_sandboxed_tests(
+    project: Project, tests: list[tuple[str, object]], jobs: int | None,
+) -> list[tuple[str, int]]:
+    """Run sandboxed `kind = "test"` targets via `nix build`. Each test
+    is its own derivation; building it succeeds iff its `script` exited 0.
+
+    With `jobs > 1`, dispatches via a `ThreadPoolExecutor` so independent
+    derivations build in parallel. Within each `nix build` call, Nix may
+    further fan out internally (controlled by the user's `nix.conf`
+    `max-jobs`). For sequential mode (jobs ≤ 1), each test streams output
+    live."""
+    write_flake(project)
+    nix = _nix_bin()
+
+    def run_one(name: str) -> tuple[int, str]:
+        cmd = [
+            nix, *NIX_EXPERIMENTAL, "build", _flake_ref(project, name),
+            "--no-link",
+        ]
+        # Capture only when running in parallel — sequential mode streams
+        # for live progress.
+        if jobs and jobs > 1:
+            r = subprocess.run(
+                cmd, check=False,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            )
+            return r.returncode, r.stdout or ""
+        r = subprocess.run(cmd, check=False)
+        return r.returncode, ""
+
+    results: list[tuple[str, int]] = []
+    if not jobs or jobs <= 1 or len(tests) == 1:
+        for name, _ in tests:
+            print(f"[rigx test] {name} (sandboxed)")
+            rc, _ = run_one(name)
+            results.append((name, rc))
+        return results
+
+    import concurrent.futures
+    print(
+        f"[rigx test] {len(tests)} sandboxed test(s) in parallel "
+        f"(jobs={jobs}; output captured per-test)"
+    )
+    with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as ex:
+        futures = {ex.submit(run_one, n): n for n, _ in tests}
+        for fut in concurrent.futures.as_completed(futures):
+            name = futures[fut]
+            rc, output = fut.result()
+            _print_test_block(f"{name} (sandboxed)", rc, output)
+            results.append((name, rc))
+    return results
 
 
 def _run_tests_sequential(
@@ -429,7 +495,7 @@ def _expand_build_spec(project: Project, spec: str) -> list[str]:
         attrs: list[str] = []
         for name in names:
             target = project.targets[name]
-            if target.kind in ("script", "test"):
+            if target.kind in ("script", "test", "check"):
                 continue
             attr_base = _nix_id(name) if "." in name else name
             if not target.variants:

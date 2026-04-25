@@ -100,9 +100,11 @@ What's different:
 - **Sharable vars** (`[vars]` + `extends`) keep flag/source/dep lists
   DRY across targets and across files.
 - **Built-in workflow tools**: `rigx watch` (rebuild on change),
-  `rigx test` (discover-and-run `kind = "test"` targets), `rigx new`
+  `rigx test` (discovers every `kind = "test"` target — sandboxed +
+  cached by default, opt-out with `sandbox = false`), `rigx new`
   (scaffold a target + stub source), `rigx fmt` (canonical TOML),
-  `rigx graph` (Mermaid dep graph), `rigx build --json` (CI-friendly output).
+  `rigx graph` (Mermaid dep graph), `rigx build --json` (CI-friendly
+  output).
 
 ## Requirements
 
@@ -536,22 +538,28 @@ cxxflags       = ["-std=c++17", "-Wall"]
 - macOS produces `.so` for cross-platform parity. If you need `.dylib`
   conventions specifically, `kind = "custom"` is the right escape hatch.
 
-### `test` — host-side check, discovered by `rigx test`
+### `test` — sandboxed (default) or host-side test, discovered by `rigx test`
 
 ```toml
-[targets.unit_tests]
-kind         = "test"
-deps.nixpkgs = ["bash"]
-script       = """
-./output/myapp/bin/myapp --self-test
+# Default: sandbox = true. Runs as its own Nix derivation, fully
+# hermetic, and the result is cached on input hash — unchanged inputs
+# means an instant pass without re-running the script.
+[targets.fmt_check]
+kind          = "test"
+deps.internal = ["my_app"]
+script        = """
+${my_app}/bin/my_app --self-test
+diff -u expected.txt <(${my_app}/bin/my_app --print)
 """
 
-# A test that touches shared state (a fixed port, a temp dir, a daemon)
-# and must not run alongside any other test.
+# Opt out of the sandbox when a test needs the host: invoke an
+# `output/`-symlinked binary, talk to a real database, fight for a
+# port, etc. No caching; you own concurrency safety.
 [targets.integ_db]
 kind         = "test"
-exclusive    = true
-deps.nixpkgs = ["bash", "postgresql"]
+sandbox      = false
+exclusive    = true                       # see below
+deps.nixpkgs = ["postgresql"]
 script       = """
 pg_ctl -D $TMPDIR/db start
 trap 'pg_ctl -D $TMPDIR/db stop' EXIT
@@ -559,16 +567,30 @@ trap 'pg_ctl -D $TMPDIR/db stop' EXIT
 """
 ```
 
-- Same shape as `script` (host-side, runs in `nix shell` with
-  `deps.nixpkgs` on PATH, `bash -eo pipefail`).
-- Discovered by `rigx test`, which runs each, exit-0=pass, prints a
-  summary, and returns the worst exit code.
-- Excluded from `rigx build`. Naming a test target there errors with a
-  pointer to `rigx test`.
-- `exclusive = true` blocks parallelism — under `rigx test -j N`, an
-  exclusive test always runs alone (in a sequential phase before the
-  pool spins up). Tests default to `exclusive = false` (eligible for
-  parallel scheduling).
+- **`sandbox = true` (default)**: the test becomes a Nix derivation.
+  Same isolation guarantees as every other build kind — clean rootfs,
+  fresh `$HOME`/`$TMPDIR`, no host filesystem, no network. Success means
+  the build succeeds; rigx synthesizes a minimal `$out` for Nix.
+  **Automatic caching**: rigx never re-runs an unchanged sandboxed test.
+- **`sandbox = false`**: the test runs host-side via
+  `nix shell …#deps --command bash -c <script>` with `cwd = project root`.
+  No caching; whatever's in your shell environment is in scope.
+  `exclusive = true` blocks parallelism for tests that touch shared host
+  state (a fixed port, a temp dir, a daemon) — under `rigx test -j N`,
+  exclusive tests always run alone in a serial phase before the pool
+  spins up. Sandboxed tests don't need `exclusive`; the sandbox provides
+  isolation.
+- **Both flavors:** `rigx test` discovers them all; reach into dep
+  `$out`s via `${dep_name}` interpolation; same `deps.internal` /
+  `deps.nixpkgs` / `deps.git` semantics.
+- Excluded from `rigx build` default. `rigx build <test>` errors with
+  a pointer to `rigx test`.
+
+**Quick guide.** Default to `sandbox = true` — it's safer (hermetic),
+faster (cached), and parallel-safe out of the box. Reach for
+`sandbox = false` when the test must reach into `./output/`, hit a real
+external service, or otherwise step outside Nix's reproducibility
+guarantees.
 
 ### `python_script` — Python entry-point + uv-managed venv
 
@@ -904,34 +926,35 @@ rigx watch hello@arm64  # specific variant
 
 ### `rigx test [-j N] [target …]` — discover-and-run tests
 
-`kind = "test"` targets are flagged as testable host-side tasks; they're
-*excluded* from `rigx build`. `rigx test` finds them all, runs each
-through `nix shell` (with `deps.nixpkgs` on PATH), and reports a
-PASS/FAIL summary. Exit code is the worst test's exit code so CI can
-gate on it.
+Discovers every `kind = "test"` target — both sandboxed (default) and
+host-side (`sandbox = false`). Tests are *excluded* from `rigx build`;
+this is the canonical entry point. Reports a PASS/FAIL summary; exit
+code is the worst test's exit code so CI can gate on it.
 
-Filters accept both literal names and **fnmatch globs** (`*`, `?`, `[…]`):
-a target runs if it matches *any* filter. No filter = `*` = all.
+Filters accept literal names and **fnmatch globs** (`*`, `?`, `[…]`): a
+target runs if it matches *any* filter. No filter = `*` = all.
 
 ```
-rigx test                # run all kind=test targets, sequentially
+rigx test                # run all test targets, sequentially
 rigx test smoke          # literal name
 rigx test 'unit_*'       # all tests starting with `unit_`
 rigx test smoke 'integ_*' # mix literal + glob
 rigx test '*'            # explicit "all" (same as no args)
-rigx test -j 4           # up to 4 tests concurrently
+rigx test -j 4           # up to 4 concurrently (per phase, see below)
 ```
 
-**Parallelism.** Default is sequential — each test streams output live
-in declaration order. With `-j N`, rigx runs tests in two phases:
-1. Tests with `exclusive = true` run **one at a time**, streaming output.
-2. Remaining tests run in a thread pool of size `N`. Their output is
-   captured per-test and printed as a block on completion, so a failure
-   block isn't sliced through with another test's stdout.
+**Phases under `-j N`:**
 
-Tests run on the **host** (not in Nix's sandbox), so the author owns
-isolation. If a test touches shared state (a fixed port, a temp dir, a
-daemon), set `exclusive = true` on it.
+1. **Sandboxed tests** (`sandbox = true`, default) run first, in a thread
+   pool of size N. Each invokes `nix build` against the test's derivation;
+   sandbox isolation makes parallelism always safe. Output captured.
+2. **Host tests with `exclusive = true`** run sequentially, streaming.
+3. **Other host tests** (`sandbox = false`, not exclusive) run in a
+   thread pool of size N. Output captured per-test and printed on
+   completion.
+
+Sequential mode (no `-j` or `-j 1`) streams every target's output live
+in declaration order — sandboxed first, then host.
 
 Quote globs in your shell so the shell doesn't expand them against
 filesystem paths first.

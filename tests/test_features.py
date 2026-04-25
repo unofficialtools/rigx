@@ -182,8 +182,8 @@ class TestKind(unittest.TestCase):
             git_deps={}, root=Path("/tmp"),
             targets={
                 "exe": Target(name="exe", kind="executable", sources=["m.cpp"]),
-                "t1":  Target(name="t1", kind="test", script="exit 0"),
-                "t2":  Target(name="t2", kind="test", script="exit 1"),
+                "t1":  Target(name="t1", kind="test", script="exit 0", sandbox=False),
+                "t2":  Target(name="t2", kind="test", script="exit 1", sandbox=False),
             },
         )
         with mock.patch("rigx.builder.run_script_target") as run:
@@ -197,8 +197,8 @@ class TestKind(unittest.TestCase):
             name="p", version="0.1.0", nixpkgs_ref="nixos-24.11",
             git_deps={}, root=Path("/tmp"),
             targets={
-                "t1": Target(name="t1", kind="test", script="exit 0"),
-                "t2": Target(name="t2", kind="test", script="exit 0"),
+                "t1": Target(name="t1", kind="test", script="exit 0", sandbox=False),
+                "t2": Target(name="t2", kind="test", script="exit 0", sandbox=False),
             },
         )
         with mock.patch("rigx.builder.run_script_target", return_value=0):

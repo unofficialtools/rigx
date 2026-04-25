@@ -408,9 +408,9 @@ class TestGlob(unittest.TestCase):
             name="p", version="0.1.0", nixpkgs_ref="nixos-24.11",
             git_deps={}, root=Path("/tmp"),
             targets={
-                "unit_a":  Target(name="unit_a",  kind="test", script="exit 0"),
-                "unit_b":  Target(name="unit_b",  kind="test", script="exit 0"),
-                "integ":   Target(name="integ",   kind="test", script="exit 0"),
+                "unit_a":  Target(name="unit_a", kind="test", script="exit 0", sandbox=False),
+                "unit_b":  Target(name="unit_b", kind="test", script="exit 0", sandbox=False),
+                "integ":   Target(name="integ",  kind="test", script="exit 0", sandbox=False),
             },
         )
 
@@ -526,11 +526,13 @@ class RunTestsParallel(unittest.TestCase):
     per-test."""
 
     def _proj_with(self, *test_specs: tuple[str, bool]) -> Project:
+        # Host-side tests: `sandbox=False` so the parallel/sequential
+        # ThreadPoolExecutor + `run_script_target` path is exercised.
         targets = {}
         for name, exclusive in test_specs:
             targets[name] = Target(
                 name=name, kind="test", script=f"echo {name}",
-                exclusive=exclusive,
+                sandbox=False, exclusive=exclusive,
             )
         return Project(
             name="p", version="0.1.0", nixpkgs_ref="nixos-24.11",
@@ -592,6 +594,92 @@ class RunTestsParallel(unittest.TestCase):
         # the contents irrespective of ordering.
         codes = dict(results)
         self.assertEqual(codes, {"p1": 0, "p2": 1})
+
+
+class SandboxedTests(unittest.TestCase):
+    """`kind = "test"` defaults to `sandbox = true` — runs as its own Nix
+    derivation via `nix build`, automatically cached. `sandbox = false`
+    flips it to host-side execution."""
+
+    def _proj(self, **targets) -> Project:
+        return Project(
+            name="p", version="0.1.0", nixpkgs_ref="nixos-24.11",
+            git_deps={}, root=Path("/tmp/proj"), targets=targets,
+        )
+
+    def test_sandboxed_test_excluded_from_all_attrs(self):
+        proj = self._proj(
+            built=Target(name="built", kind="executable", sources=["m.cpp"]),
+            verify=Target(name="verify", kind="test", script="exit 0"),
+        )
+        attrs = builder._all_attrs(proj)
+        self.assertIn("built", attrs)
+        self.assertNotIn("verify", attrs)
+
+    def test_build_rejects_test_with_pointer_to_rigx_test(self):
+        proj = self._proj(
+            verify=Target(name="verify", kind="test", script="exit 0"),
+        )
+        with self.assertRaisesRegex(BuildError, "use `rigx test verify`"):
+            builder._expand_build_spec(proj, "verify")
+
+    def test_sandboxed_dispatches_via_nix_build(self):
+        proj = self._proj(
+            verify=Target(name="verify", kind="test", script="exit 0"),
+        )
+        with mock.patch("rigx.builder.write_flake"), \
+             mock.patch("rigx.builder._nix_bin", return_value="/usr/bin/nix"), \
+             mock.patch("rigx.builder.subprocess.run") as run:
+            run.return_value = mock.Mock(returncode=0)
+            results = builder.run_tests(proj)
+        self.assertEqual(results, [("verify", 0)])
+        cmd = run.call_args.args[0]
+        self.assertIn("build", cmd)
+        self.assertTrue(any(c.endswith("#verify") for c in cmd))
+        self.assertIn("--no-link", cmd)
+
+    def test_sandbox_false_dispatches_via_nix_shell(self):
+        # When sandbox=false, the host-side path is used — `run_script_target`
+        # is invoked, NOT `nix build`.
+        proj = self._proj(
+            host_t=Target(
+                name="host_t", kind="test", script="exit 0", sandbox=False,
+            ),
+        )
+        with mock.patch("rigx.builder.run_script_target", return_value=0) as r, \
+             mock.patch("rigx.builder.subprocess.run") as nix_run:
+            results = builder.run_tests(proj)
+        r.assert_called_once()
+        nix_run.assert_not_called()
+        self.assertEqual(results, [("host_t", 0)])
+
+    def test_mixed_sandboxed_and_host(self):
+        proj = self._proj(
+            sand=Target(name="sand", kind="test", script="exit 0"),  # default sandbox=True
+            host=Target(name="host", kind="test", script="exit 0", sandbox=False),
+        )
+        with mock.patch("rigx.builder.write_flake"), \
+             mock.patch("rigx.builder._nix_bin", return_value="/usr/bin/nix"), \
+             mock.patch(
+                 "rigx.builder.subprocess.run",
+                 return_value=mock.Mock(returncode=0),
+             ), \
+             mock.patch("rigx.builder.run_script_target", return_value=0):
+            results = dict(builder.run_tests(proj))
+        self.assertEqual(results, {"sand": 0, "host": 0})
+
+    def test_sandboxed_failure_propagates(self):
+        proj = self._proj(
+            verify=Target(name="verify", kind="test", script="exit 1"),
+        )
+        with mock.patch("rigx.builder.write_flake"), \
+             mock.patch("rigx.builder._nix_bin", return_value="/usr/bin/nix"), \
+             mock.patch(
+                 "rigx.builder.subprocess.run",
+                 return_value=mock.Mock(returncode=1),
+             ):
+            results = builder.run_tests(proj)
+        self.assertEqual(results, [("verify", 1)])
 
 
 class HintCommitGenerated(unittest.TestCase):
