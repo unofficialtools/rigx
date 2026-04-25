@@ -147,12 +147,15 @@ def _all_attrs(project: Project) -> list[str]:
     return attrs
 
 
-def run_script_target(project: Project, target) -> int:
+def run_script_target(
+    project: Project, target, extra_args: list[str] | None = None
+) -> int:
     """Execute a `kind = "script"` target via `nix shell` on the host.
 
     Tools listed in `deps.nixpkgs` are brought onto PATH from the project's
     pinned nixpkgs. Runs in the project root; no sandbox. The target's script
-    is passed to `bash -eo pipefail`.
+    is passed to `bash -eo pipefail`. `extra_args` (typed after `--` on the
+    command line) are forwarded as `$1`, `$2`, … inside the script.
     """
     assert target.script is not None
     nix = _nix_bin()
@@ -171,12 +174,16 @@ def run_script_target(project: Project, target) -> int:
         "pipefail",
         "-c",
         target.script,
+        target.name,
+        *(extra_args or []),
     ]
     result = subprocess.run(cmd, cwd=project.root, check=False)
     return result.returncode
 
 
-def run_named_script(project: Project, name: str) -> None:
+def run_named_script(
+    project: Project, name: str, extra_args: list[str] | None = None
+) -> None:
     """CLI helper: look up a script target by name and execute it."""
     if name not in project.targets:
         raise BuildError(f"no such target: {name}")
@@ -187,7 +194,7 @@ def run_named_script(project: Project, name: str) -> None:
             f"use `rigx build {name}` instead"
         )
     print(f"[rigx] running {name}")
-    rc = run_script_target(project, target)
+    rc = run_script_target(project, target, extra_args)
     if rc != 0:
         raise BuildError(f"script target {name!r} failed (exit {rc})")
 

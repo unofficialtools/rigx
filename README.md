@@ -89,6 +89,7 @@ rigx build hello@release  # build a specific variant
 rigx flake                # print generated flake.nix (for debugging)
 rigx clean                # remove output/
 rigx run publish          # execute a script-kind target (publish/deploy/etc.)
+rigx run deploy -- --dry-run prod   # forward args after `--` as $1, $2, …
 rigx uv lock              # run uv (from pinned nixpkgs) — e.g. to refresh uv.lock
 ```
 
@@ -344,9 +345,14 @@ command bash -eo pipefail -c "<script>"` in the project root.
 **Invoke with `rigx run`, not `rigx build`:**
 ```
 rigx run publish
+rigx run publish -- --dry-run prod    # extra args become $1, $2, … in the script
 ```
 Script targets produce no artifact and therefore aren't buildable. If you name
 one in `rigx build`, you'll get an error pointing at `rigx run`.
+
+Anything after `--` is forwarded to the script as positional arguments — use
+`"$@"` (or `$1`, `$2`, …) inside the `script` body to consume them. The target
+name is `$0`. Without `--`, the script runs with no extra arguments.
 
 - Intended for side-effecting tasks: publishing, deploying, pushing images,
   running end-to-end tests against real systems.

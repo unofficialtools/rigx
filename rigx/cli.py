@@ -84,7 +84,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     """Execute a script-kind target (e.g. publish, deploy)."""
     project = _load(args)
     try:
-        builder.run_named_script(project, args.target)
+        builder.run_named_script(project, args.target, args.script_args)
     except builder.BuildError as e:
         _report_build_error(e)
         return 1
@@ -129,10 +129,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser(
         "run",
-        help="execute a script-kind target (e.g. `rigx run publish`)",
+        help="execute a script-kind target (e.g. `rigx run publish [-- args…]`)",
     )
     sp.add_argument("target", help="script target name")
-    sp.set_defaults(func=cmd_run)
+    # No script_args declared here — `main()` slices argv on the first `--`
+    # so any flags after it (e.g. `rigx run pub -- --foo`) pass through verbatim.
+    sp.set_defaults(func=cmd_run, script_args=[])
 
     sp = sub.add_parser(
         "uv",
@@ -164,15 +166,41 @@ def _split_uv_passthrough(argv: list[str]) -> tuple[list[str], list[str]] | None
     return argv[: i + 1], argv[i + 1 :]
 
 
+def _split_run_passthrough(argv: list[str]) -> tuple[list[str], list[str]] | None:
+    """If `rigx run TARGET -- …` is invoked, split off the post-`--` tail.
+
+    Everything after the first `--` is forwarded to the script as `$1`, `$2`, …
+    Returns None if there's no `run` subcommand or no `--` separator.
+    """
+    try:
+        i = argv.index("run")
+    except ValueError:
+        return None
+    prev = argv[i - 1] if i > 0 else ""
+    value_taking_opts = {"-C", "--project"}
+    if prev in value_taking_opts:
+        return None
+    try:
+        j = argv.index("--", i + 1)
+    except ValueError:
+        return None
+    return argv[:j], argv[j + 1 :]
+
+
 def main(argv: list[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
 
-    split = _split_uv_passthrough(raw)
-    if split is not None:
-        pre, uv_args = split
+    uv_split = _split_uv_passthrough(raw)
+    run_split = _split_run_passthrough(raw)
+    if uv_split is not None:
+        pre, uv_args = uv_split
         args = parser.parse_args(pre)
         args.uv_args = uv_args
+    elif run_split is not None:
+        pre, script_args = run_split
+        args = parser.parse_args(pre)
+        args.script_args = script_args
     else:
         args = parser.parse_args(raw)
 

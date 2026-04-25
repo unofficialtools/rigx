@@ -115,6 +115,34 @@ class RunNamedScript(unittest.TestCase):
         with self.assertRaisesRegex(BuildError, "is not a script target"):
             builder.run_named_script(proj, "hello")
 
+    def test_extra_args_forwarded_to_bash_as_positional(self):
+        proj = _project_with(
+            deploy=Target(name="deploy", kind="script", script='echo "$@"'),
+        )
+        with mock.patch("rigx.builder._nix_bin", return_value="/usr/bin/nix"), \
+             mock.patch("rigx.builder.subprocess.run") as run:
+            run.return_value = mock.Mock(returncode=0)
+            builder.run_named_script(proj, "deploy", ["--dry-run", "prod"])
+        cmd = run.call_args.args[0]
+        # `bash -eo pipefail -c <script> $0 $1 $2 ...`
+        self.assertIn("bash", cmd)
+        i = cmd.index("-c")
+        # Script body sits at -c's value; target name is $0; user args follow.
+        self.assertEqual(cmd[i + 1 : i + 5], ['echo "$@"', "deploy", "--dry-run", "prod"])
+
+    def test_no_extra_args_means_no_positional_after_target_name(self):
+        proj = _project_with(
+            deploy=Target(name="deploy", kind="script", script="true"),
+        )
+        with mock.patch("rigx.builder._nix_bin", return_value="/usr/bin/nix"), \
+             mock.patch("rigx.builder.subprocess.run") as run:
+            run.return_value = mock.Mock(returncode=0)
+            builder.run_named_script(proj, "deploy")
+        cmd = run.call_args.args[0]
+        i = cmd.index("-c")
+        self.assertEqual(cmd[i + 1 : i + 3], ["true", "deploy"])
+        self.assertEqual(len(cmd), i + 3)
+
 
 class BuildRejectsScript(unittest.TestCase):
     def test_build_points_at_rigx_run(self):
