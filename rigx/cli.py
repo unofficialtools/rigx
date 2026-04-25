@@ -510,6 +510,9 @@ def main(argv: list[str] | None = None) -> int:
     except config.ConfigError as e:
         print(f"rigx: {e}", file=sys.stderr)
         return 1
+    except KeyboardInterrupt:
+        print("\n[rigx] interrupted", file=sys.stderr)
+        return 130
 
 
 if __name__ == "__main__":

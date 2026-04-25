@@ -1,6 +1,8 @@
 """Tests for argv-splitting in the rigx CLI."""
 
+import io
 import unittest
+from unittest import mock
 
 from rigx import cli
 
@@ -74,6 +76,18 @@ class SplitPkgPassthrough(unittest.TestCase):
         self.assertIsNone(
             cli._split_pkg_passthrough(["-C", "pkg", "build"])
         )
+
+
+class MainKeyboardInterrupt(unittest.TestCase):
+    def test_keyboard_interrupt_returns_130(self):
+        # `rigx version` is dispatch-only with no I/O; raise KeyboardInterrupt
+        # from cmd_version to simulate a SIGINT bubbling up from any command.
+        stderr = io.StringIO()
+        with mock.patch.object(cli, "cmd_version", side_effect=KeyboardInterrupt), \
+             mock.patch("sys.stderr", stderr):
+            rc = cli.main(["version"])
+        self.assertEqual(rc, 130)
+        self.assertIn("interrupted", stderr.getvalue())
 
 
 if __name__ == "__main__":
