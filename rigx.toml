@@ -16,6 +16,24 @@ script       = """
 python3 -m unittest discover tests
 """
 
+# End-to-end smoke-test: build every target in example-project/ via the
+# in-tree rigx. Catches regressions the unit tests can't — real flake
+# generation, real `nix build` invocations, parallel dispatch, isolated
+# per-target failure reporting.
+#
+# - sandbox = false: shells out to the host's `nix` daemon, which a Nix
+#   sandbox can't reach.
+# - exclusive = true: writes example-project/flake.nix and creates
+#   example-project/output/ symlinks; we don't want it racing other tests.
+[targets.example_project_build]
+kind         = "test"
+sandbox      = false
+exclusive    = true
+deps.nixpkgs = ["python3"]
+script       = """
+PYTHONPATH=. python3 -m rigx -C example-project build -j 4
+"""
+
 # `rigx run publish` — builds sdist + wheel with uv, then uploads to PyPI.
 #
 # Token resolution (first match wins):

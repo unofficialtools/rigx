@@ -82,9 +82,10 @@ What's different:
 - **Lock file** (`flake.lock`) pins every input revision.
 - **Sandboxed builds**: compilation never touches the local filesystem; each
   derivation runs against the Nix store's layered filesystem.
-- **Parallel by default**: `rigx build` collapses every requested attr into a
-  single `nix build` call so independent targets run concurrently. Pass
-  `-j N` to forward `--max-jobs N`.
+- **Parallel builds**: `rigx build -j N` runs up to N targets concurrently
+  (each via its own `nix build`; the Nix daemon dedupes shared deps).
+  Default is sequential — failures are reported per-target rather than
+  cancelling the whole batch.
 - **Outputs** only appear under `output/` as symlinks into the Nix store.
 - **Parameterized targets** via variants (e.g. `debug` / `release`).
 - **Multi-language, first-class**: C, C++, Go, Rust, Zig, Nim, Python — pick
@@ -175,7 +176,7 @@ rigx build                # build every target (and variant)
 rigx build hello          # build one target
 rigx build hello@release  # build a specific variant
 rigx build 'hello*'       # glob over target names (variants expanded)
-rigx build -j 8           # forward to `nix build --max-jobs 8` (parallel derivs)
+rigx build -j 8           # up to 8 targets concurrently (one nix-build each)
 rigx build --json         # machine-readable output for CI / scripts
 rigx watch [target]       # rebuild on source change (Ctrl-C to stop)
 rigx test                 # discover & run all kind=test targets, sequentially
@@ -1128,15 +1129,25 @@ tar -C $TMPDIR -czf $out/release.tar.gz release
 
 ## Running the tests
 
-From the repo root, with stdlib `unittest`:
+The repo's own `rigx.toml` declares two test targets, both discovered by
+`rigx test` from the repo root:
+
+| Target | Kind | What it covers |
+|---|---|---|
+| `unittests`            | `kind = "test"` (sandboxed, default)         | Pure-Python unit suite: TOML parser, validator, flake-text generator, builder attribute resolution. No `nix` or network access required at runtime — runs hermetically in a Nix derivation, cached on input hash. |
+| `example_project_build`| `kind = "test"`, `sandbox = false`, `exclusive = true` | End-to-end integration: shells out to `nix build` against every target in `example-project/` to catch regressions in flake generation, parallel dispatch, and per-target failure isolation that unit tests can't see. |
+
+```
+rigx test                    # both, sequential
+rigx test -j 4 unittests     # just the Python suite, parallel-ready
+rigx test 'example_*'        # just the end-to-end smoke test
+```
+
+You can also run the unit suite directly (no rigx, no nix):
 
 ```
 python3 -m unittest discover tests -v
 ```
-
-Tests are Nix-free: they exercise the TOML parser, validator, Nix-flake text
-generator, and builder attribute resolution without invoking `nix` or touching
-the network.
 
 ## Example project
 

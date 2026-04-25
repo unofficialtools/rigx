@@ -334,7 +334,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         metavar="N",
         default=None,
-        help="forward to `nix build --max-jobs N` (parallel derivations)",
+        help="run up to N targets concurrently (each via its own `nix build` "
+             "call; the Nix daemon dedupes shared deps)",
     )
     sp.set_defaults(func=cmd_build)
 

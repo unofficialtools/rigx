@@ -556,55 +556,59 @@ def build(
     output_dir.mkdir(exist_ok=True)
 
     nix = _nix_bin()
-    flake_refs = [_flake_ref(project, attr) for attr in attrs]
 
-    # Build everything in a single `nix build` call so Nix's daemon can:
-    #   - share the flake evaluation pass across attrs;
-    #   - schedule independent derivations concurrently up to `--max-jobs`
-    #     (forwarded from rigx's `--jobs N` flag).
-    # We use `--no-link` + `--print-out-paths` and create our own symlinks
-    # so the per-target `output/<attr>` UX is preserved exactly. Nix's
-    # progress goes to stderr (passthrough); the captured stdout is just
-    # the newline-separated store paths.
-    cmd = [
-        nix,
-        *NIX_EXPERIMENTAL,
-        "build",
-        *flake_refs,
-        "--no-link",
-        "--print-out-paths",
-    ]
-    if jobs is not None:
-        cmd += ["--max-jobs", str(jobs)]
-
-    print(f"[rigx] building {len(attrs)} target(s): {', '.join(attrs)}")
-    result = subprocess.run(
-        cmd,
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=None,
-        text=True,
-    )
-    if result.returncode != 0:
-        raise BuildError(f"nix build failed (exit {result.returncode})")
-
-    out_paths = [line for line in result.stdout.split("\n") if line.strip()]
-    if len(out_paths) != len(attrs):
-        raise BuildError(
-            f"nix build returned {len(out_paths)} store path(s) but "
-            f"{len(attrs)} attr(s) were requested ({attrs!r}); cannot pair "
-            f"outputs to symlinks"
-        )
-
-    results: list[tuple[str, Path]] = []
-    for attr, store_path in zip(attrs, out_paths):
+    def build_one(attr: str) -> tuple[str, Path | None, int]:
         out_link = output_dir / attr
-        # Replace any existing symlink/file in-place so re-runs always point
-        # at the freshest store path.
-        if out_link.is_symlink() or out_link.exists():
-            out_link.unlink()
-        out_link.symlink_to(store_path)
-        results.append((attr, out_link))
+        cmd = [
+            nix, *NIX_EXPERIMENTAL, "build",
+            _flake_ref(project, attr),
+            "--out-link", str(out_link),
+        ]
+        # Each rigx-side worker invokes its own `nix build`; the Nix daemon
+        # serializes the underlying derivation builds across all clients so
+        # we never duplicate work. Per-attr isolation means one failure
+        # never cancels the others (the previous single-`nix build` rewrite
+        # had that all-or-nothing behavior, which surprised users).
+        result = subprocess.run(cmd, check=False)
+        return attr, (out_link if result.returncode == 0 else None), result.returncode
+
+    workers = jobs if (jobs and jobs > 1) else 1
+    if workers == 1 or len(attrs) == 1:
+        results: list[tuple[str, Path]] = []
+        failures: list[tuple[str, int]] = []
+        for attr in attrs:
+            print(f"[rigx] building {attr}")
+            a, link, rc = build_one(attr)
+            if link is not None:
+                results.append((a, link))
+            else:
+                failures.append((a, rc))
+    else:
+        import concurrent.futures
+        print(
+            f"[rigx] building {len(attrs)} target(s) with -j {workers}: "
+            f"{', '.join(attrs)}"
+        )
+        results = []
+        failures = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            for fut in concurrent.futures.as_completed(
+                {ex.submit(build_one, a): a for a in attrs}
+            ):
+                a, link, rc = fut.result()
+                if link is not None:
+                    print(f"  {a} -> {link}")
+                    results.append((a, link))
+                else:
+                    print(f"  {a}: FAILED (exit {rc})")
+                    failures.append((a, rc))
+
+    if failures:
+        names = ", ".join(f"{a} (exit {rc})" for a, rc in failures)
+        raise BuildError(
+            f"{len(failures)}/{len(attrs)} target(s) failed: {names}; "
+            f"{len(results)} succeeded"
+        )
 
     return results
 

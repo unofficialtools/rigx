@@ -53,7 +53,9 @@ kind = "python_script"
 sources = ["src/greet.py"]
 python_version = "3.12"
 python_project = "."            # dir containing pyproject.toml + uv.lock
-# python_venv_hash = "sha256-..."  # see README; first build prints the real hash
+# Pinned uv-venv FOD hash; bump whenever pyproject.toml or uv.lock changes
+# (rigx prints the new hash in the build error so you can paste it back).
+python_venv_hash = "sha256-a1eSPty02qsWzhZCEJ+XpTdSNIXsNg6vw+LsZD/kaIo="
 
 [targets.gen_greeting]
 kind = "executable"

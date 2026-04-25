@@ -437,11 +437,11 @@ class TestGlob(unittest.TestCase):
         )
 
 
-class BuildSingleNixInvocation(unittest.TestCase):
-    """`builder.build` collapses N attrs into one `nix build` call so Nix
-    can share evaluation and schedule independent derivations in parallel.
-    Per-target symlinks at `output/<attr>` are recreated by rigx after Nix
-    prints the store paths via `--print-out-paths`."""
+class BuildPerAttrIsolation(unittest.TestCase):
+    """`builder.build` invokes `nix build` once per attr so a failure in
+    one target doesn't cancel the others (the Nix daemon dedupes derivation
+    builds across concurrent client calls). With `-j N`, the calls are
+    dispatched through a `ThreadPoolExecutor` of size N."""
 
     def _proj(self) -> Project:
         return Project(
@@ -454,70 +454,54 @@ class BuildSingleNixInvocation(unittest.TestCase):
             },
         )
 
-    def _run_build(self, jobs=None, attrs=("a", "b", "c")):
+    def _run_build(self, jobs=None, attrs=("a", "b", "c"), exit_codes=None):
         proj = self._proj()
-        fake_stdout = "\n".join(f"/nix/store/fake-{a}" for a in attrs) + "\n"
-        result = mock.Mock(returncode=0, stdout=fake_stdout)
+        # subprocess.run gets called once per attr; default = all succeed.
+        codes = exit_codes or [0] * len(attrs)
+        results_iter = iter(mock.Mock(returncode=rc) for rc in codes)
         with mock.patch("rigx.builder.write_flake"), \
              mock.patch("rigx.builder._nix_bin", return_value="/usr/bin/nix"), \
-             mock.patch("rigx.builder.subprocess.run", return_value=result) as run, \
-             mock.patch("pathlib.Path.unlink"), \
-             mock.patch("pathlib.Path.symlink_to") as symlink_to, \
-             mock.patch("pathlib.Path.is_symlink", return_value=False), \
-             mock.patch("pathlib.Path.exists", return_value=False), \
+             mock.patch(
+                 "rigx.builder.subprocess.run",
+                 side_effect=lambda *a, **kw: next(results_iter),
+             ) as run, \
              mock.patch("pathlib.Path.mkdir"):
-            results = builder.build(proj, list(attrs), jobs=jobs)
-        return run, symlink_to, results
+            try:
+                built = builder.build(proj, list(attrs), jobs=jobs)
+            except BuildError as e:
+                return run, [], e
+        return run, built, None
 
-    def test_one_invocation_with_all_refs(self):
-        run, _, _ = self._run_build()
-        # exactly one subprocess.run call, regardless of attr count
-        self.assertEqual(run.call_count, 1)
-        cmd = run.call_args.args[0]
-        # all three attrs appear as flake refs in the same command
-        self.assertEqual(
-            sum(1 for tok in cmd if tok.endswith("#a")
-                or tok.endswith("#b") or tok.endswith("#c")),
-            3,
-        )
-        self.assertIn("--no-link", cmd)
-        self.assertIn("--print-out-paths", cmd)
-        # No --max-jobs unless `jobs` is set.
-        self.assertNotIn("--max-jobs", cmd)
+    def test_one_invocation_per_attr(self):
+        run, built, err = self._run_build()
+        self.assertIsNone(err)
+        self.assertEqual(run.call_count, 3)
+        self.assertEqual(sorted(a for a, _ in built), ["a", "b", "c"])
+        # Each call carries exactly one flake ref.
+        for call in run.call_args_list:
+            cmd = call.args[0]
+            refs = [t for t in cmd if t.startswith("path:")]
+            self.assertEqual(len(refs), 1)
 
-    def test_jobs_flag_forwards_max_jobs(self):
-        run, _, _ = self._run_build(jobs=8)
-        cmd = run.call_args.args[0]
-        i = cmd.index("--max-jobs")
-        self.assertEqual(cmd[i + 1], "8")
+    def test_partial_failure_does_not_cancel_others(self):
+        # Middle attr fails; the others should still build, and the
+        # BuildError summarizes only the failures.
+        run, _, err = self._run_build(exit_codes=[0, 1, 0])
+        self.assertEqual(run.call_count, 3)
+        self.assertIsNotNone(err)
+        msg = str(err)
+        self.assertIn("1/3 target(s) failed", msg)
+        self.assertIn("b (exit 1)", msg)
+        self.assertIn("2 succeeded", msg)
 
-    def test_symlinks_created_per_attr(self):
-        _, symlink_to, results = self._run_build()
-        # One `symlink_to` per attr, pointing at the matching store path.
-        self.assertEqual(symlink_to.call_count, 3)
-        attrs = [a for a, _ in results]
-        self.assertEqual(attrs, ["a", "b", "c"])
-
-    def test_path_count_mismatch_raises(self):
-        proj = self._proj()
-        # Nix returned only 2 paths but we asked for 3 — error out clearly.
-        result = mock.Mock(returncode=0, stdout="/nix/store/x\n/nix/store/y\n")
-        with mock.patch("rigx.builder.write_flake"), \
-             mock.patch("rigx.builder._nix_bin", return_value="/usr/bin/nix"), \
-             mock.patch("rigx.builder.subprocess.run", return_value=result), \
-             mock.patch("pathlib.Path.mkdir"):
-            with self.assertRaisesRegex(BuildError, "store path"):
-                builder.build(proj, ["a", "b", "c"])
-
-    def test_failed_nix_build_raises(self):
-        proj = self._proj()
-        result = mock.Mock(returncode=1, stdout="")
-        with mock.patch("rigx.builder.write_flake"), \
-             mock.patch("rigx.builder._nix_bin", return_value="/usr/bin/nix"), \
-             mock.patch("rigx.builder.subprocess.run", return_value=result), \
-             mock.patch("pathlib.Path.mkdir"):
-            with self.assertRaisesRegex(BuildError, "exit 1"):
-                builder.build(proj, ["a"])
+    def test_jobs_dispatches_via_thread_pool(self):
+        # With -j > 1, the same number of calls are made (one per attr);
+        # we just dispatch via ThreadPoolExecutor. The end-to-end behavior
+        # (per-attr `nix build`, isolated failures) is identical.
+        run, built, err = self._run_build(jobs=4)
+        self.assertIsNone(err)
+        self.assertEqual(run.call_count, 3)
+        self.assertEqual(sorted(a for a, _ in built), ["a", "b", "c"])
 
 
 class RunTestsParallel(unittest.TestCase):

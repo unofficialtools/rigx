@@ -609,11 +609,15 @@ def _build_phase_nim_executable(
     shim = ""
     if triple:
         zig_target = _cross_info(triple).get("zig_triple", triple)
+        # Use `#!/bin/sh` not `/usr/bin/env bash`: the strict Nix build
+        # sandbox provides `/bin/sh` (bash) but no `/usr/bin/env`, so an
+        # env-shebang would fail with `not found` when nim execs the shim.
         # Avoid heredocs here — `_indent` would break their terminator. Two
-        # plain echos write the shim with no escaping pitfalls.
+        # plain echos write the shim with no escaping pitfalls. The body
+        # is POSIX-shell-compatible, so `/bin/sh` is sufficient.
         shim = (
             "mkdir -p $TMPDIR/bin\n"
-            "echo '#!/usr/bin/env bash' > $TMPDIR/bin/zigcc\n"
+            "echo '#!/bin/sh' > $TMPDIR/bin/zigcc\n"
             f"echo 'exec zig cc -target {zig_target} \"$@\"' >> $TMPDIR/bin/zigcc\n"
             "chmod +x $TMPDIR/bin/zigcc\n"
         )

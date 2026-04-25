@@ -717,7 +717,9 @@ class CrossCompilation(unittest.TestCase):
         # Toolchain auto-pulls both nim and zig.
         self.assertIn("nativeBuildInputs = [ pkgs.nim pkgs.zig ]", out)
         # Shim is emitted (echo-based to survive nix_gen's indenter).
-        self.assertIn("echo '#!/usr/bin/env bash' > $TMPDIR/bin/zigcc", out)
+        # Shim uses `/bin/sh` shebang because Nix's strict build sandbox
+        # has no `/usr/bin/env`.
+        self.assertIn("echo '#!/bin/sh' > $TMPDIR/bin/zigcc", out)
         # Nim is told to use the shim as its C compiler.
         self.assertIn("--clang.exe:$TMPDIR/bin/zigcc", out)
         self.assertIn("--cpu:arm64", out)
