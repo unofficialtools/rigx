@@ -30,11 +30,17 @@ defines = { DEBUG = "1" }
 cxxflags = ["-O2"]
 defines = { NDEBUG = "1" }
 
+# Toolchain-swap variant: `rigx build hello@clang` reuses the same sources
+# but routes the build through nixpkgs `clangStdenv` instead of the default.
+[targets.hello.variants.clang]
+compiler = "clang"
+cxxflags = ["-O2"]
+
+# Nim: language inferred from `.nim` extension; nim toolchain auto-pulled.
 [targets.hello_nim]
-kind = "nim_executable"
+kind = "executable"
 sources = ["src/hello.nim"]
 nim_flags = ["-d:release", "--opt:speed"]
-deps.nixpkgs = ["nim"]
 
 [targets.hello_nim.variants.debug]
 nim_flags = ["-d:debug", "--debugger:native"]
@@ -94,12 +100,6 @@ rustflags = ["-Copt-level=2"]
 kind    = "executable"
 sources = ["src/hello.zig"]
 zigflags = ["-O", "ReleaseFast"]
-
-# Pick a different C++ compiler per variant. `compiler = "clang"` →
-# nixpkgs `clangStdenv`; the default is gcc on Linux.
-[targets.hello.variants.clang]
-compiler = "clang"
-cxxflags = ["-O2"]
 
 # ─── Cross-compilation to ARM64 Linux, via `zig cc` ────────────────────────
 # Zig ships with clang + a portable libc layer, so `zig cc -target …` is a

@@ -94,8 +94,8 @@ class EffectiveFlags(unittest.TestCase):
         self.assertNotIn("-DA=1", flags)
 
     def test_effective_nim_flags(self):
-        t = Target(name="t", kind="nim_executable", nim_flags=["-d:release"],
-                   defines={"X": "1"})
+        t = Target(name="t", kind="executable", language="nim",
+                   nim_flags=["-d:release"], defines={"X": "1"})
         v = Variant(name="debug", nim_flags=["-d:debug"])
         out = nix_gen._effective_nim_flags(t, v)
         self.assertIn("-d:release", out)

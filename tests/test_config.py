@@ -111,19 +111,22 @@ class LoadTargetKinds(unittest.TestCase):
         self.assertEqual(proj.targets["app"].defines, {"X": "1"})
 
     def test_nim_executable(self):
+        # Nim is now just a `language` for `kind = "executable"` (inferred
+        # from the `.nim` extension); nim_executable is no longer a kind.
         body = """
             [project]
             name = "p"
 
             [targets.t]
-            kind = "nim_executable"
+            kind = "executable"
             sources = ["main.nim"]
             nim_flags = ["-d:release"]
-            deps.nixpkgs = ["nim"]
         """
         with TempProject(body) as root:
+            (root / "main.nim").write_text("")
             proj = config.load(root)
-        self.assertEqual(proj.targets["t"].kind, "nim_executable")
+        self.assertEqual(proj.targets["t"].kind, "executable")
+        self.assertEqual(proj.targets["t"].language, "nim")
         self.assertEqual(proj.targets["t"].nim_flags, ["-d:release"])
 
     def test_python_script_defaults(self):

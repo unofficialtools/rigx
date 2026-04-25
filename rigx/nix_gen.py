@@ -146,7 +146,12 @@ def _toolchain_pkgs(target: Target, variant: Variant | None) -> list[str]:
 
 # Mirrors `config.DEFAULT_COMPILER` but kept here so nix_gen doesn't have to
 # import it. If the table grows or moves, sync both sides.
-DEFAULT_COMPILER_FOR_LANG = {"go": "go", "rust": "rustc", "zig": "zig"}
+DEFAULT_COMPILER_FOR_LANG = {
+    "go":   "go",
+    "rust": "rustc",
+    "zig":  "zig",
+    "nim":  "nim",
+}
 
 
 def _is_cross_flake_ref(d: str, project: Project) -> bool:
@@ -414,7 +419,7 @@ def _build_phase_nim_executable(
     target: Target, variant: Variant | None, project: Project
 ) -> str:
     if not target.sources:
-        raise ValueError(f"nim_executable {target.name!r} needs at least one source")
+        raise ValueError(f"nim executable {target.name!r} needs at least one source")
     entry = target.sources[0]
     flags = _effective_nim_flags(target, variant)
 
@@ -430,15 +435,6 @@ def _build_phase_nim_executable(
         "export HOME=$TMPDIR\n"
         f"{cmd}\n"
         "runHook postBuild\n"
-    )
-
-
-def _install_phase_nim_executable(target: Target) -> str:
-    return (
-        "runHook preInstall\n"
-        "mkdir -p $out/bin\n"
-        f"cp {target.name} $out/bin/\n"
-        "runHook postInstall\n"
     )
 
 
@@ -696,6 +692,9 @@ def _mk_derivation(
         elif language == "zig":
             build_phase = _build_phase_zig_executable(target, variant, project)
             extra_native = _toolchain_pkgs(target, variant)
+        elif language == "nim":
+            build_phase = _build_phase_nim_executable(target, variant, project)
+            extra_native = _toolchain_pkgs(target, variant)
         else:
             raise ValueError(
                 f"executable {target.name!r}: unsupported language "
@@ -716,9 +715,6 @@ def _mk_derivation(
                 f"{target.language!r}"
             )
         install_phase = _install_phase_static_library(target)
-    elif target.kind == "nim_executable":
-        build_phase = _build_phase_nim_executable(target, variant, project)
-        install_phase = _install_phase_nim_executable(target)
     elif target.kind == "run":
         build_phase = _build_phase_run(target, project)
         install_phase = _install_phase_run(target)

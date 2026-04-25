@@ -22,6 +22,7 @@ EXT_TO_LANG = {
     ".go":  "go",
     ".rs":  "rust",
     ".zig": "zig",
+    ".nim": "nim",
 }
 
 # Which `kind` accepts which `language`. `executable` works for everything;
@@ -29,7 +30,7 @@ EXT_TO_LANG = {
 # (`.a` / rlib). Go and Zig static libraries exist but the conventions are
 # noisier — out of scope for v1.
 KIND_LANGUAGES = {
-    "executable":     {"c", "cxx", "go", "rust", "zig"},
+    "executable":     {"c", "cxx", "go", "rust", "zig", "nim"},
     "static_library": {"c", "cxx", "rust"},
 }
 
@@ -40,13 +41,13 @@ DEFAULT_COMPILER = {
     "go":   "go",
     "rust": "rustc",
     "zig":  "zig",
+    "nim":  "nim",
 }
 
 VALID_KINDS = {
     "executable",
     "static_library",
     "shared_library",
-    "nim_executable",
     "python_script",
     "run",
     "custom",
@@ -263,9 +264,9 @@ def _infer_language(
     (forces an explicit override) and empty source lists (`executable`/
     `static_library` always need at least one source)."""
     if explicit:
-        if explicit not in {"c", "cxx", "go", "rust", "zig"}:
+        if explicit not in {"c", "cxx", "go", "rust", "zig", "nim"}:
             raise ConfigError(
-                f"{ctx}: language must be one of c, cxx, go, rust, zig "
+                f"{ctx}: language must be one of c, cxx, go, rust, zig, nim "
                 f"(got {explicit!r})"
             )
         return explicit
@@ -649,7 +650,7 @@ def _load(root: Path, _visited: set[Path]) -> Project:
             # Otherwise, treat `run` as a bare command name resolved via PATH
             # (supplied by deps.nixpkgs / deps.git).
             if target.run in targets:
-                runnable_kinds = {"executable", "nim_executable"}
+                runnable_kinds = {"executable"}
                 if targets[target.run].kind not in runnable_kinds:
                     raise ConfigError(
                         f"target {tname}: run target '{target.run}' must be one of "

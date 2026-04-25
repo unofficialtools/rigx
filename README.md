@@ -66,12 +66,11 @@ What's different:
   and gets reused next time.
 - No `.PHONY`, no `genrule` — for side-effecting tasks (publish, deploy, run
   a script) use `kind = "script"` and `rigx run <name>`.
-- Need a different language? Just drop `.go`, `.rs`, or `.zig` files into
-  `sources` — language is inferred from the extension, the toolchain comes
-  from nixpkgs, and you get the same `kind = "executable"` shape. Use
-  `kind = "nim_executable"` / `"python_script"` for those, or
-  `kind = "custom"` for project-managed builds (Cargo workspaces, `cmake`,
-  etc.).
+- Need a different language? Just drop `.go`, `.rs`, `.zig`, or `.nim`
+  files into `sources` — language is inferred from the extension, the
+  toolchain comes from nixpkgs, and you get the same `kind = "executable"`
+  shape. Use `kind = "python_script"` for Python; `kind = "custom"` for
+  project-managed builds (Cargo workspaces, `cmake`, …).
 - `rigx.toml` is pure data — no Starlark, no Make macros. Sharing values
   across targets is `[vars]`; sharing across folders is `[modules]` or
   `[dependencies.local.*]` (see below).
@@ -462,23 +461,10 @@ deps.nixpkgs   = ["fmt"]
 - Downstream targets that list this in `deps.internal` automatically get the
   include path and the archive on the link line.
 
-### `nim_executable` — Nim program
-
-```toml
-[targets.hello_nim]
-kind         = "nim_executable"
-sources      = ["src/hello.nim"]     # sources[0] is the entry point
-nim_flags    = ["-d:release", "--opt:speed"]
-defines      = { FEATURE_X = "1" }    # → -d:FEATURE_X=1
-deps.nixpkgs = ["nim"]
-
-[targets.hello_nim.variants.debug]
-nim_flags = ["-d:debug", "--debugger:native"]
-```
-
-- Output: `$out/bin/<name>`.
-- Runs `nim c <nim_flags> --nimcache:./nimcache --out:<name> <entry>`.
-- `HOME` is redirected to `$TMPDIR` because stdenv's default is read-only.
+> Nim is now just another language for `kind = "executable"` — drop a `.nim`
+> file in `sources` and the `nim` toolchain is auto-pulled from nixpkgs.
+> See `executable` above for the Nim example. The earlier `nim_executable`
+> kind has been retired.
 
 ### `python_script` — Python entry-point + uv-managed venv
 
@@ -804,12 +790,12 @@ defines  = { DEBUG = "1" }
 cxxflags = ["-O2"]
 defines  = { NDEBUG = "1" }
 
-# Nim executable with variants
+# Nim executable with variants — language inferred from `.nim`,
+# nim toolchain auto-pulled from nixpkgs.
 [targets.hello_nim]
-kind         = "nim_executable"
-sources      = ["src/hello.nim"]
-nim_flags    = ["-d:release", "--opt:speed"]
-deps.nixpkgs = ["nim"]
+kind      = "executable"
+sources   = ["src/hello.nim"]
+nim_flags = ["-d:release", "--opt:speed"]
 
 [targets.hello_nim.variants.debug]
 nim_flags = ["-d:debug", "--debugger:native"]
