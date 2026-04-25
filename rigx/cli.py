@@ -247,7 +247,9 @@ def cmd_test(args: argparse.Namespace) -> int:
     PASS/FAIL line plus a summary; exit code is the worst test exit code."""
     project = _load(args)
     try:
-        results = builder.run_tests(project, args.targets or None)
+        results = builder.run_tests(
+            project, args.targets or None, jobs=args.jobs,
+        )
     except builder.BuildError as e:
         _report_build_error(e)
         return 1
@@ -363,6 +365,15 @@ def build_parser() -> argparse.ArgumentParser:
         "targets",
         nargs="*",
         help="test target names to run (default: all kind=test targets)",
+    )
+    sp.add_argument(
+        "-j",
+        "--jobs",
+        type=int,
+        default=None,
+        metavar="N",
+        help="run up to N tests concurrently; tests with `exclusive = true` "
+             "still run alone (default: sequential)",
     )
     sp.set_defaults(func=cmd_test)
 

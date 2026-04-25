@@ -520,6 +520,80 @@ class BuildSingleNixInvocation(unittest.TestCase):
                 builder.build(proj, ["a"])
 
 
+class RunTestsParallel(unittest.TestCase):
+    """`run_tests` with `jobs > 1` runs `exclusive = true` tests sequentially
+    first, then the remaining tests in a thread pool with output captured
+    per-test."""
+
+    def _proj_with(self, *test_specs: tuple[str, bool]) -> Project:
+        targets = {}
+        for name, exclusive in test_specs:
+            targets[name] = Target(
+                name=name, kind="test", script=f"echo {name}",
+                exclusive=exclusive,
+            )
+        return Project(
+            name="p", version="0.1.0", nixpkgs_ref="nixos-24.11",
+            git_deps={}, root=Path("/tmp"), targets=targets,
+        )
+
+    def test_jobs_le_1_runs_sequential(self):
+        proj = self._proj_with(("a", False), ("b", False))
+        with mock.patch("rigx.builder.run_script_target", return_value=0) as r:
+            results = builder.run_tests(proj, jobs=1)
+        # Sequential path uses the streaming runner — no capture variant.
+        self.assertEqual(r.call_count, 2)
+        self.assertEqual([n for n, _ in results], ["a", "b"])
+
+    def test_exclusive_runs_before_parallel(self):
+        proj = self._proj_with(("ex", True), ("p1", False), ("p2", False))
+        call_order: list[str] = []
+        def stream(_p, t):
+            call_order.append(("stream", t.name))
+            return 0
+        def capture(_p, t):
+            call_order.append(("capture", t.name))
+            return 0, ""
+        with mock.patch("rigx.builder.run_script_target", side_effect=stream), \
+             mock.patch("rigx.builder._run_test_capture", side_effect=capture):
+            results = builder.run_tests(proj, jobs=4)
+        # First call must be the exclusive (streaming).
+        self.assertEqual(call_order[0], ("stream", "ex"))
+        # The remaining two are the parallel pair (captured).
+        captured_names = sorted(n for kind, n in call_order[1:] if kind == "capture")
+        self.assertEqual(captured_names, ["p1", "p2"])
+        self.assertEqual(sorted(n for n, _ in results), ["ex", "p1", "p2"])
+
+    def test_only_exclusives_use_streaming(self):
+        proj = self._proj_with(("a", True), ("b", True))
+        with mock.patch("rigx.builder.run_script_target", return_value=0) as stream, \
+             mock.patch("rigx.builder._run_test_capture") as capture:
+            builder.run_tests(proj, jobs=4)
+        self.assertEqual(stream.call_count, 2)
+        capture.assert_not_called()
+
+    def test_single_test_runs_sequential_even_with_jobs(self):
+        # No point spinning up a pool for one test.
+        proj = self._proj_with(("solo", False))
+        with mock.patch("rigx.builder.run_script_target", return_value=0) as r, \
+             mock.patch("rigx.builder._run_test_capture") as cap:
+            builder.run_tests(proj, jobs=8)
+        r.assert_called_once()
+        cap.assert_not_called()
+
+    def test_parallel_returns_all_results_with_exit_codes(self):
+        proj = self._proj_with(("p1", False), ("p2", False))
+        with mock.patch(
+            "rigx.builder._run_test_capture",
+            side_effect=[(0, "out1"), (1, "out2")],
+        ):
+            results = builder.run_tests(proj, jobs=2)
+        # Order is completion-order (mock returns deterministically); verify
+        # the contents irrespective of ordering.
+        codes = dict(results)
+        self.assertEqual(codes, {"p1": 0, "p2": 1})
+
+
 class HintCommitGenerated(unittest.TestCase):
     """The reminder is opt-in by environment: only inside a git work-tree,
     only on stderr, never staged. We mock the git probe so the test stays

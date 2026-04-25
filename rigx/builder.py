@@ -283,17 +283,27 @@ def run_named_script(
 
 
 def run_tests(
-    project: Project, filters: list[str] | None = None
+    project: Project, filters: list[str] | None = None, jobs: int | None = None,
 ) -> list[tuple[str, int]]:
     """Discover and execute every `kind = "test"` target. Returns
-    [(qualified_name, exit_code), …] in execution order.
+    [(qualified_name, exit_code), …] (order: exclusives in declaration
+    order, then parallel tests in completion order).
 
     Each entry in `filters` is treated as an fnmatch pattern (literal names
     work because fnmatch is exact-match for non-wildcard patterns). A test
     is selected if it matches *any* filter. `None`/empty filters → all.
 
-    Tests reuse the `script` execution path: each runs in a `nix shell`
-    with `deps.nixpkgs` on PATH, host-side, exit 0 = pass."""
+    `jobs` controls outer parallelism. Default (None or ≤ 1) is fully
+    sequential — each test streams its output live in declaration order.
+    With `jobs > 1`, rigx runs in two phases:
+      1. Tests with `exclusive = true` run one at a time, streaming.
+      2. Remaining tests run in a `ThreadPoolExecutor` of size `jobs`,
+         output captured per-test and printed as a block on completion
+         so failures don't get sliced through with another test's stdout.
+
+    Tests run on the host (not in Nix's sandbox), so authors are responsible
+    for isolation when opting into parallelism — `exclusive = true` is the
+    escape hatch for tests that touch shared state."""
     selected: list[tuple[str, object]] = []
     for name, target in project.targets.items():
         if target.kind != "test":
@@ -301,12 +311,90 @@ def run_tests(
         if filters and not any(fnmatch.fnmatchcase(name, f) for f in filters):
             continue
         selected.append((name, target))
+
+    if not selected:
+        return []
+    if not jobs or jobs <= 1 or len(selected) == 1:
+        return _run_tests_sequential(project, selected)
+
+    return _run_tests_parallel(project, selected, jobs)
+
+
+def _run_tests_sequential(
+    project: Project, selected: list[tuple[str, object]]
+) -> list[tuple[str, int]]:
     results: list[tuple[str, int]] = []
     for name, target in selected:
-        print(f"[rigx test] {name}")
+        marker = " (exclusive)" if getattr(target, "exclusive", False) else ""
+        print(f"[rigx test] {name}{marker}")
         rc = run_script_target(project, target)
         results.append((name, rc))
     return results
+
+
+def _run_tests_parallel(
+    project: Project, selected: list[tuple[str, object]], jobs: int,
+) -> list[tuple[str, int]]:
+    """Two phases: exclusives first (one at a time, streaming) then the
+    rest in a thread pool (output captured + printed on completion)."""
+    import concurrent.futures
+    exclusives = [(n, t) for n, t in selected if getattr(t, "exclusive", False)]
+    parallel = [(n, t) for n, t in selected if not getattr(t, "exclusive", False)]
+
+    results: list[tuple[str, int]] = []
+    for name, target in exclusives:
+        print(f"[rigx test] {name} (exclusive)")
+        rc = run_script_target(project, target)
+        results.append((name, rc))
+
+    if not parallel:
+        return results
+
+    print(
+        f"[rigx test] {len(parallel)} test(s) in parallel "
+        f"(jobs={jobs}; output captured per-test)"
+    )
+    with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as ex:
+        futures = {
+            ex.submit(_run_test_capture, project, t): n
+            for n, t in parallel
+        }
+        for fut in concurrent.futures.as_completed(futures):
+            name = futures[fut]
+            rc, output = fut.result()
+            _print_test_block(name, rc, output)
+            results.append((name, rc))
+    return results
+
+
+def _run_test_capture(project: Project, target) -> tuple[int, str]:
+    """Like `run_script_target` but captures stdout+stderr together so
+    parallel test output doesn't interleave on the parent terminal."""
+    assert target.script is not None
+    nix = _nix_bin()
+    refs = [
+        f"nixpkgs/{project.nixpkgs_ref}#{pkg}"
+        for pkg in target.deps.nixpkgs
+    ]
+    cmd = [
+        nix, *NIX_EXPERIMENTAL, "shell", *refs, "--command",
+        "bash", "-eo", "pipefail", "-c", target.script, target.name,
+    ]
+    result = subprocess.run(
+        cmd, cwd=project.root, check=False,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    return result.returncode, result.stdout or ""
+
+
+def _print_test_block(name: str, rc: int, output: str) -> None:
+    status = "PASS" if rc == 0 else f"FAIL (exit {rc})"
+    print(f"\n[rigx test] {name}  {status}")
+    if output:
+        # Two-space indent makes the boundary between rigx's framing
+        # and the test's own output unambiguous.
+        for line in output.rstrip("\n").splitlines():
+            print(f"  {line}")
 
 
 def _has_glob(s: str) -> bool:

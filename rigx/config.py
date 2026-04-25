@@ -147,6 +147,11 @@ class Target:
     install_script: str | None = None               # for kind = "custom"
     native_build_inputs: list[str] = field(default_factory=list)  # nixpkgs attrs
     script: str | None = None                       # for kind = "script"
+    # `kind = "test"` only: when true, this test never runs in parallel
+    # with any other test (even under `rigx test -j N`). Use it for tests
+    # that touch shared state — a port, a temp dir, a daemon — that would
+    # interfere with concurrent runs.
+    exclusive: bool = False
     variants: dict[str, Variant] = field(default_factory=dict)
     # Module namespace (`[modules]` form). Empty for parent-owned targets.
     # The full identity is `namespace.name` when namespace is set; this is
@@ -509,6 +514,7 @@ def _build_target(
             tconf.get("native_build_inputs", []), vars_table, f"{tctx}.native_build_inputs"
         ),
         script=tconf.get("script"),
+        exclusive=bool(tconf.get("exclusive", False)),
         variants=variants,
         namespace=namespace,
     )

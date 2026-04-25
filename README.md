@@ -175,9 +175,10 @@ rigx build 'hello*'       # glob over target names (variants expanded)
 rigx build -j 8           # forward to `nix build --max-jobs 8` (parallel derivs)
 rigx build --json         # machine-readable output for CI / scripts
 rigx watch [target]       # rebuild on source change (Ctrl-C to stop)
-rigx test                 # discover & run all kind=test targets
+rigx test                 # discover & run all kind=test targets, sequentially
 rigx test smoke perf      # run only the named tests (literal names)
 rigx test 'unit_*'        # filters are fnmatch patterns — globs work too
+rigx test -j 4            # up to 4 tests concurrently (exclusives still serial)
 rigx graph hello          # print a Mermaid dep graph for one target
 rigx flake                # print generated flake.nix (for debugging)
 rigx fmt [--write]        # canonical-format rigx.toml (comments not preserved)
@@ -544,14 +545,30 @@ deps.nixpkgs = ["bash"]
 script       = """
 ./output/myapp/bin/myapp --self-test
 """
+
+# A test that touches shared state (a fixed port, a temp dir, a daemon)
+# and must not run alongside any other test.
+[targets.integ_db]
+kind         = "test"
+exclusive    = true
+deps.nixpkgs = ["bash", "postgresql"]
+script       = """
+pg_ctl -D $TMPDIR/db start
+trap 'pg_ctl -D $TMPDIR/db stop' EXIT
+./output/myapp/bin/myapp --integration
+"""
 ```
 
 - Same shape as `script` (host-side, runs in `nix shell` with
   `deps.nixpkgs` on PATH, `bash -eo pipefail`).
-- Discovered by `rigx test` (which runs each, exit-0=pass, prints a
-  summary, returns the worst exit code).
+- Discovered by `rigx test`, which runs each, exit-0=pass, prints a
+  summary, and returns the worst exit code.
 - Excluded from `rigx build`. Naming a test target there errors with a
   pointer to `rigx test`.
+- `exclusive = true` blocks parallelism — under `rigx test -j N`, an
+  exclusive test always runs alone (in a sequential phase before the
+  pool spins up). Tests default to `exclusive = false` (eligible for
+  parallel scheduling).
 
 ### `python_script` — Python entry-point + uv-managed venv
 
@@ -885,7 +902,7 @@ rigx watch hello        # one target
 rigx watch hello@arm64  # specific variant
 ```
 
-### `rigx test [target …]` — discover-and-run tests
+### `rigx test [-j N] [target …]` — discover-and-run tests
 
 `kind = "test"` targets are flagged as testable host-side tasks; they're
 *excluded* from `rigx build`. `rigx test` finds them all, runs each
@@ -897,12 +914,24 @@ Filters accept both literal names and **fnmatch globs** (`*`, `?`, `[…]`):
 a target runs if it matches *any* filter. No filter = `*` = all.
 
 ```
-rigx test                # run all kind=test targets
+rigx test                # run all kind=test targets, sequentially
 rigx test smoke          # literal name
 rigx test 'unit_*'       # all tests starting with `unit_`
 rigx test smoke 'integ_*' # mix literal + glob
 rigx test '*'            # explicit "all" (same as no args)
+rigx test -j 4           # up to 4 tests concurrently
 ```
+
+**Parallelism.** Default is sequential — each test streams output live
+in declaration order. With `-j N`, rigx runs tests in two phases:
+1. Tests with `exclusive = true` run **one at a time**, streaming output.
+2. Remaining tests run in a thread pool of size `N`. Their output is
+   captured per-test and printed as a block on completion, so a failure
+   block isn't sliced through with another test's stdout.
+
+Tests run on the **host** (not in Nix's sandbox), so the author owns
+isolation. If a test touches shared state (a fixed port, a temp dir, a
+daemon), set `exclusive = true` on it.
 
 Quote globs in your shell so the shell doesn't expand them against
 filesystem paths first.
