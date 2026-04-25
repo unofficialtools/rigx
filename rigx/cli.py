@@ -66,19 +66,27 @@ def cmd_lock(args: argparse.Namespace) -> int:
 
 def cmd_list(args: argparse.Namespace) -> int:
     project = _load(args)
+    kf = args.kind
+    shown = 0
     for name, target in project.targets.items():
+        if kf and target.kind != kf:
+            continue
         if target.variants:
             variants = ", ".join(target.variant_names())
             print(f"  {name} [{target.kind}] variants: {variants}")
         else:
             print(f"  {name} [{target.kind}]")
+        shown += 1
     # Cross-flake (local-dep) targets, recursively flattened. Shown with the
     # dotted CLI form so the user can copy-paste into `rigx build`.
-    _list_local_deps(project, prefix="")
+    shown += _list_local_deps(project, prefix="", kind_filter=kf)
+    if kf and shown == 0:
+        print(f"  (no targets with kind={kf!r})", file=sys.stderr)
     return 0
 
 
-def _list_local_deps(project, prefix: str) -> None:
+def _list_local_deps(project, prefix: str, kind_filter: str | None = None) -> int:
+    shown = 0
     for lname, ldep in project.local_deps.items():
         sub = ldep.sub_project
         if not sub:
@@ -86,13 +94,17 @@ def _list_local_deps(project, prefix: str) -> None:
         for tname, target in sub.targets.items():
             if target.kind == "script":
                 continue
+            if kind_filter and target.kind != kind_filter:
+                continue
             qual = f"{prefix}{lname}.{tname}"
             if target.variants:
                 variants = ", ".join(target.variant_names())
                 print(f"  {qual} [{target.kind}, local-dep] variants: {variants}")
             else:
                 print(f"  {qual} [{target.kind}, local-dep]")
-        _list_local_deps(sub, prefix=f"{prefix}{lname}.")
+            shown += 1
+        shown += _list_local_deps(sub, prefix=f"{prefix}{lname}.", kind_filter=kind_filter)
+    return shown
 
 
 def cmd_clean(args: argparse.Namespace) -> int:
@@ -266,11 +278,16 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_uv(args: argparse.Namespace) -> int:
-    """Run uv via the project's pinned nixpkgs (no host uv install needed)."""
+def cmd_pkg(args: argparse.Namespace) -> int:
+    """Run any binary from the project's pinned nixpkgs.
+
+    `rigx pkg <attr> [-- args…]` invokes `nix run nixpkgs/<ref>#<attr>` with
+    the args after `--` (or directly after `<attr>`) forwarded verbatim.
+    Useful for one-off tooling — `uv lock`, `jq …`, etc. — without having
+    to declare a `kind = "script"` target."""
     project = _load(args)
     try:
-        return builder.run_nixpkgs_tool(project, "uv", args.uv_args)
+        return builder.run_nixpkgs_tool(project, args.attr, args.pkg_args)
     except builder.BuildError as e:
         _report_build_error(e)
         return 1
@@ -299,6 +316,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_lock)
 
     sp = sub.add_parser("list", help="list targets")
+    sp.add_argument(
+        "--kind",
+        choices=sorted(config.VALID_KINDS),
+        help="show only targets of this kind",
+    )
     sp.set_defaults(func=cmd_list)
 
     sp = sub.add_parser("clean", help="remove output/")
@@ -374,33 +396,39 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_run, script_args=[])
 
     sp = sub.add_parser(
-        "uv",
-        help="run uv via the project's pinned nixpkgs (e.g. `rigx uv lock`)",
+        "pkg",
+        help="run a nixpkgs binary (e.g. `rigx pkg uv -- lock`)",
     )
-    # No arguments declared here — `main()` slices argv manually so leading
-    # flags (e.g. `rigx uv --version`) pass through verbatim.
-    sp.set_defaults(func=cmd_uv)
+    sp.add_argument("attr", help="nixpkgs attr name (uv, jq, ripgrep, …)")
+    # `pkg_args` filled in by `main()` after the manual argv split so any
+    # flags after `--` (or after `<attr>`) reach the underlying tool intact.
+    sp.set_defaults(func=cmd_pkg, pkg_args=[])
 
     return p
 
 
-def _split_uv_passthrough(argv: list[str]) -> tuple[list[str], list[str]] | None:
-    """If `uv` appears as a subcommand, split argv into (pre, uv_args).
+def _split_pkg_passthrough(argv: list[str]) -> tuple[list[str], list[str]] | None:
+    """If `rigx pkg <attr> …` is invoked, split off the trailing args for
+    forwarding to the nixpkgs binary.
 
-    argparse.REMAINDER is finicky about leading flags in subparsers, so we
-    pre-slice here: everything after the first `uv` token is forwarded to uv
-    verbatim. Returns None if there's no `uv` subcommand in argv.
+    Convention: everything after `<attr>` is forwarded; an optional `--`
+    separator is consumed (so `rigx pkg uv -- lock` and `rigx pkg uv lock`
+    are equivalent). Returns None if no `pkg` subcommand or no attr follows.
     """
     try:
-        i = argv.index("uv")
+        i = argv.index("pkg")
     except ValueError:
         return None
-    # Make sure `uv` isn't the *value* of a preceding option like `-C uv`.
     prev = argv[i - 1] if i > 0 else ""
-    value_taking_opts = {"-C", "--project"}
-    if prev in value_taking_opts:
+    if prev in {"-C", "--project"}:
         return None
-    return argv[: i + 1], argv[i + 1 :]
+    if i + 1 >= len(argv):
+        return None  # `rigx pkg` with no attr — let argparse error normally.
+    pre = argv[: i + 2]              # rigx … pkg <attr>
+    forward = argv[i + 2 :]
+    if forward and forward[0] == "--":
+        forward = forward[1:]
+    return pre, forward
 
 
 def _split_run_passthrough(argv: list[str]) -> tuple[list[str], list[str]] | None:
@@ -428,12 +456,12 @@ def main(argv: list[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
 
-    uv_split = _split_uv_passthrough(raw)
+    pkg_split = _split_pkg_passthrough(raw)
     run_split = _split_run_passthrough(raw)
-    if uv_split is not None:
-        pre, uv_args = uv_split
+    if pkg_split is not None:
+        pre, pkg_args = pkg_split
         args = parser.parse_args(pre)
-        args.uv_args = uv_args
+        args.pkg_args = pkg_args
     elif run_split is not None:
         pre, script_args = run_split
         args = parser.parse_args(pre)

@@ -111,8 +111,9 @@ What's different:
 
 Python is provided by whatever channel you use to install rigx (PyPI install
 methods manage it for you; nixpkgs brings it along automatically). For
-generating Python `uv.lock` files you can run `rigx uv lock` — rigx pulls
-`uv` from the project's pinned nixpkgs, no host install needed.
+generating Python `uv.lock` files you can run `rigx pkg uv -- lock` — rigx
+pulls `uv` (or any other binary) from the project's pinned nixpkgs, no host
+install needed.
 
 ## Installation
 
@@ -162,6 +163,7 @@ From a project directory containing `rigx.toml`:
 
 ```
 rigx list                 # list targets
+rigx list --kind test     # filter by kind (executable, test, run, …)
 rigx lock                 # generate flake.nix and update flake.lock
 rigx build                # build every target (and variant)
 rigx build hello          # build one target
@@ -177,7 +179,7 @@ rigx new executable foo   # scaffold a new target + stub source files
 rigx clean                # remove output/
 rigx run publish          # execute a script-kind target (publish/deploy/etc.)
 rigx run deploy -- --dry-run prod   # forward args after `--` as $1, $2, …
-rigx uv lock              # run uv (from pinned nixpkgs) — e.g. to refresh uv.lock
+rigx pkg uv -- lock       # run any nixpkgs binary (uv, jq, ripgrep, …) from pinned nixpkgs
 ```
 
 If rigx isn't installed, invoke it as a module:
@@ -562,7 +564,7 @@ python_venv_hash = "sha256-..."      # optional; see workflow below
 
 **`python_venv_hash` workflow** (optional but recommended):
 
-1. Write `pyproject.toml` with your deps; run `rigx uv lock` (or `uv lock`
+1. Write `pyproject.toml` with your deps; run `rigx pkg uv -- lock` (or `uv lock`
    if you have uv installed locally) to produce `uv.lock`.
 2. First `rigx build <target>` fails with a hash-mismatch error:
    ```

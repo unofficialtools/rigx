@@ -38,5 +38,43 @@ class SplitRunPassthrough(unittest.TestCase):
         )
 
 
+class SplitPkgPassthrough(unittest.TestCase):
+    def test_no_pkg_subcommand(self):
+        self.assertIsNone(cli._split_pkg_passthrough(["build", "hello"]))
+
+    def test_pkg_with_no_attr_returns_none(self):
+        # `rigx pkg` alone — let argparse complain about the missing attr.
+        self.assertIsNone(cli._split_pkg_passthrough(["pkg"]))
+
+    def test_pkg_with_attr_only(self):
+        pre, args = cli._split_pkg_passthrough(["pkg", "uv"])
+        self.assertEqual(pre, ["pkg", "uv"])
+        self.assertEqual(args, [])
+
+    def test_pkg_with_args_no_dash(self):
+        pre, args = cli._split_pkg_passthrough(["pkg", "uv", "lock"])
+        self.assertEqual(pre, ["pkg", "uv"])
+        self.assertEqual(args, ["lock"])
+
+    def test_pkg_with_dash_separator(self):
+        # `--` is consumed; args after it forwarded.
+        pre, args = cli._split_pkg_passthrough(["pkg", "uv", "--", "lock", "--frozen"])
+        self.assertEqual(pre, ["pkg", "uv"])
+        self.assertEqual(args, ["lock", "--frozen"])
+
+    def test_pkg_with_leading_global_flag(self):
+        pre, args = cli._split_pkg_passthrough(
+            ["-C", "./proj", "pkg", "jq", "--", ".foo"]
+        )
+        self.assertEqual(pre, ["-C", "./proj", "pkg", "jq"])
+        self.assertEqual(args, [".foo"])
+
+    def test_pkg_as_value_of_project_flag_is_ignored(self):
+        # `-C pkg` means project dir is "pkg", not the pkg subcommand.
+        self.assertIsNone(
+            cli._split_pkg_passthrough(["-C", "pkg", "build"])
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
