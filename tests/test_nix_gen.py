@@ -103,16 +103,28 @@ class EffectiveFlags(unittest.TestCase):
         self.assertIn("-d:X=1", out)
 
 
-def _project(name="p", targets=None, git_deps=None, local_deps=None, root=None) -> Project:
+def _project(name="p", targets=None, git_deps=None, local_deps=None, root=None, description="") -> Project:
     return Project(
         name=name,
         version="0.1.0",
+        description=description,
         nixpkgs_ref="nixos-24.11",
         git_deps=git_deps or {},
         targets=targets or {},
         root=root or Path("/tmp"),
         local_deps=local_deps or {},
     )
+
+
+class FlakeDescription(unittest.TestCase):
+    def test_default_description_uses_project_name(self):
+        out = nix_gen.generate(_project(name="myproj"))
+        self.assertIn('description = "rigx build for myproj"', out)
+
+    def test_explicit_description_overrides_default(self):
+        out = nix_gen.generate(_project(description="A short summary"))
+        self.assertIn('description = "A short summary"', out)
+        self.assertNotIn('description = "rigx build for p"', out)
 
 
 class GenerateExecutable(unittest.TestCase):

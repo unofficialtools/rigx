@@ -54,7 +54,38 @@ VALID_KINDS = {
     "custom",
     "script",
     "test",
+    "capsule",
 }
+
+# Capsule backends.
+#
+#   `lite`  — `unofficialtools/nix-docker`-style FROM-scratch container
+#             image that mounts the host's `/nix/store` and Nix daemon
+#             socket at runtime; tiny image, fast iteration, host-tied.
+#             No init system: the entrypoint runs directly as the
+#             container's Cmd.
+#   `nixos` — NixOS userspace running under systemd inside a container.
+#             Same host-store mount as `lite`, but PID 1 is systemd —
+#             so `nixos_modules` services / units actually run. Needs
+#             `--privileged` (handled by the runner) so systemd can
+#             manage cgroups and tmpfs mounts. Slower than `lite`
+#             because systemd boots; faster than `qemu` because there's
+#             no kernel boot.
+#   `qemu`  — full NixOS VM booted under qemu. The user's entrypoint
+#             runs as a systemd service. v1 uses `system.build.vm`
+#             (9p-shares the host's /nix/store) rather than a baked
+#             qcow2 — fast iteration, host-store-tied. Disk-image
+#             layout is reserved for follow-on work.
+#
+# `docker` (generic OCI without the host-store mount) is reserved for
+# follow-on work.
+SUPPORTED_CAPSULE_BACKENDS = {"lite", "nixos", "qemu"}
+RESERVED_CAPSULE_BACKENDS = {"docker"}
+
+# Env-var name pattern. POSIX-ish — letters, digits, underscores; first
+# char not a digit. Capsule env keys are validated against this so a
+# typo doesn't silently produce a broken docker invocation.
+_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 @dataclass
@@ -163,6 +194,33 @@ class Target:
     # a port, a temp dir, a daemon — that would interfere with concurrent
     # runs. Sandboxed tests don't need this; the sandbox provides isolation.
     exclusive: bool = False
+    # Capsule (kind = "capsule") fields.
+    # `backend = "lite"` produces a `unofficialtools/nix-docker`-style
+    # FROM-scratch image that mounts the host's nix store + daemon
+    # socket at runtime. `qemu` is reserved for cross-arch user-mode
+    # emulation of rigx-built binaries (e.g. testing aarch64 firmware on
+    # an x86_64 host) and isn't supported in v1.
+    backend: str = ""
+    # Shell command the container runs at startup. `${target}` interpolates
+    # rigx-built deps' store paths — same convention as `kind = "run"` and
+    # `kind = "custom"`. Required for capsules.
+    entrypoint: str = ""
+    # Environment variables exposed to the entrypoint. Values may use the
+    # same `${target}` interpolation. Useful for passing peer addresses
+    # supplied by `rigx.testbed` (e.g. `PEER_FC = "${TESTBED_FC}"` so the
+    # orchestrator can rewrite endpoints between runs).
+    env: dict[str, str] = field(default_factory=dict)
+    # `hostname` defaults to the target name. `ports` lists TCP ports the
+    # container plans to listen on; the runner forwards them to the host.
+    hostname: str = ""
+    ports: list[int] = field(default_factory=list)
+    # Qemu capsules only: paths (project-relative) to user-supplied NixOS
+    # module files that get spliced into the VM's eval-config alongside
+    # the rigx-generated module. Use this to enable services
+    # (`services.openssh.enable = true`), declare extra users, mount
+    # volumes, swap kernel packages, etc. — anything you'd put in a
+    # NixOS configuration. Globs are expanded against the project root.
+    nixos_modules: list[str] = field(default_factory=list)
     variants: dict[str, Variant] = field(default_factory=dict)
     # Module namespace (`[modules]` form). Empty for parent-owned targets.
     # The full identity is `namespace.name` when namespace is set; this is
@@ -185,6 +243,7 @@ class Project:
     git_deps: dict[str, GitDep]
     targets: dict[str, Target]
     root: Path
+    description: str = ""
     local_deps: dict[str, "LocalDep"] = field(default_factory=dict)
 
     def find_target(self, qualified: str) -> tuple["Project", str] | None:
@@ -494,6 +553,36 @@ def _build_target(
     compiler = str(tconf.get("compiler", ""))
     target_triple = str(tconf.get("target", ""))
 
+    # Capsule fields. `entrypoint` is a shell string with `${name}`
+    # interpolation against the rec scope (same convention as run/custom).
+    backend = str(tconf.get("backend", ""))
+    entrypoint = str(tconf.get("entrypoint", "") or "")
+    hostname = str(tconf.get("hostname", ""))
+    env_raw = tconf.get("env", {})
+    if not isinstance(env_raw, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in env_raw.items()
+    ):
+        raise ConfigError(f"{tctx}: env must be a table of name → string values")
+    env = dict(env_raw)
+    ports_raw = tconf.get("ports", [])
+    if not isinstance(ports_raw, list) or not all(
+        isinstance(x, int) for x in ports_raw
+    ):
+        raise ConfigError(f"{tctx}: ports must be a list of integers")
+    ports = list(ports_raw)
+
+    # `nixos_modules`: project-relative paths to NixOS module files for
+    # qemu capsules. Same glob/path-prefix treatment as `sources` so
+    # `[modules]`-merged capsules see paths relative to the parent root.
+    nixos_modules = _expand_globs(
+        _expand_list(
+            tconf.get("nixos_modules", []), vars_table, f"{tctx}.nixos_modules",
+        ),
+        glob_root,
+        f"{tctx}.nixos_modules",
+        output_prefix=path_prefix,
+    )
+
     return Target(
         name=tname,
         kind=kind,
@@ -527,6 +616,12 @@ def _build_target(
         script=tconf.get("script"),
         sandbox=bool(tconf.get("sandbox", True)),
         exclusive=bool(tconf.get("exclusive", False)),
+        backend=backend,
+        entrypoint=entrypoint,
+        env=env,
+        hostname=hostname,
+        ports=ports,
+        nixos_modules=nixos_modules,
         variants=variants,
         namespace=namespace,
     )
@@ -631,6 +726,115 @@ def _merge_into(
         base[k] = v
 
 
+def _load_includes(
+    data: dict, base_dir: Path, _visited: frozenset[Path] = frozenset()
+) -> None:
+    """Process top-level `include = [...]`. Each entry is a literal path or a
+    glob (`*`, `**`, `?`, `[…]`) resolved relative to `base_dir`. For each
+    matched file, recursively process its own `include`, then merge its
+    top-level tables into `data`. Mutates `data` in place.
+
+    Semantics: an included file is inlined textually into its parent — paths
+    inside it (target sources, `[vars].extends`, etc.) resolve against the
+    *root* rigx.toml's directory, not the include file's directory. This keeps
+    the implementation simple and gives users one mental model for paths;
+    use `[modules]` when subtree-relative paths and namespacing are wanted.
+
+    Restrictions: included files may not declare `[project]` or `[nixpkgs]`
+    (those belong to the root). Duplicate target / var / dep names across the
+    parent and any include are config errors. Empty glob matches are allowed.
+    """
+    # Common TOML pitfall: writing `include = [...]` *after* `[project]`
+    # silently lands inside the project table. Surface a clear error before
+    # the user's targets disappear into the void.
+    proj_section = data.get("project")
+    if isinstance(proj_section, dict) and "include" in proj_section:
+        raise ConfigError(
+            "`include = [...]` must appear before any [section] header — "
+            "it currently parsed as `project.include` because it sits below "
+            "`[project]`. Move it to the very top of the file."
+        )
+
+    raw = data.pop("include", None)
+    if raw is None:
+        return
+    if not isinstance(raw, list) or not all(isinstance(x, str) for x in raw):
+        raise ConfigError("top-level `include` must be a list of strings (paths or globs)")
+
+    paths: list[Path] = []
+    for entry in raw:
+        if any(c in entry for c in "*?["):
+            matches = sorted(p.resolve() for p in base_dir.glob(entry) if p.is_file())
+            paths.extend(matches)
+        else:
+            p = (base_dir / entry).resolve()
+            if not p.is_file():
+                raise ConfigError(f"include: file not found: {p} (declared as {entry!r})")
+            paths.append(p)
+
+    for inc_path in paths:
+        if inc_path in _visited:
+            chain = " -> ".join(str(p) for p in [*_visited, inc_path])
+            raise ConfigError(f"include cycle: {chain}")
+        with inc_path.open("rb") as f:
+            inc_data = tomllib.load(f)
+        if "project" in inc_data:
+            raise ConfigError(
+                f"include {inc_path}: must not contain [project] "
+                f"(only the root rigx.toml owns project identity)"
+            )
+        if "nixpkgs" in inc_data:
+            raise ConfigError(
+                f"include {inc_path}: must not contain [nixpkgs] "
+                f"(only the root rigx.toml sets the nixpkgs ref)"
+            )
+        # Recurse: an included file's own `include` resolves against the
+        # included file's directory.
+        _load_includes(inc_data, inc_path.parent, _visited | {inc_path})
+        _merge_include_data(data, inc_data, str(inc_path))
+
+
+def _merge_include_data(base: dict, new: dict, source: str) -> None:
+    """Merge an included file's top-level tables into `base`. `targets`,
+    `vars`, and the two-level `dependencies.{git,local}` tables merge at the
+    leaf level — duplicate keys raise. Anything else collides at the top
+    level (we don't deep-merge unknown keys; safer to surface a clear error
+    than silently combine)."""
+    for top_key, top_val in new.items():
+        if top_key in ("targets", "vars"):
+            if not isinstance(top_val, dict):
+                raise ConfigError(f"include {source}: [{top_key}] must be a table")
+            base.setdefault(top_key, {})
+            for k, v in top_val.items():
+                if k in base[top_key]:
+                    raise ConfigError(
+                        f"include {source}: {top_key}.{k} is already defined"
+                    )
+                base[top_key][k] = v
+        elif top_key == "dependencies":
+            if not isinstance(top_val, dict):
+                raise ConfigError(f"include {source}: [dependencies] must be a table")
+            base.setdefault("dependencies", {})
+            for sub_key, sub_val in top_val.items():
+                if not isinstance(sub_val, dict):
+                    raise ConfigError(
+                        f"include {source}: [dependencies.{sub_key}] must be a table"
+                    )
+                base["dependencies"].setdefault(sub_key, {})
+                for k, v in sub_val.items():
+                    if k in base["dependencies"][sub_key]:
+                        raise ConfigError(
+                            f"include {source}: dependencies.{sub_key}.{k} is already defined"
+                        )
+                    base["dependencies"][sub_key][k] = v
+        else:
+            if top_key in base:
+                raise ConfigError(
+                    f"include {source}: top-level [{top_key}] is already defined"
+                )
+            base[top_key] = top_val
+
+
 def _load(root: Path, _visited: set[Path]) -> Project:
     if root in _visited:
         chain = " -> ".join(str(p) for p in [*_visited, root])
@@ -643,11 +847,16 @@ def _load(root: Path, _visited: set[Path]) -> Project:
     with toml_path.open("rb") as f:
         data = tomllib.load(f)
 
+    # Inline top-level `include = [...]` files before any other parsing so
+    # downstream code sees the merged dict transparently.
+    _load_includes(data, root, frozenset({toml_path.resolve()}))
+
     proj = data.get("project")
     if not proj or "name" not in proj:
         raise ConfigError("missing [project] section with 'name'")
     name = proj["name"]
     version = proj.get("version", "0.0.0")
+    description = str(proj.get("description", ""))
 
     nixpkgs = data.get("nixpkgs", {})
     nixpkgs_ref = nixpkgs.get("ref", "nixos-24.11")
@@ -764,10 +973,63 @@ def _load(root: Path, _visited: set[Path]) -> Project:
                 raise ConfigError(
                     f"target {tname}: kind='run' requires 'outputs' (files to capture)"
                 )
+        if target.kind == "capsule":
+            if not target.backend:
+                raise ConfigError(
+                    f"target {qname}: kind='capsule' requires 'backend' "
+                    f"(one of {sorted(SUPPORTED_CAPSULE_BACKENDS)})"
+                )
+            if target.backend in RESERVED_CAPSULE_BACKENDS:
+                raise ConfigError(
+                    f"target {qname}: backend={target.backend!r} is reserved "
+                    f"for follow-on work; v1 supports "
+                    f"{sorted(SUPPORTED_CAPSULE_BACKENDS)}"
+                )
+            if target.backend not in SUPPORTED_CAPSULE_BACKENDS:
+                raise ConfigError(
+                    f"target {qname}: unknown backend {target.backend!r}; "
+                    f"supported: {sorted(SUPPORTED_CAPSULE_BACKENDS)}"
+                )
+            if not target.entrypoint:
+                raise ConfigError(
+                    f"target {qname}: kind='capsule' requires "
+                    f"'entrypoint' (shell command run inside the container; "
+                    f"use ${{<dep>}} to interpolate rigx-built deps)"
+                )
+            for env_name in target.env:
+                if not _ENV_NAME_RE.match(env_name):
+                    raise ConfigError(
+                        f"target {qname}: env key {env_name!r} is not a "
+                        f"valid POSIX env-var name"
+                    )
+            # `deps.internal` is interpolated into the entrypoint via
+            # `${<short-name>}`. Collisions on the last dotted segment
+            # silently shadow — emit a friendly error.
+            seen_short: dict[str, str] = {}
+            for d in target.deps.internal:
+                short = d.rsplit(".", 1)[-1]
+                if short in seen_short and seen_short[short] != d:
+                    raise ConfigError(
+                        f"target {qname}: deps.internal entries "
+                        f"'{seen_short[short]}' and '{d}' both expose as "
+                        f"${{{short}}} — rename one or pick a different "
+                        f"short name"
+                    )
+                seen_short[short] = d
+            # `nixos_modules` needs a NixOS evaluation — valid on
+            # `qemu` (NixOS VM) and `nixos` (NixOS userspace under
+            # systemd in a container). `lite` has no NixOS to configure.
+            if target.nixos_modules and target.backend not in ("qemu", "nixos"):
+                raise ConfigError(
+                    f"target {qname}: nixos_modules is only valid for "
+                    f"backend='qemu' or backend='nixos' "
+                    f"(got backend={target.backend!r})"
+                )
 
     return Project(
         name=name,
         version=version,
+        description=description,
         nixpkgs_ref=nixpkgs_ref,
         git_deps=git_deps,
         local_deps=local_deps,

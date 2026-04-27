@@ -1,9 +1,13 @@
+# Bolierplate #####################################################################
+
 [project]
 name = "hello-example"
 version = "0.1.0"
 
 [nixpkgs]
 ref = "nixos-24.11"
+
+# Simple Examples #################################################################
 
 [targets.greet]
 kind = "static_library"
@@ -22,6 +26,8 @@ ldflags = ["-lfmt"]
 deps.internal = ["greet"]
 deps.nixpkgs = ["fmt"]
 
+# Examples of Variants ############################################################
+
 [targets.hello.variants.debug]
 cxxflags = ["-O0", "-g"]
 defines = { DEBUG = "1" }
@@ -36,26 +42,7 @@ defines = { NDEBUG = "1" }
 compiler = "clang"
 cxxflags = ["-O2"]
 
-# Nim: language inferred from `.nim` extension; nim toolchain auto-pulled.
-[targets.hello_nim]
-kind = "executable"
-sources = ["src/hello.nim"]
-nim_flags = ["-d:release", "--opt:speed"]
-
-[targets.hello_nim.variants.debug]
-nim_flags = ["-d:debug", "--debugger:native"]
-
-[targets.hello_nim.variants.release]
-nim_flags = ["-d:release", "--opt:speed"]
-
-[targets.greet_py]
-kind = "python_script"
-sources = ["src/greet.py"]
-python_version = "3.12"
-python_project = "."            # dir containing pyproject.toml + uv.lock
-# Pinned uv-venv FOD hash; bump whenever pyproject.toml or uv.lock changes
-# (rigx prints the new hash in the build error so you can paste it back).
-python_venv_hash = "sha256-a1eSPty02qsWzhZCEJ+XpTdSNIXsNg6vw+LsZD/kaIo="
+# Examples in Dependencies and Artifact Output ####################################
 
 [targets.gen_greeting]
 kind = "executable"
@@ -86,6 +73,29 @@ deps.internal = ["headers_zip"]    # declares the build-order dependency
 args = ["-d", "extracted", "${headers_zip}/headers.zip"]
 outputs = ["extracted"]            # a directory; cp -r handles it
 
+# Examples in Other Languages #####################################################
+
+# Nim: language inferred from `.nim` extension; nim toolchain auto-pulled.
+[targets.hello_nim]
+kind = "executable"
+sources = ["src/hello.nim"]
+nim_flags = ["-d:release", "--opt:speed"]
+
+[targets.hello_nim.variants.debug]
+nim_flags = ["-d:debug", "--debugger:native"]
+
+[targets.hello_nim.variants.release]
+nim_flags = ["-d:release", "--opt:speed"]
+
+[targets.greet_py]
+kind = "python_script"
+sources = ["src/greet.py"]
+python_version = "3.12"
+python_project = "."            # dir containing pyproject.toml + uv.lock
+# Pinned uv-venv FOD hash; bump whenever pyproject.toml or uv.lock changes
+# (rigx prints the new hash in the build error so you can paste it back).
+python_venv_hash = "sha256-a1eSPty02qsWzhZCEJ+XpTdSNIXsNg6vw+LsZD/kaIo="
+
 # Go: language inferred from `.go` extension; toolchain auto-pulled from nixpkgs.
 [targets.hello_go]
 kind    = "executable"
@@ -102,6 +112,8 @@ rustflags = ["-Copt-level=2"]
 kind    = "executable"
 sources = ["src/hello.zig"]
 zigflags = ["-O", "ReleaseFast"]
+
+# Example of Cross Compilation #####################################################
 
 # ─── Cross-compilation, first-class via `target = …` ────────────────────────
 # `target = "aarch64-linux"` routes c/cxx through `pkgsCross.aarch64-multi…
@@ -120,6 +132,86 @@ kind      = "executable"
 sources   = ["src/hello.nim"]
 target    = "aarch64-linux"
 nim_flags = ["-d:release"]
+
+# Example of Capsules and Testbeds #################################################
+
+# Capsule: package an existing rigx-built binary as a runnable container
+# in the unofficialtools/nix-docker shape — kilobyte-sized FROM-scratch
+# image that mounts the host's /nix/store at runtime so the binary is
+# reachable. `${hello_go}` interpolates to the rigx-built target's store
+# path. After `rigx build greeter`, drop into the image with
+# `./output/greeter/bin/shell-greeter` (needs docker/podman on PATH).
+#
+# Heavier first build than the rest of this project — nix builds the
+# scratch image and the daemon pulls dockerTools dependencies. Skip
+# from `rigx build` (no args) by listing other targets explicitly if
+# this is a problem.
+[targets.greeter]
+kind          = "capsule"
+backend       = "lite"
+deps.nixpkgs  = ["coreutils", "helix"]
+deps.internal = ["hello_go"]
+entrypoint    = "${hello_go}/bin/hello_go"
+
+# Qemu capsule running a native (host-arch) Go binary inside a NixOS VM.
+# No `target` field means the VM is built for whatever system you run
+# rigx under — works out of the box on any Linux host with KVM. Use
+# this to verify your host's qemu setup before tackling the cross-arch
+# variant below.
+[targets.hello_x86_capsule]
+kind          = "capsule"
+backend       = "qemu"
+deps.internal = ["hello_go"]
+entrypoint    = "${hello_go}/bin/hello_go Massimo && systemctl poweroff"
+hostname      = "x86cap"
+
+[targets.test_hello_x86]
+kind          = "test"
+sandbox       = false
+deps.internal = ["hello_x86_capsule"]
+deps.nixpkgs  = ["coreutils", "gnugrep"]
+script = """
+set -euo pipefail
+echo "[test_hello_x86] booting x86_64 qemu capsule (this can take a minute)"
+out=$(timeout 180 ./output/hello_x86_capsule/bin/run-hello_x86_capsule 2>&1 || true)
+echo "$out" | tail -20
+echo "$out" | grep -q "Hello, Massimo!"
+echo "[test_hello_x86] saw expected greeting"
+"""
+
+# Qemu capsule running an ARM binary inside an aarch64 NixOS VM.
+# `target = "aarch64-linux"` shifts the VM evaluation to aarch64 so the
+# same capsule declaration produces an ARM VM on an x86_64 host. The
+# rigx-built ARM binary (cross-compiled via zigcc above) is referenced
+# through `${hello_nim_arm64}` and runs natively in the VM's aarch64
+# kernel. Requires aarch64 builders or `boot.binfmt.emulatedSystems` on
+# the host to actually build; the declaration itself is portable.
+# [targets.hello_arm_capsule]
+# kind          = "capsule"
+# backend       = "qemu"
+# target        = "aarch64-linux"
+# deps.internal = ["hello_nim_arm64"]
+# entrypoint    = "${hello_nim_arm64}/bin/hello_nim Massimo && systemctl poweroff"
+# hostname      = "armcap"
+
+# Host-side test that boots the ARM capsule, captures its console output,
+# and asserts on the greeting. The entrypoint shuts the VM down once
+# hello_nim exits so the run terminates without a timeout. `sandbox =
+# false` is required — the test launches qemu, which doesn't run inside
+# Nix's build sandbox.
+# [targets.test_hello_arm]
+# kind          = "test"
+# sandbox       = false
+# deps.internal = ["hello_arm_capsule"]
+# deps.nixpkgs  = ["coreutils", "gnugrep"]
+# script = """
+# set -euo pipefail
+# echo "[test_hello_arm] booting ARM qemu capsule (this can take a minute)"
+# out=$(timeout 180 ./output/hello_arm_capsule/bin/run-hello_arm_capsule 2>&1 || true)
+# echo "$out" | tail -20
+# echo "$out" | grep -q "Hello, Massimo!"
+# echo "[test_hello_arm] saw expected greeting"
+# """
 
 # `custom` is the escape hatch for non-trivial workflows the first-class
 # kinds don't cover. Here it stitches together previously-built targets

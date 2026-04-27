@@ -326,11 +326,95 @@ def run_tests(
     if sandboxed:
         results.extend(_run_sandboxed_tests(project, sandboxed, jobs))
     if host_tests:
+        # Sandboxed tests pull their `deps.internal` in via Nix derivation
+        # edges. Host tests don't — the script runs in the project root
+        # and references `output/<dep>/...` paths, which only exist after
+        # an explicit `nix build` with `--out-link`. Build them now.
+        _ensure_host_test_deps_built(project, host_tests, jobs)
         if not jobs or jobs <= 1 or len(host_tests) == 1:
             results.extend(_run_tests_sequential(project, host_tests))
         else:
             results.extend(_run_tests_parallel(project, host_tests, jobs))
     return results
+
+
+def _ensure_host_test_deps_built(
+    project: Project, host_tests: list[tuple[str, object]], jobs: int | None,
+) -> None:
+    """Build host tests' `deps.internal` so the `output/<dep>/` symlinks
+    exist before the test scripts reference them. Test/script deps are
+    skipped — `kind = "test"` / `kind = "script"` aren't buildable
+    (`build()` would error)."""
+    seen: set[str] = set()
+    to_build: list[str] = []
+    for _, target in host_tests:
+        for dep in target.deps.internal:
+            if dep in seen:
+                continue
+            seen.add(dep)
+            resolved = project.find_target(dep)
+            if resolved is not None:
+                owner, dep_name = resolved
+                dep_target = owner.targets.get(dep_name)
+                if dep_target is not None and dep_target.kind in ("test", "script"):
+                    continue
+            to_build.append(dep)
+    if not to_build:
+        return
+    print(f"[rigx test] building host-test deps: {', '.join(to_build)}")
+    build(project, to_build, jobs=jobs)
+
+
+def _cross_arch_qemu_capsules(
+    project: Project, names: list[str],
+) -> list[tuple[str, str]]:
+    """Return [(name, target_triple)] for each entry in `names` that is a
+    `kind = "capsule"`, `backend = "qemu"` target whose `target` field
+    differs from the empty default — i.e. wants a VM whose arch is not
+    the host's. Building those needs binfmt + nix `extra-platforms` on
+    the host."""
+    out: list[tuple[str, str]] = []
+    for name in names:
+        resolved = project.find_target(name)
+        if resolved is None:
+            continue
+        owner, dep_name = resolved
+        t = owner.targets.get(dep_name)
+        if t is None:
+            continue
+        if t.kind == "capsule" and t.backend == "qemu" and t.target:
+            out.append((name, t.target))
+    return out
+
+
+def _cross_arch_hint(cross_arch: list[tuple[str, str]]) -> str:
+    """Friendly post-failure note for cross-arch qemu capsule builds.
+    Stays distro-agnostic — names the *what* (binfmt registration plus
+    `extra-platforms`) and leaves the *how* to the user's package
+    manager."""
+    listing = ", ".join(f"{n!r} (target = {t!r})" for n, t in cross_arch)
+    arches = sorted({t for _, t in cross_arch})
+    arches_line = " ".join(arches)
+    if len(cross_arch) == 1:
+        head = f"Hint: {listing} is a cross-arch qemu capsule. "
+        subj = "Building it"
+    else:
+        head = f"Hint: {listing} are cross-arch qemu capsules. "
+        subj = "Building them"
+    return (
+        "\n\n"
+        f"{head}{subj} on a different host arch needs two pieces of host "
+        "setup:\n"
+        "  1. binfmt_misc registered for the target arch — so the kernel "
+        "can run cross-arch ELF binaries through qemu's user-mode emulator. "
+        "Verify with `cat /proc/sys/fs/binfmt_misc/qemu-<arch>` (e.g. "
+        "qemu-aarch64); look for `enabled`.\n"
+        f"  2. `extra-platforms = {arches_line}` in your Nix daemon config "
+        "(typically /etc/nix/nix.conf), then restart the daemon.\n"
+        "On NixOS, `boot.binfmt.emulatedSystems = [ \"<target>\" ];` "
+        "configures both in one step. On other systems, install a "
+        "qemu-user package for your distro and add the nix.conf line."
+    )
 
 
 def _run_sandboxed_tests(
@@ -605,10 +689,18 @@ def build(
 
     if failures:
         names = ", ".join(f"{a} (exit {rc})" for a, rc in failures)
-        raise BuildError(
+        msg = (
             f"{len(failures)}/{len(attrs)} target(s) failed: {names}; "
             f"{len(results)} succeeded"
         )
+        # If any failed target is a cross-arch qemu capsule, the platform-
+        # mismatch errors from `nix build` are almost certainly because
+        # the host doesn't have binfmt + extra-platforms set up. Append a
+        # distro-agnostic note pointing the user at what to fix.
+        cross_arch = _cross_arch_qemu_capsules(project, [a for a, _ in failures])
+        if cross_arch:
+            msg += _cross_arch_hint(cross_arch)
+        raise BuildError(msg)
 
     return results
 

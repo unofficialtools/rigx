@@ -694,5 +694,128 @@ class HintCommitGenerated(unittest.TestCase):
         self.assertIn("commit when stable", out)
 
 
+class EnsureHostTestDepsBuilt(unittest.TestCase):
+    """`rigx test` on a host (sandbox=false) test must build its
+    `deps.internal` first so `output/<dep>/...` symlinks exist when
+    the test script runs. Sandboxed tests don't need this — Nix builds
+    deps as part of the test derivation."""
+
+    def _proj(self) -> Project:
+        from rigx.config import TargetDeps
+        return _project_with(**{
+            "lib": Target(name="lib", kind="executable", sources=["a.c"]),
+            "tool": Target(name="tool", kind="executable", sources=["b.c"]),
+            "helper_test": Target(
+                name="helper_test", kind="test", sandbox=True, script="echo",
+            ),
+            "host_t": Target(
+                name="host_t", kind="test", sandbox=False, script="echo",
+                deps=TargetDeps(internal=["lib", "tool", "helper_test"]),
+            ),
+        })
+
+    def test_builds_internal_deps_skipping_test_kinds(self):
+        proj = self._proj()
+        host_tests = [("host_t", proj.targets["host_t"])]
+        with mock.patch("rigx.builder.build") as build_mock:
+            builder._ensure_host_test_deps_built(proj, host_tests, jobs=None)
+        build_mock.assert_called_once()
+        called_specs = build_mock.call_args.args[1]
+        # Test-kind dep is filtered out so build() doesn't error on it;
+        # buildable deps go through.
+        self.assertCountEqual(called_specs, ["lib", "tool"])
+
+    def test_no_op_when_no_internal_deps(self):
+        from rigx.config import TargetDeps
+        proj = _project_with(**{
+            "host_t": Target(
+                name="host_t", kind="test", sandbox=False, script="echo",
+                deps=TargetDeps(internal=[]),
+            ),
+        })
+        host_tests = [("host_t", proj.targets["host_t"])]
+        with mock.patch("rigx.builder.build") as build_mock:
+            builder._ensure_host_test_deps_built(proj, host_tests, jobs=None)
+        build_mock.assert_not_called()
+
+    def test_dedups_deps_across_multiple_host_tests(self):
+        from rigx.config import TargetDeps
+        proj = _project_with(**{
+            "lib": Target(name="lib", kind="executable", sources=["a.c"]),
+            "h1": Target(
+                name="h1", kind="test", sandbox=False, script="echo",
+                deps=TargetDeps(internal=["lib"]),
+            ),
+            "h2": Target(
+                name="h2", kind="test", sandbox=False, script="echo",
+                deps=TargetDeps(internal=["lib"]),
+            ),
+        })
+        host_tests = [
+            ("h1", proj.targets["h1"]),
+            ("h2", proj.targets["h2"]),
+        ]
+        with mock.patch("rigx.builder.build") as build_mock:
+            builder._ensure_host_test_deps_built(proj, host_tests, jobs=None)
+        called_specs = build_mock.call_args.args[1]
+        self.assertEqual(called_specs, ["lib"])
+
+
+class CrossArchQemuHint(unittest.TestCase):
+    """When a build fails for a `kind = "capsule"`, `backend = "qemu"`,
+    `target = "<other>"` target, the BuildError message should include
+    a distro-agnostic hint about binfmt + extra-platforms."""
+
+    def _proj(self) -> Project:
+        return _project_with(**{
+            "arm_cap": Target(
+                name="arm_cap", kind="capsule", backend="qemu",
+                target="aarch64-linux", entrypoint="/bin/true",
+            ),
+            "x86_cap": Target(
+                name="x86_cap", kind="capsule", backend="qemu",
+                target="", entrypoint="/bin/true",
+            ),
+            "plain_exe": Target(
+                name="plain_exe", kind="executable", sources=["a.c"],
+            ),
+        })
+
+    def test_detects_cross_arch_capsule(self):
+        proj = self._proj()
+        out = builder._cross_arch_qemu_capsules(proj, ["arm_cap"])
+        self.assertEqual(out, [("arm_cap", "aarch64-linux")])
+
+    def test_skips_non_cross_arch_capsule(self):
+        proj = self._proj()
+        out = builder._cross_arch_qemu_capsules(proj, ["x86_cap"])
+        self.assertEqual(out, [])
+
+    def test_skips_non_capsule_targets(self):
+        proj = self._proj()
+        out = builder._cross_arch_qemu_capsules(proj, ["plain_exe"])
+        self.assertEqual(out, [])
+
+    def test_hint_text_is_distro_agnostic(self):
+        hint = builder._cross_arch_hint([("arm_cap", "aarch64-linux")])
+        # Names the *what* (binfmt + nix.conf), not the *how* (apt/pacman).
+        self.assertIn("binfmt_misc", hint)
+        self.assertIn("extra-platforms = aarch64-linux", hint)
+        self.assertIn("/etc/nix/nix.conf", hint)
+        self.assertIn("aarch64-linux", hint)
+        # NixOS gets a one-shot pointer; other distros are pointed at
+        # their own package manager rather than named explicitly.
+        self.assertIn("NixOS", hint)
+        for distro in ("apt", "pacman", "yum", "dnf", "brew"):
+            self.assertNotIn(distro, hint.lower())
+
+    def test_hint_lists_multiple_arches(self):
+        hint = builder._cross_arch_hint([
+            ("arm_cap", "aarch64-linux"),
+            ("riscv_cap", "riscv64-linux"),
+        ])
+        self.assertIn("extra-platforms = aarch64-linux riscv64-linux", hint)
+
+
 if __name__ == "__main__":
     unittest.main()

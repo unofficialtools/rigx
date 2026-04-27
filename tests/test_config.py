@@ -39,6 +39,21 @@ class LoadMinimal(unittest.TestCase):
         self.assertEqual(proj.targets, {})
         self.assertEqual(proj.git_deps, {})
 
+    def test_description_default_and_override(self):
+        body = """
+            [project]
+            name = "p"
+        """
+        with TempProject(body) as root:
+            self.assertEqual(config.load(root).description, "")
+        body2 = """
+            [project]
+            name = "p"
+            description = "A demo project"
+        """
+        with TempProject(body2) as root:
+            self.assertEqual(config.load(root).description, "A demo project")
+
     def test_version_and_nixpkgs_ref(self):
         body = """
             [project]
@@ -1094,6 +1109,240 @@ class SourceGlobs(unittest.TestCase):
         self.assertEqual(
             proj.targets["app"].sources, ["src/a.cpp", "src/sub/b.cpp"]
         )
+
+
+class Includes(unittest.TestCase):
+    def test_literal_include_merges_targets(self):
+        body = """
+            include = ["lib/extra.toml"]
+
+            [project]
+            name = "p"
+
+            [targets.app]
+            kind = "executable"
+            sources = ["src/main.c"]
+        """
+        with TempProject(body) as root:
+            (root / "src").mkdir()
+            (root / "src" / "main.c").write_text("")
+            (root / "src" / "helper.c").write_text("")
+            (root / "lib").mkdir()
+            (root / "lib" / "extra.toml").write_text(dedent("""
+                [targets.helper]
+                kind = "executable"
+                sources = ["src/helper.c"]
+            """).lstrip())
+            proj = config.load(root)
+        self.assertEqual(set(proj.targets), {"app", "helper"})
+        self.assertEqual(proj.targets["helper"].sources, ["src/helper.c"])
+
+    def test_glob_include_sorted_and_merged(self):
+        body = """
+            include = ["targets/*.toml"]
+
+            [project]
+            name = "p"
+        """
+        with TempProject(body) as root:
+            (root / "src").mkdir()
+            (root / "src" / "a.c").write_text("")
+            (root / "src" / "b.c").write_text("")
+            (root / "targets").mkdir()
+            (root / "targets" / "a.toml").write_text(dedent("""
+                [targets.a]
+                kind = "executable"
+                sources = ["src/a.c"]
+            """).lstrip())
+            (root / "targets" / "b.toml").write_text(dedent("""
+                [targets.b]
+                kind = "executable"
+                sources = ["src/b.c"]
+            """).lstrip())
+            proj = config.load(root)
+        self.assertEqual(set(proj.targets), {"a", "b"})
+
+    def test_empty_glob_match_is_allowed(self):
+        body = """
+            include = ["targets/*.toml"]
+
+            [project]
+            name = "p"
+
+            [targets.app]
+            kind = "executable"
+            sources = ["src/main.c"]
+        """
+        with TempProject(body) as root:
+            (root / "src").mkdir()
+            (root / "src" / "main.c").write_text("")
+            (root / "targets").mkdir()
+            proj = config.load(root)
+        self.assertEqual(set(proj.targets), {"app"})
+
+    def test_recursive_include(self):
+        body = """
+            include = ["a.toml"]
+
+            [project]
+            name = "p"
+        """
+        with TempProject(body) as root:
+            (root / "src").mkdir()
+            (root / "src" / "x.c").write_text("")
+            (root / "a.toml").write_text(dedent("""
+                include = ["nested/b.toml"]
+            """).lstrip())
+            (root / "nested").mkdir()
+            (root / "nested" / "b.toml").write_text(dedent("""
+                [targets.x]
+                kind = "executable"
+                sources = ["src/x.c"]
+            """).lstrip())
+            proj = config.load(root)
+        self.assertEqual(set(proj.targets), {"x"})
+
+    def test_duplicate_target_across_files_errors(self):
+        body = """
+            include = ["lib/extra.toml"]
+
+            [project]
+            name = "p"
+
+            [targets.app]
+            kind = "executable"
+            sources = ["src/a.c"]
+        """
+        with TempProject(body) as root:
+            (root / "src").mkdir()
+            (root / "src" / "a.c").write_text("")
+            (root / "lib").mkdir()
+            (root / "lib" / "extra.toml").write_text(dedent("""
+                [targets.app]
+                kind = "executable"
+                sources = ["src/a.c"]
+            """).lstrip())
+            with self.assertRaisesRegex(ConfigError, "targets.app is already defined"):
+                config.load(root)
+
+    def test_include_with_project_section_errors(self):
+        body = """
+            include = ["other.toml"]
+
+            [project]
+            name = "p"
+        """
+        with TempProject(body) as root:
+            (root / "other.toml").write_text(dedent("""
+                [project]
+                name = "other"
+            """).lstrip())
+            with self.assertRaisesRegex(ConfigError, r"must not contain \[project\]"):
+                config.load(root)
+
+    def test_include_with_nixpkgs_section_errors(self):
+        body = """
+            include = ["other.toml"]
+
+            [project]
+            name = "p"
+        """
+        with TempProject(body) as root:
+            (root / "other.toml").write_text(dedent("""
+                [nixpkgs]
+                ref = "nixos-unstable"
+            """).lstrip())
+            with self.assertRaisesRegex(ConfigError, r"must not contain \[nixpkgs\]"):
+                config.load(root)
+
+    def test_include_missing_file_errors(self):
+        body = """
+            include = ["does/not/exist.toml"]
+
+            [project]
+            name = "p"
+        """
+        with TempProject(body) as root:
+            with self.assertRaisesRegex(ConfigError, "include: file not found"):
+                config.load(root)
+
+    def test_include_cycle_detected(self):
+        body = """
+            include = ["a.toml"]
+
+            [project]
+            name = "p"
+        """
+        with TempProject(body) as root:
+            (root / "a.toml").write_text(dedent("""
+                include = ["b.toml"]
+            """).lstrip())
+            (root / "b.toml").write_text(dedent("""
+                include = ["a.toml"]
+            """).lstrip())
+            with self.assertRaisesRegex(ConfigError, "include cycle"):
+                config.load(root)
+
+    def test_include_must_be_list_of_strings(self):
+        body = """
+            include = "lib/extra.toml"
+
+            [project]
+            name = "p"
+        """
+        with TempProject(body) as root:
+            with self.assertRaisesRegex(ConfigError, "include.*list of strings"):
+                config.load(root)
+
+    def test_include_merges_vars_and_deps(self):
+        body = """
+            include = ["shared.toml"]
+
+            [project]
+            name = "p"
+
+            [vars]
+            local = ["src/local.c"]
+
+            [targets.app]
+            kind = "executable"
+            sources = ["$vars.local", "$vars.shared"]
+            deps = { git = ["libfmt"] }
+        """
+        with TempProject(body) as root:
+            (root / "src").mkdir()
+            (root / "src" / "local.c").write_text("")
+            (root / "src" / "shared.c").write_text("")
+            (root / "shared.toml").write_text(dedent("""
+                [vars]
+                shared = ["src/shared.c"]
+
+                [dependencies.git.libfmt]
+                url = "https://github.com/fmtlib/fmt"
+            """).lstrip())
+            proj = config.load(root)
+        self.assertIn("libfmt", proj.git_deps)
+        self.assertEqual(
+            proj.targets["app"].sources, ["src/local.c", "src/shared.c"]
+        )
+
+    def test_duplicate_var_across_files_errors(self):
+        body = """
+            include = ["other.toml"]
+
+            [project]
+            name = "p"
+
+            [vars]
+            x = ["a"]
+        """
+        with TempProject(body) as root:
+            (root / "other.toml").write_text(dedent("""
+                [vars]
+                x = ["b"]
+            """).lstrip())
+            with self.assertRaisesRegex(ConfigError, "vars.x is already defined"):
+                config.load(root)
 
 
 if __name__ == "__main__":

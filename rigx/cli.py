@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -56,7 +57,57 @@ def cmd_build(args: argparse.Namespace) -> int:
     else:
         for attr, link in results:
             print(f"  {attr} -> {link}")
+            for hint in _build_hint_lines(project, attr, link):
+                print(f"      {hint}")
     return 0
+
+
+def _attr_to_target(project: config.Project, attr: str) -> config.Target | None:
+    """Reverse-map a Nix attr (`hello`, `hello-debug`, `frontend_app`) to
+    the rigx Target it was built from. Used by `_build_hint_lines` so
+    we can render kind-specific guidance ("run with: …", "shell into:
+    …") after each successful `rigx build`."""
+    for name, target in project.targets.items():
+        sanitized = name.replace(".", "_")
+        if sanitized == attr:
+            return target
+        for vname in target.variants:
+            if f"{sanitized}-{vname}" == attr:
+                return target
+    return None
+
+
+def _build_hint_lines(
+    project: config.Project, attr: str, link: Path
+) -> list[str]:
+    """Return per-kind "what to do with this artifact" lines printed
+    underneath each `attr -> output/...` line. Kept narrow — only kinds
+    where there's a single obvious entry point (executable, capsule,
+    python_script) get hints. Static/shared libraries and `custom`
+    targets get nothing; they're consumed by linking or follow-up
+    scripts, not invoked directly."""
+    target = _attr_to_target(project, attr)
+    if target is None:
+        return []
+    # Render paths relative to cwd so the user can copy-paste — same
+    # framing as the `attr -> link` line above.
+    try:
+        rel = Path(os.path.relpath(link, Path.cwd()))
+    except ValueError:
+        rel = link
+    if target.kind == "executable":
+        return [f"run:   {rel}/bin/{target.name}"]
+    if target.kind == "python_script":
+        return [f"run:   {rel}/bin/{target.name}"]
+    if target.kind == "capsule":
+        # Capsules ship two runners — `run-<name>` boots the entrypoint,
+        # `shell-<name>` drops into bash. Surface both so users discover
+        # the debug path without reading the README.
+        return [
+            f"start: {rel}/bin/run-{target.name}",
+            f"shell: {rel}/bin/shell-{target.name}",
+        ]
+    return []
 
 
 def cmd_lock(args: argparse.Namespace) -> int:

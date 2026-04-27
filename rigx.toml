@@ -170,3 +170,18 @@ echo "  git push -u origin rigx-init-v$VERSION"
 echo "  gh pr create --fill"
 echo "==================================================================="
 """
+
+# Render the Remotion tutorial → tutorial/out/rigx-cpp-tutorial.mp4
+# Note: `npm start` (remotion studio) is intentionally omitted — it's an
+# interactive dev server that never returns, so it can't sit between
+# `npm install` and `npm run build` in a non-interactive pipeline. Run it
+# manually with: (cd tutorials/lander-remotion && npm start)
+[targets.render-rigx-cpp-tutorial]
+kind         = "script"
+deps.nixpkgs = ["nodejs", "coreutils"]
+script       = '''
+cd tutorial/
+npm install
+npm run render
+echo "Wrote $(pwd)/out/rigx-cpp-tutorial.mp4"
+'''

@@ -90,5 +90,127 @@ class MainKeyboardInterrupt(unittest.TestCase):
         self.assertIn("interrupted", stderr.getvalue())
 
 
+class BuildHints(unittest.TestCase):
+    """`rigx build` prints a per-kind hint after each successful target —
+    `run:` for executable / python_script, `start:` + `shell:` for
+    capsule, nothing for static_library / custom / run."""
+
+    def _project(self):
+        from pathlib import Path
+        from rigx.config import Project, Target, Variant, TargetDeps
+        targets = {
+            "hello": Target(name="hello", kind="executable"),
+            "lib": Target(name="lib", kind="static_library"),
+            "greeter": Target(
+                name="greeter", kind="capsule",
+                backend="lite", entrypoint="x",
+            ),
+            "tool": Target(name="tool", kind="python_script"),
+            "build_thing": Target(name="build_thing", kind="custom"),
+            "hello_var": Target(
+                name="hello_var", kind="executable",
+                variants={"debug": Variant(name="debug")},
+            ),
+        }
+        return Project(
+            name="p", version="0.0.0", nixpkgs_ref="x",
+            git_deps={}, targets=targets, root=Path("/tmp/p"),
+        )
+
+    def test_executable_emits_run_hint(self):
+        from pathlib import Path
+        proj = self._project()
+        hints = cli._build_hint_lines(proj, "hello", Path("/tmp/p/output/hello"))
+        self.assertEqual(len(hints), 1)
+        self.assertTrue(hints[0].startswith("run:"))
+        self.assertIn("/bin/hello", hints[0])
+
+    def test_capsule_emits_start_and_shell_hints(self):
+        from pathlib import Path
+        proj = self._project()
+        hints = cli._build_hint_lines(
+            proj, "greeter", Path("/tmp/p/output/greeter")
+        )
+        self.assertEqual(len(hints), 2)
+        self.assertTrue(hints[0].startswith("start:"))
+        self.assertIn("/bin/run-greeter", hints[0])
+        self.assertTrue(hints[1].startswith("shell:"))
+        self.assertIn("/bin/shell-greeter", hints[1])
+
+    def test_python_script_emits_run_hint(self):
+        from pathlib import Path
+        proj = self._project()
+        hints = cli._build_hint_lines(proj, "tool", Path("/tmp/p/output/tool"))
+        self.assertEqual(len(hints), 1)
+        self.assertIn("/bin/tool", hints[0])
+
+    def test_static_library_emits_no_hint(self):
+        # Static libraries are consumed by linking, not invocation —
+        # there's no "run this" guidance to give.
+        from pathlib import Path
+        proj = self._project()
+        hints = cli._build_hint_lines(proj, "lib", Path("/tmp/p/output/lib"))
+        self.assertEqual(hints, [])
+
+    def test_custom_emits_no_hint(self):
+        from pathlib import Path
+        proj = self._project()
+        hints = cli._build_hint_lines(
+            proj, "build_thing", Path("/tmp/p/output/build_thing")
+        )
+        self.assertEqual(hints, [])
+
+    def test_variant_attr_resolves_to_base_target(self):
+        # Variant attrs (`hello_var-debug`) reverse-map to the base
+        # target so we still know to print the executable hint.
+        # The binary inside is named after the base target, not the
+        # variant.
+        from pathlib import Path
+        proj = self._project()
+        hints = cli._build_hint_lines(
+            proj, "hello_var-debug", Path("/tmp/p/output/hello_var-debug")
+        )
+        self.assertEqual(len(hints), 1)
+        self.assertIn("/bin/hello_var", hints[0])
+
+    def test_unknown_attr_returns_no_hint(self):
+        from pathlib import Path
+        proj = self._project()
+        self.assertEqual(
+            cli._build_hint_lines(
+                proj, "ghost", Path("/tmp/p/output/ghost")
+            ),
+            [],
+        )
+
+
+class MainModuleExitCode(unittest.TestCase):
+    """`python -m rigx` (via rigx/__main__.py) must propagate cli.main's
+    return value as the process exit code. The pyproject console-script
+    entry gets this for free; the module entry needs an explicit
+    sys.exit() — without it, scripts that shell out to `python -m rigx
+    ... build ...` (like the repo's own example_project_build test)
+    silently report PASS on a failed build."""
+
+    def _run_main_returning(self, exit_code: int) -> int:
+        import subprocess
+        import sys
+        return subprocess.run(
+            [
+                sys.executable, "-c",
+                "import rigx.cli, runpy\n"
+                f"rigx.cli.main = lambda *a, **k: {exit_code}\n"
+                "runpy.run_module('rigx', run_name='__main__')\n",
+            ],
+            capture_output=True,
+        ).returncode
+
+    def test_propagates_nonzero(self):
+        self.assertEqual(self._run_main_returning(7), 7)
+
+    def test_zero_is_clean_exit(self):
+        self.assertEqual(self._run_main_returning(0), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

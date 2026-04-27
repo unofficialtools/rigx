@@ -12,6 +12,15 @@ def _nix_str(s: str) -> str:
     return '"' + s.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$") + '"'
 
 
+def _nix_interp_str(s: str) -> str:
+    """Quote a Python string for Nix, preserving `${name}` interpolation.
+    Escapes backslashes and quotes; leaves `$` alone so Nix interpolates
+    `${name}` against the surrounding `rec` scope at flake-eval time.
+    Same convention `kind = "run"` args and `kind = "custom"` scripts use
+    to refer to other rigx-built deps' store paths."""
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
 def _nix_id(qualified: str) -> str:
     """Map a possibly-dotted name ('frontend.app') to a Nix identifier
     ('frontend_app'). Used for `let` bindings and `rec` attrs — Nix accepts
@@ -886,6 +895,810 @@ def _mk_custom_derivation(target: Target, project: Project) -> str:
     return "\n".join(lines)
 
 
+def _nix_value(v) -> str:
+    """Render a Python scalar / list / dict as a Nix expression. Used to
+    bake the manifest attrset into the capsule derivation via
+    `builtins.toJSON`. Strings are escaped exactly like `_nix_str`."""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, str):
+        return _nix_str(v)
+    if isinstance(v, list):
+        return "[ " + " ".join(_nix_value(x) for x in v) + " ]"
+    if isinstance(v, dict):
+        items = []
+        for k, val in v.items():
+            key = k if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", k) else _nix_str(k)
+            items.append(f"{key} = {_nix_value(val)};")
+        if not items:
+            return "{ }"
+        return "{ " + " ".join(items) + " }"
+    if v is None:
+        return "null"
+    raise TypeError(f"cannot render {v!r} as a Nix value")
+
+
+def _capsule_image_tag(target: Target) -> str:
+    """OCI tag baked into the lite-capsule image. Stable across rebuilds
+    so the runner script can `docker load` and reference by tag without
+    looking up the digest."""
+    safe = target.qualified_name.replace(".", "_").replace("/", "_")
+    return f"rigx/{safe}:latest"
+
+
+def _capsule_manifest(target: Target) -> dict:
+    """The on-disk contract orchestrators (rigx.capsule, rigx.testbed,
+    future mixed-backend tools) read instead of reaching into Nix attrs.
+    Captures everything that varies per capsule and that a downstream
+    process needs to know without re-evaluating the flake."""
+    hostname = target.hostname or target.name
+    manifest: dict = {
+        "name": target.qualified_name,
+        "backend": target.backend,
+        "hostname": hostname,
+        "ports": list(target.ports),
+    }
+    if target.backend == "lite":
+        manifest["image"] = {
+            "kind": "oci-tarball-host-store",
+            "path": "image/image.tar.gz",
+            "tag": _capsule_image_tag(target),
+        }
+    elif target.backend == "nixos":
+        # Same OCI tarball shape as lite — host store mounted at
+        # runtime — but the container's PID 1 is NixOS systemd, not
+        # the entrypoint directly.
+        manifest["image"] = {
+            "kind": "oci-tarball-nixos-systemd",
+            "path": "image/image.tar.gz",
+            "tag": _capsule_image_tag(target),
+        }
+    elif target.backend == "qemu":
+        # v1: 9p-mounts the host's /nix/store rather than baking a qcow2.
+        # The runner forwards declared ports via qemu user-mode networking;
+        # the entrypoint runs as a systemd one-shot inside the VM.
+        manifest["image"] = {
+            "kind": "qemu-nixos-vm",
+            "path": "system/vm-script",
+        }
+    if target.env:
+        manifest["env"] = dict(target.env)
+    return manifest
+
+
+# Sentinels in the runner-script source for stuff we want resolved at
+# Nix-eval time. After bash-escaping the body, these get substituted
+# with bare `${capsule…_<name>}` Nix interpolation tokens that the
+# evaluator resolves against the let scope of
+# `_mk_capsule_derivation`. Keeping the substitution off-band of the
+# bash escape avoids two-pass tangles between the bash and Nix
+# meanings of `${…}`.
+_PLACEHOLDER_PATH = "@@RIGX_PATH@@"
+_PLACEHOLDER_BASH_BIN = "@@RIGX_BASH_BIN@@"
+
+
+def _capsule_runner_script(
+    target: Target, *, mode: str
+) -> str:
+    """Body of the bash runner that starts the capsule.
+
+    Two flavors share most of the boilerplate (engine detection, host-store
+    mount setup, per-container nix-state dirs, port/env plumbing): `mode =
+    "run"` runs the user's entrypoint as the container's command;
+    `mode = "shell"` overrides the entrypoint with bash so you can poke
+    around inside.
+
+    `PATH` inside the container is built from `deps.nixpkgs` — each
+    listed nixpkgs attr's `/bin` is colon-joined. The image is FROM
+    scratch and the Nix store is the only file source, so users opt in
+    to whatever they want reachable at runtime (e.g. `coreutils` for
+    `ls`/`cat`, `gnugrep` for `grep`). `bash` is provided by the
+    framework — the image's `Cmd` and `--entrypoint` use absolute
+    store paths so PATH never needs to contain bash.
+
+    Env knobs the orchestrator (rigx.capsule / rigx.testbed) sets:
+      RIGX_NAME      stable container name (default: random uuid)
+      RIGX_DETACH    1 = `-d` instead of `-it`; default interactive
+      RIGX_NETWORK   join an existing docker network
+      RIGX_PUBLISH   comma-list of `host:container` port pairs
+      RIGX_ENV       comma-list of `KEY=VALUE` extra env vars
+      RIGX_KEEP_STATE 1 = persist per-container profile/gcroot dirs
+    """
+    image_tag = _capsule_image_tag(target)
+    hostname = target.hostname or target.name
+    label = f"{mode}-{target.name}"
+    # Shell mode overrides the image's Cmd and starts bash from the
+    # store path baked in at Nix-eval time (placeholder is substituted
+    # by `_mk_capsule_derivation` after bash escaping).
+    entrypoint_flag = (
+        f'--entrypoint "{_PLACEHOLDER_BASH_BIN}"' if mode == "shell" else ""
+    )
+    return f"""\
+#!/usr/bin/env bash
+set -euo pipefail
+
+if command -v docker >/dev/null 2>&1; then ENGINE=docker
+elif command -v podman >/dev/null 2>&1; then ENGINE=podman
+else echo "{label}: docker or podman is required on PATH" >&2; exit 1
+fi
+
+HERE="$(cd "$(dirname "$0")/.." && pwd)"
+
+# Per-container nix-state dirs on host, cleaned up on exit unless the
+# orchestrator wants them persisted (RIGX_KEEP_STATE=1).
+RIGX_CACHE="${{XDG_CACHE_HOME:-$HOME/.cache}}/rigx/lite-state"
+CID="${{RIGX_NAME:-rigx-{target.name}-$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid)}}"
+PROFILE_DIR="$RIGX_CACHE/profiles/$CID"
+GCROOT_DIR="$RIGX_CACHE/gcroots/$CID"
+mkdir -p "$PROFILE_DIR" "$GCROOT_DIR"
+if [ -z "${{RIGX_KEEP_STATE:-}}" ]; then
+    trap 'rm -rf "$PROFILE_DIR" "$GCROOT_DIR"' EXIT
+fi
+
+echo "[{label}] loading {image_tag}" >&2
+"$ENGINE" load < "$HERE/image/image.tar.gz" >&2
+
+RUN_FLAGS=(--rm)
+if [ -n "${{RIGX_DETACH:-}}" ]; then
+    RUN_FLAGS+=(-d)
+else
+    RUN_FLAGS+=(-it)
+fi
+[ -n "${{RIGX_NAME:-}}" ] && RUN_FLAGS+=(--name "$RIGX_NAME")
+[ -n "${{RIGX_NETWORK:-}}" ] && RUN_FLAGS+=(--network "$RIGX_NETWORK")
+
+if [ -n "${{RIGX_PUBLISH:-}}" ]; then
+    IFS=',' read -ra PUBS <<< "$RIGX_PUBLISH"
+    for p in "${{PUBS[@]}}"; do RUN_FLAGS+=(-p "$p"); done
+fi
+
+if [ -n "${{RIGX_ENV:-}}" ]; then
+    IFS=',' read -ra EVS <<< "$RIGX_ENV"
+    for e in "${{EVS[@]}}"; do RUN_FLAGS+=(-e "$e"); done
+fi
+
+exec "$ENGINE" run "${{RUN_FLAGS[@]}}" \\
+    --hostname "{hostname}" \\
+    -v /nix/store:/nix/store:ro \\
+    -v /nix/var/nix/daemon-socket:/nix/var/nix/daemon-socket \\
+    -v /etc/ssl/certs:/etc/ssl/certs:ro \\
+    -v "$PROFILE_DIR":/nix/var/nix/profiles \\
+    -v "$GCROOT_DIR":/nix/var/nix/gcroots \\
+    -e "PATH={_PLACEHOLDER_PATH}" \\
+    -e "NIX_REMOTE=daemon" \\
+    {entrypoint_flag} \\
+    {image_tag} \\
+    "$@"
+"""
+
+
+def _mk_capsule_derivation(target: Target, project: Project) -> str:
+    """Dispatch a `kind = "capsule"` target to its backend-specific
+    builder. v1 supports `lite` (FROM-scratch OCI image), `nixos`
+    (NixOS userspace under systemd in a container), and `qemu` (NixOS
+    VM); `docker` is reserved for follow-on work."""
+    if target.backend == "lite":
+        return _mk_lite_capsule_derivation(target, project)
+    if target.backend == "nixos":
+        return _mk_nixos_capsule_derivation(target, project)
+    if target.backend == "qemu":
+        return _mk_qemu_capsule_derivation(target, project)
+    raise ValueError(
+        f"capsule {target.qualified_name!r}: unknown backend "
+        f"{target.backend!r} (supported: 'lite', 'nixos', 'qemu')"
+    )
+
+
+def _mk_lite_capsule_derivation(target: Target, project: Project) -> str:
+    """Lite capsule (kind = "capsule", backend = "lite"): a `unofficialtools/
+    nix-docker`-style FROM-scratch OCI image plus host-side runners
+    (`run-<name>`, `shell-<name>`) that mount the host's `/nix/store` and
+    Nix daemon socket into the container at start time. The image
+    contains only `/etc/{nix.conf,passwd,group}` and mount-anchor stub
+    directories — every binary comes from the host store via the bind
+    mount, including the user's rigx-built deps referenced in
+    `entrypoint` via `${{name}}` interpolation.
+
+    Layout under `$out`:
+      bin/run-<name>     standalone runner (host-store mounts + entrypoint)
+      bin/shell-<name>   same setup but `--entrypoint` is bash, for poking
+      image/image.tar.gz the loadable scratch OCI tarball
+      manifest.json      contract for orchestrators (rigx.capsule etc.)
+    """
+
+    name = target.qualified_name
+    safe_name = _nix_id(name)
+    hostname = target.hostname or target.name
+    image_tag = _capsule_image_tag(target)
+    manifest = _capsule_manifest(target)
+
+    # Cmd inside the image. `${dep}` references in the user's entrypoint
+    # interpolate against the rec scope at flake-eval time, baking the
+    # absolute store path of each rigx-built dep into the image's Cmd.
+    # The store path resolves at runtime because the runner mounts
+    # `/nix/store` from the host.
+    entrypoint_expr = _nix_interp_str(
+        _rewrite_interp(target.entrypoint, project)
+    )
+    env_pairs: list[str] = []
+    for key, val in target.env.items():
+        env_pairs.append(
+            _nix_interp_str(f"{key}=" + _rewrite_interp(val, project))
+        )
+    exposed_ports = (
+        " ".join(f'"{p}/tcp" = {{ }};' for p in target.ports)
+        if target.ports
+        else ""
+    )
+
+    lines: list[str] = []
+    lines.append("let")
+    # `imageRoot`: the union of files that go directly into the FROM-scratch
+    # rootfs. nix.conf points the in-container `nix` at the host daemon;
+    # passwd/group make `whoami` and ID-aware tools work.
+    lines.append(
+        f"  capsuleImageRoot_{safe_name} = "
+        f"pkgs.runCommand \"rigx-lite-{safe_name}-root\" {{ }} ''"
+    )
+    lines.append("    mkdir -p $out/etc")
+    lines.append("    mkdir -p $out/nix/store")
+    lines.append("    mkdir -p $out/nix/var/nix/profiles")
+    lines.append("    mkdir -p $out/nix/var/nix/gcroots")
+    lines.append("    mkdir -p $out/nix/var/nix/daemon-socket")
+    lines.append("    mkdir -p $out/tmp")
+    lines.append("    mkdir -p $out/root")
+    lines.append("    chmod 1777 $out/tmp")
+    lines.append("    cat > $out/etc/nix.conf <<NIXCONF")
+    lines.append("    store = daemon")
+    lines.append("    experimental-features = nix-command flakes")
+    lines.append("    NIXCONF")
+    lines.append("    cat > $out/etc/passwd <<PASSWD")
+    lines.append("    root:x:0:0:root:/root:/bin/sh")
+    lines.append("    nobody:x:65534:65534:nobody:/var/empty:/bin/false")
+    lines.append("    PASSWD")
+    lines.append("    cat > $out/etc/group <<GROUP")
+    lines.append("    root:x:0:")
+    lines.append("    nobody:x:65534:")
+    lines.append("    GROUP")
+    lines.append("  '';")
+    # The OCI image. Cmd is `bash -c <entrypoint>` — bash from the *image
+    # build's* nixpkgs; at runtime that store path is reachable because
+    # the runner bind-mounts the host's /nix/store (the host's nix daemon
+    # may have built either / both bash store paths over time, but they
+    # sit in the same store).
+    lines.append(
+        f"  capsuleImage_{safe_name} = pkgs.dockerTools.buildImage {{"
+    )
+    lines.append(f"    name = {_nix_str('rigx/' + safe_name)};")
+    lines.append('    tag = "latest";')
+    lines.append(f"    copyToRoot = capsuleImageRoot_{safe_name};")
+    lines.append("    config = {")
+    lines.append(
+        f"      Cmd = [ \"${{pkgs.bash}}/bin/bash\" \"-c\" {entrypoint_expr} ];"
+    )
+    lines.append(f"      Hostname = {_nix_str(hostname)};")
+    lines.append('      WorkingDir = "/root";')
+    if env_pairs:
+        lines.append(
+            "      Env = [ " + " ".join(env_pairs) + " ];"
+        )
+    if exposed_ports:
+        lines.append(f"      ExposedPorts = {{ {exposed_ports} }};")
+    lines.append("    };")
+    lines.append("  };")
+    # Manifest. Lab/orchestrator/human reads this rather than reaching
+    # into Nix attrs — keeps the boundary layer thin.
+    lines.append(
+        f"  capsuleManifest_{safe_name} = pkgs.writeText \"manifest.json\""
+    )
+    lines.append(f"    (builtins.toJSON {_nix_value(manifest)});")
+    # Runners. Two scripts share the boilerplate — one runs the entrypoint,
+    # the other drops to a shell. `pkgs.writeShellScript` produces an
+    # executable in the store; we copy it into `$out/bin/`.
+    #
+    # Every `${...}` in the bash body is a *bash* expansion — escape to
+    # `''${...}` so Nix's indented-string parser treats it as a literal
+    # `${` rather than interpolating against the surrounding rec scope.
+    # (Failing to escape produces "undefined variable RIGX_NAME" errors
+    # at flake eval time.)
+    #
+    # Two placeholders survive the bash-escape step intact: they're
+    # substituted *afterwards* with bare Nix interpolation tokens that
+    # DO resolve at flake-eval time against the let bindings emitted
+    # below. This is how `${pkgs.coreutils}/bin` etc. gets baked into
+    # the container's PATH at evaluation time rather than being
+    # resolved at runtime against an empty FROM-scratch image.
+    def _bake_runner(body: str) -> str:
+        body = body.replace("${", "''${")
+        body = body.replace(
+            _PLACEHOLDER_PATH,
+            "${capsulePath_" + safe_name + "}",
+        )
+        body = body.replace(
+            _PLACEHOLDER_BASH_BIN,
+            "${capsuleBashBin_" + safe_name + "}",
+        )
+        return body
+
+    run_body = _bake_runner(_capsule_runner_script(target, mode="run"))
+    shell_body = _bake_runner(_capsule_runner_script(target, mode="shell"))
+    # PATH inside the container = `:`-join of each `deps.nixpkgs`
+    # entry's `/bin`. Empty when no nixpkgs deps are listed; the
+    # entrypoint still works because Cmd uses absolute store paths,
+    # but `shell-<name>` won't have any tools (`ls`, `cat`, …) until
+    # the user lists `coreutils` (or whatever) explicitly. Strict
+    # opt-in — keeps the contract obvious.
+    if target.deps.nixpkgs:
+        path_parts = " + \":\" + ".join(
+            f"\"${{pkgs.{p}}}/bin\"" for p in target.deps.nixpkgs
+        )
+        lines.append(f"  capsulePath_{safe_name} = {path_parts};")
+    else:
+        lines.append(f"  capsulePath_{safe_name} = \"\";")
+    # Shell mode unconditionally needs bash — framework-provided so
+    # `shell-<name>` works regardless of what the user listed in
+    # deps.nixpkgs.
+    lines.append(
+        f"  capsuleBashBin_{safe_name} = "
+        f"\"${{pkgs.bashInteractive}}/bin/bash\";"
+    )
+    lines.append(
+        f"  capsuleRunner_{safe_name} = pkgs.writeShellScript "
+        f"\"run-{target.name}\" ''"
+    )
+    for ln in run_body.splitlines():
+        lines.append(f"    {ln}")
+    lines.append("  '';")
+    lines.append(
+        f"  capsuleShell_{safe_name} = pkgs.writeShellScript "
+        f"\"shell-{target.name}\" ''"
+    )
+    for ln in shell_body.splitlines():
+        lines.append(f"    {ln}")
+    lines.append("  '';")
+    lines.append(
+        f"in pkgs.runCommand {_nix_str(target.name + '-capsule')} {{"
+    )
+    lines.append(f"  pname = {_nix_str(name)};")
+    lines.append(f"  version = {_nix_str(project.version)};")
+    lines.append("} ''")
+    lines.append("  mkdir -p $out/bin $out/image")
+    lines.append(
+        f"  cp ${{capsuleImage_{safe_name}}} $out/image/image.tar.gz"
+    )
+    lines.append(
+        f"  cp ${{capsuleManifest_{safe_name}}} $out/manifest.json"
+    )
+    lines.append(
+        f"  cp ${{capsuleRunner_{safe_name}}} $out/bin/run-{target.name}"
+    )
+    lines.append(
+        f"  cp ${{capsuleShell_{safe_name}}} $out/bin/shell-{target.name}"
+    )
+    lines.append(
+        f"  chmod +x $out/bin/run-{target.name} $out/bin/shell-{target.name}"
+    )
+    lines.append("''")
+    return "\n".join(lines)
+
+
+def _mk_nixos_capsule_derivation(target: Target, project: Project) -> str:
+    """NixOS-in-container capsule (kind = "capsule", backend = "nixos"): a
+    real NixOS userspace running under systemd inside a docker/podman
+    container, with the host's `/nix/store` mounted at runtime. Compared
+    to `lite` (FROM-scratch container, entrypoint is Cmd) you get real
+    NixOS semantics — services, units, declarative `nixos_modules` —
+    at the cost of a slightly heavier startup (systemd boots) and a
+    `--privileged` flag on the runner. Compared to `qemu` (full VM) you
+    skip the kernel boot.
+
+    Layout under `$out`:
+      bin/run-<name>     standalone runner (host-store mount + systemd init)
+      image/image.tar.gz the loadable OCI tarball whose Cmd is `${toplevel}/init`
+      manifest.json      contract for orchestrators (rigx.capsule etc.)
+    """
+    name = target.qualified_name
+    safe_name = _nix_id(name)
+    hostname = target.hostname or target.name
+    image_tag = _capsule_image_tag(target)
+    manifest = _capsule_manifest(target)
+
+    # Same `${dep}` interpolation pattern as lite/qemu — at flake-eval
+    # time `${hello_go}` resolves to its store path, which is reachable
+    # inside the container because the runner mounts /nix/store.
+    entrypoint = _rewrite_interp(target.entrypoint, project)
+    entrypoint_expr = _nix_interp_str(entrypoint)
+
+    sys_pkgs = " ".join(f"pkgs.{p}" for p in target.deps.nixpkgs)
+
+    env_lines: list[str] = []
+    for key, val in target.env.items():
+        env_lines.append(
+            f'          {key} = {_nix_interp_str(_rewrite_interp(val, project))};'
+        )
+    env_block = "\n".join(env_lines) if env_lines else ""
+
+    exposed_ports_block = (
+        " ".join(f'"{p}/tcp" = {{ }};' for p in target.ports)
+        if target.ports
+        else ""
+    )
+
+    # `target = "<triple>"` shifts the NixOS evaluation system. Same
+    # cross-arch host-setup (binfmt + nix.conf extra-platforms) as qemu;
+    # `_cross_arch_qemu_capsules` in builder.py also catches this case
+    # (the helper looks at backend=="qemu", but we'd extend it if needed).
+    if target.target:
+        eval_system_line = f'    system = {_nix_str(target.target)};'
+    else:
+        eval_system_line = "    inherit system;"
+
+    lines: list[str] = []
+    lines.append("let")
+    # NixOS toplevel: same eval-config shape as qemu, but no qemu-vm.nix
+    # module and `boot.isContainer = true` so the toplevel is shaped for
+    # a container (no kernel modules, no bootloader, no fsck, …).
+    lines.append(
+        f"  capsuleNixosSystem_{safe_name} = "
+        f"(import (nixpkgs + \"/nixos/lib/eval-config.nix\") {{"
+    )
+    lines.append(eval_system_line)
+    lines.append("    modules = [")
+    lines.append("      ({ config, lib, pkgs, ... }: {")
+    lines.append('        system.stateVersion = "24.11";')
+    lines.append(f'        networking.hostName = {_nix_str(hostname)};')
+    lines.append("        networking.firewall.enable = false;")
+    lines.append("        networking.useDHCP = false;")
+    lines.append("        boot.isContainer = true;")
+    if sys_pkgs:
+        lines.append(f"        environment.systemPackages = [ {sys_pkgs} ];")
+    lines.append("        systemd.services.rigx-entrypoint = {")
+    lines.append('          description = "rigx capsule entrypoint";')
+    lines.append('          wantedBy = [ "multi-user.target" ];')
+    lines.append('          after = [ "network.target" ];')
+    if env_block:
+        lines.append("          environment = {")
+        lines.append(env_block)
+        lines.append("          };")
+    lines.append("          serviceConfig = {")
+    lines.append('            Type = "simple";')
+    lines.append(
+        "            ExecStart = \"${pkgs.bash}/bin/bash -c \" + "
+        f"(lib.escapeShellArg {entrypoint_expr});"
+    )
+    lines.append('            StandardOutput = "journal+console";')
+    lines.append('            StandardError = "journal+console";')
+    lines.append('            Restart = "no";')
+    lines.append("          };")
+    lines.append("        };")
+    lines.append("      })")
+    for mod_path in target.nixos_modules:
+        lines.append(f"      (src + {_nix_str('/' + mod_path)})")
+    lines.append("    ];")
+    lines.append("  }).config.system.build.toplevel;")
+    # Bootstrap rootfs — minimal /etc + mount anchors. NixOS init takes
+    # over from there (creates /etc symlinks pointing at
+    # `/run/current-system/sw/etc`, mounts /run, /tmp, etc.).
+    lines.append(
+        f"  capsuleImageRoot_{safe_name} = "
+        f"pkgs.runCommand \"rigx-nixos-{safe_name}-root\" {{ }} ''"
+    )
+    lines.append("    mkdir -p $out/etc $out/nix/store")
+    lines.append("    mkdir -p $out/tmp $out/run $out/root $out/var/log")
+    lines.append("    chmod 1777 $out/tmp")
+    lines.append("    cat > $out/etc/passwd <<PASSWD")
+    lines.append("    root:x:0:0:root:/root:/bin/sh")
+    lines.append("    nobody:x:65534:65534:nobody:/var/empty:/bin/false")
+    lines.append("    PASSWD")
+    lines.append("    cat > $out/etc/group <<GROUP")
+    lines.append("    root:x:0:")
+    lines.append("    nobody:x:65534:")
+    lines.append("    GROUP")
+    lines.append("  '';")
+    # OCI image: Cmd boots NixOS via the toplevel's /init.
+    lines.append(
+        f"  capsuleImage_{safe_name} = pkgs.dockerTools.buildImage {{"
+    )
+    lines.append(f"    name = {_nix_str('rigx/' + safe_name)};")
+    lines.append('    tag = "latest";')
+    lines.append(f"    copyToRoot = capsuleImageRoot_{safe_name};")
+    lines.append("    config = {")
+    lines.append(
+        f"      Cmd = [ \"${{capsuleNixosSystem_{safe_name}}}/init\" ];"
+    )
+    lines.append(f"      Hostname = {_nix_str(hostname)};")
+    if exposed_ports_block:
+        lines.append(f"      ExposedPorts = {{ {exposed_ports_block} }};")
+    # SIGRTMIN+3 is systemd's preferred shutdown signal — gives services
+    # a chance to exit cleanly before the container is reaped.
+    lines.append('      StopSignal = "SIGRTMIN+3";')
+    lines.append("    };")
+    lines.append("  };")
+    lines.append(
+        f"  capsuleManifest_{safe_name} = "
+        f"pkgs.writeText \"manifest.json\""
+    )
+    lines.append(f"    (builtins.toJSON {_nix_value(manifest)});")
+    # Runner. systemd inside docker needs --privileged (or the
+    # equivalent fine-grained setup) plus tmpfs for /run, /tmp, /var/log
+    # so it can write its runtime state. Otherwise the same RIGX_*
+    # env-var contract as lite.
+    runner_body = f"""\
+#!/usr/bin/env bash
+set -euo pipefail
+
+if command -v docker >/dev/null 2>&1; then ENGINE=docker
+elif command -v podman >/dev/null 2>&1; then ENGINE=podman
+else echo "run-{target.name}: docker or podman is required on PATH" >&2; exit 1
+fi
+
+HERE="$(cd "$(dirname "$0")/.." && pwd)"
+
+CID="${{RIGX_NAME:-rigx-{target.name}-$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid)}}"
+
+echo "[run-{target.name}] loading {image_tag}" >&2
+"$ENGINE" load < "$HERE/image/image.tar.gz" >&2
+
+RUN_FLAGS=(--rm --privileged)
+if [ -n "${{RIGX_DETACH:-}}" ]; then
+    RUN_FLAGS+=(-d)
+else
+    RUN_FLAGS+=(-it)
+fi
+[ -n "${{RIGX_NAME:-}}" ] && RUN_FLAGS+=(--name "$RIGX_NAME")
+[ -n "${{RIGX_NETWORK:-}}" ] && RUN_FLAGS+=(--network "$RIGX_NETWORK")
+
+if [ -n "${{RIGX_PUBLISH:-}}" ]; then
+    IFS=',' read -ra PUBS <<< "$RIGX_PUBLISH"
+    for p in "${{PUBS[@]}}"; do RUN_FLAGS+=(-p "$p"); done
+fi
+
+if [ -n "${{RIGX_ENV:-}}" ]; then
+    IFS=',' read -ra EVS <<< "$RIGX_ENV"
+    for e in "${{EVS[@]}}"; do RUN_FLAGS+=(-e "$e"); done
+fi
+
+exec "$ENGINE" run "${{RUN_FLAGS[@]}}" \\
+    --hostname "{hostname}" \\
+    --tmpfs /run \\
+    --tmpfs /tmp \\
+    --tmpfs /var/log \\
+    -v /nix/store:/nix/store:ro \\
+    {image_tag} \\
+    "$@"
+"""
+    runner_escaped = runner_body.replace("${", "''${")
+    lines.append(
+        f"  capsuleRunner_{safe_name} = pkgs.writeShellScript "
+        f"\"run-{target.name}\" ''"
+    )
+    for ln in runner_escaped.splitlines():
+        lines.append(f"    {ln}")
+    lines.append("  '';")
+    lines.append(
+        f"in pkgs.runCommand {_nix_str(target.name + '-nixos-capsule')} {{"
+    )
+    lines.append(f"  pname = {_nix_str(name)};")
+    lines.append(f"  version = {_nix_str(project.version)};")
+    lines.append("} ''")
+    lines.append("  mkdir -p $out/bin $out/image")
+    lines.append(
+        f"  cp ${{capsuleImage_{safe_name}}} $out/image/image.tar.gz"
+    )
+    lines.append(
+        f"  cp ${{capsuleManifest_{safe_name}}} $out/manifest.json"
+    )
+    lines.append(
+        f"  cp ${{capsuleRunner_{safe_name}}} $out/bin/run-{target.name}"
+    )
+    lines.append(f"  chmod +x $out/bin/run-{target.name}")
+    lines.append("''")
+    return "\n".join(lines)
+
+
+def _mk_qemu_capsule_derivation(target: Target, project: Project) -> str:
+    """qemu capsule (kind = "capsule", backend = "qemu"): a full NixOS VM
+    booted under qemu. The user's entrypoint runs as a systemd one-shot
+    service inside the VM; `deps.nixpkgs` go into `environment.systemPackages`;
+    declared `ports` are forwarded host→guest via qemu user-mode networking.
+
+    v1 uses NixOS's `system.build.vm` — the standard nixos-test driver
+    shape that 9p-mounts the host's `/nix/store` rather than baking a
+    standalone qcow2. Fast iteration, host-store-tied, requires KVM on
+    Linux. A self-contained qcow2 layout is reserved for follow-on work
+    when mixed-backend labs need the VM to run on a different host.
+
+    Layout under `$out`:
+      bin/run-<name>     standalone runner (execs the underlying VM script)
+      system/vm-script   symlink into the NixOS-VM derivation
+      manifest.json      contract for orchestrators (rigx.capsule etc.)
+    """
+    name = target.qualified_name
+    safe_name = _nix_id(name)
+    hostname = target.hostname or target.name
+    manifest = _capsule_manifest(target)
+
+    # Same `${dep}` interpolation pattern as lite — at flake-eval time
+    # `${hello_go}` resolves to its absolute store path; that path is
+    # reachable inside the VM because the runner 9p-mounts /nix/store.
+    entrypoint = _rewrite_interp(target.entrypoint, project)
+    entrypoint_expr = _nix_interp_str(entrypoint)
+
+    # systemPackages = list of pkgs.<attr> for each deps.nixpkgs entry.
+    sys_pkgs = " ".join(f"pkgs.{p}" for p in target.deps.nixpkgs)
+
+    # virtualisation.forwardPorts: declarative host→guest port mapping.
+    # qemu's user-mode networking translates these to `-netdev
+    # user,hostfwd=tcp::HOST_PORT-:GUEST_PORT` flags at boot.
+    if target.ports:
+        fwd_entries = "\n          ".join(
+            f"{{ from = \"host\"; host.port = {p}; guest.port = {p}; "
+            f"proto = \"tcp\"; }}"
+            for p in target.ports
+        )
+        forward_ports_block = (
+            "[\n          " + fwd_entries + "\n        ]"
+        )
+    else:
+        forward_ports_block = "[ ]"
+
+    # systemd Environment= entries. `${dep}` interpolation supported, same
+    # as the entrypoint, so users can pass dep store paths via env.
+    env_lines: list[str] = []
+    for key, val in target.env.items():
+        env_lines.append(
+            f'          {key} = {_nix_interp_str(_rewrite_interp(val, project))};'
+        )
+    env_block = "\n".join(env_lines) if env_lines else ""
+
+    # `target = "aarch64-linux"` (or any other cross triple) shifts the
+    # VM's NixOS system so the same capsule definition produces an ARM
+    # VM on an x86_64 host. The user's host needs aarch64 builders or
+    # binfmt_misc to actually build it; the *declaration* is portable.
+    if target.target:
+        vm_system_line = f'    system = {_nix_str(target.target)};'
+    else:
+        vm_system_line = "    inherit system;"
+
+    lines: list[str] = []
+    lines.append("let")
+    lines.append(
+        f"  qemuCapsuleSystem_{safe_name} = "
+        f"(import (nixpkgs + \"/nixos/lib/eval-config.nix\") {{"
+    )
+    lines.append(vm_system_line)
+    lines.append("    modules = [")
+    lines.append(
+        "      (nixpkgs + \"/nixos/modules/virtualisation/qemu-vm.nix\")"
+    )
+    lines.append("      ({ config, lib, pkgs, ... }: {")
+    lines.append('        system.stateVersion = "24.11";')
+    lines.append(f"        networking.hostName = {_nix_str(hostname)};")
+    # Firewall off — declared ports are already the contract; layering
+    # iptables on top would just be a footgun for `ports = [5000]`.
+    lines.append("        networking.firewall.enable = false;")
+    if sys_pkgs:
+        lines.append(
+            f"        environment.systemPackages = [ {sys_pkgs} ];"
+        )
+    lines.append("        virtualisation = {")
+    lines.append("          memorySize = 2048;")
+    lines.append("          cores = 2;")
+    lines.append("          graphics = false;")
+    lines.append(f"          forwardPorts = {forward_ports_block};")
+    lines.append("        };")
+    lines.append("        systemd.services.rigx-entrypoint = {")
+    lines.append('          description = "rigx capsule entrypoint";')
+    lines.append('          wantedBy = [ "multi-user.target" ];')
+    lines.append('          after = [ "network-online.target" ];')
+    lines.append('          wants = [ "network-online.target" ];')
+    if env_block:
+        lines.append("          environment = {")
+        lines.append(env_block)
+        lines.append("          };")
+    lines.append("          serviceConfig = {")
+    lines.append('            Type = "simple";')
+    lines.append(
+        "            ExecStart = \"${pkgs.bash}/bin/bash -c \" + "
+        f"(lib.escapeShellArg {entrypoint_expr});"
+    )
+    lines.append('            StandardOutput = "journal+console";')
+    lines.append('            StandardError = "journal+console";')
+    lines.append('            Restart = "no";')
+    lines.append("          };")
+    lines.append("        };")
+    lines.append("      })")
+    # User-supplied NixOS modules. `src` is in scope (the project's
+    # filtered source tree) so `(src + "/path/to/foo.nix")` resolves
+    # to a Nix path that imports as a module.
+    for mod_path in target.nixos_modules:
+        lines.append(f"      (src + {_nix_str('/' + mod_path)})")
+    lines.append("    ];")
+    lines.append("  }).config.system.build.vm;")
+    lines.append(
+        f"  qemuCapsuleManifest_{safe_name} = "
+        f"pkgs.writeText \"manifest.json\""
+    )
+    lines.append(f"    (builtins.toJSON {_nix_value(manifest)});")
+    # The runner is a tiny bash wrapper that execs the underlying NixOS
+    # vm script. Done as `writeShellScript` so it's executable and lives
+    # in the store; we then copy it to `$out/bin/run-<name>`.
+    # The runner does two jobs: translate the docker-shaped RIGX_PUBLISH
+    # contract into qemu-shaped `QEMU_NET_OPTS=hostfwd=...` rules, then
+    # exec the underlying NixOS vm script. The translator handles all
+    # three publish shapes the testbed produces:
+    #   HOST:CONT             → hostfwd=tcp::HOST-:CONT
+    #   ADDR:HOST:CONT        → hostfwd=tcp:ADDR:HOST-:CONT
+    #   …/udp suffix          → hostfwd=udp:…
+    # Multiple comma-separated rules are joined into the single
+    # QEMU_NET_OPTS value the qemu-vm.nix module appends to its
+    # `-netdev user,…` flag.
+    runner_body = f"""\
+#!/usr/bin/env bash
+set -euo pipefail
+HERE="$(cd "$(dirname "$0")/.." && pwd)"
+
+QEMU_NET_OPTS="${{QEMU_NET_OPTS:-}}"
+if [ -n "${{RIGX_PUBLISH:-}}" ]; then
+    extra=""
+    IFS=',' read -ra PUBS <<< "$RIGX_PUBLISH"
+    for p in "${{PUBS[@]}}"; do
+        proto="tcp"
+        case "$p" in
+            */udp) proto="udp"; p="${{p%/udp}}";;
+            */tcp) p="${{p%/tcp}}";;
+        esac
+        cnt=$(awk -F: '{{print NF-1}}' <<< "$p")
+        case "$cnt" in
+            1) host="${{p%:*}}"; cont="${{p##*:}}"
+               rule="hostfwd=$proto::$host-:$cont";;
+            2) addr="${{p%%:*}}"; rest="${{p#*:}}"
+               host="${{rest%:*}}"; cont="${{rest##*:}}"
+               rule="hostfwd=$proto:$addr:$host-:$cont";;
+            *) echo "run-{target.name}: malformed RIGX_PUBLISH entry: $p" >&2; exit 1;;
+        esac
+        extra="${{extra:+$extra,}}$rule"
+    done
+    if [ -n "$extra" ]; then
+        QEMU_NET_OPTS="${{QEMU_NET_OPTS:+$QEMU_NET_OPTS,}}$extra"
+    fi
+fi
+export QEMU_NET_OPTS
+
+exec "$HERE/system/vm-script/bin/run-{hostname}-vm" "$@"
+"""
+    # Escape `${...}` so Nix doesn't interpolate the bash expansions.
+    runner_escaped = runner_body.replace("${", "''${")
+    lines.append(
+        f"  qemuCapsuleRunner_{safe_name} = pkgs.writeShellScript "
+        f"\"run-{target.name}\" ''"
+    )
+    for ln in runner_escaped.splitlines():
+        lines.append(f"    {ln}")
+    lines.append("  '';")
+    lines.append(
+        f"in pkgs.runCommand {_nix_str(target.name + '-qemu-capsule')} {{"
+    )
+    lines.append(f"  pname = {_nix_str(name)};")
+    lines.append(f"  version = {_nix_str(project.version)};")
+    lines.append("} ''")
+    lines.append("  mkdir -p $out/bin $out/system")
+    lines.append(
+        f"  ln -s ${{qemuCapsuleSystem_{safe_name}}} $out/system/vm-script"
+    )
+    lines.append(
+        f"  cp ${{qemuCapsuleManifest_{safe_name}}} $out/manifest.json"
+    )
+    lines.append(
+        f"  cp ${{qemuCapsuleRunner_{safe_name}}} $out/bin/run-{target.name}"
+    )
+    lines.append(f"  chmod +x $out/bin/run-{target.name}")
+    lines.append("''")
+    return "\n".join(lines)
+
+
 def _mk_test_derivation(target: Target, project: Project) -> str:
     """Sandboxed test (`kind = "test"`): the user's `script` becomes the
     derivation's buildPhase, success means the build succeeds. We
@@ -924,6 +1737,8 @@ def _mk_derivation(
         return _mk_test_derivation(target, project)
     if target.kind == "custom":
         return _mk_custom_derivation(target, project)
+    if target.kind == "capsule":
+        return _mk_capsule_derivation(target, project)
 
     pname = (
         target.qualified_name
@@ -1091,7 +1906,8 @@ def generate(project: Project) -> str:
     w = out.append
 
     w("{")
-    w(f"  description = {_nix_str(f'rigx build for {project.name}')};")
+    desc = project.description or f"rigx build for {project.name}"
+    w(f"  description = {_nix_str(desc)};")
     w("")
     w("  inputs = {")
     w(f"    nixpkgs.url = {_nix_str(f'github:NixOS/nixpkgs/{project.nixpkgs_ref}')};")
