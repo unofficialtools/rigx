@@ -210,16 +210,17 @@ def _nix_id(name: str) -> str:
 def _all_attrs(project: Project) -> list[str]:
     """Every build attribute (targets with variants expand to one per variant).
 
-    `script`-kind targets are excluded so `rigx build` with no arguments does
-    not inadvertently run side-effecting tasks (publish, deploy, etc.). Run
-    them explicitly with `rigx build <name>`.
+    `script`/`testbed`-kind targets are excluded so `rigx build` with no
+    arguments does not inadvertently run side-effecting tasks (publish,
+    deploy, interactive testbeds). Run them explicitly with
+    `rigx run <name>`.
 
     Names are sanitized when dotted (B-merged module targets) so they match
     the Nix attrs emitted by `nix_gen._target_block`.
     """
     attrs: list[str] = []
     for name, target in project.targets.items():
-        if target.kind in ("script", "test"):
+        if target.kind in ("script", "test", "testbed"):
             continue
         attr_base = _nix_id(name) if "." in name else name
         if not target.variants:
@@ -267,19 +268,26 @@ def run_script_target(
 def run_named_script(
     project: Project, name: str, extra_args: list[str] | None = None
 ) -> None:
-    """CLI helper: look up a script target by name and execute it."""
+    """CLI helper: look up a script-style target by name and execute it.
+
+    Accepts both `kind = "script"` (one-shot host-side task) and
+    `kind = "testbed"` (interactive scenario that sets things up and
+    waits for input). Both share the `script` field and the same
+    host-side execution path; the distinct kinds let `rigx list
+    --kind testbed` discover scenarios separately from generic
+    scripts."""
     if name not in project.targets:
         raise BuildError(f"no such target: {name}")
     target = project.targets[name]
-    if target.kind != "script":
+    if target.kind not in ("script", "testbed"):
         raise BuildError(
-            f"target {name!r} (kind={target.kind!r}) is not a script target; "
-            f"use `rigx build {name}` instead"
+            f"target {name!r} (kind={target.kind!r}) is not a script or "
+            f"testbed target; use `rigx build {name}` instead"
         )
     print(f"[rigx] running {name}")
     rc = run_script_target(project, target, extra_args)
     if rc != 0:
-        raise BuildError(f"script target {name!r} failed (exit {rc})")
+        raise BuildError(f"{target.kind} target {name!r} failed (exit {rc})")
 
 
 def run_tests(
@@ -356,7 +364,9 @@ def _ensure_host_test_deps_built(
             if resolved is not None:
                 owner, dep_name = resolved
                 dep_target = owner.targets.get(dep_name)
-                if dep_target is not None and dep_target.kind in ("test", "script"):
+                if dep_target is not None and dep_target.kind in (
+                    "test", "script", "testbed",
+                ):
                     continue
             to_build.append(dep)
     if not to_build:
@@ -579,7 +589,7 @@ def _expand_build_spec(project: Project, spec: str) -> list[str]:
         attrs: list[str] = []
         for name in names:
             target = project.targets[name]
-            if target.kind in ("script", "test", "check"):
+            if target.kind in ("script", "test", "testbed", "check"):
                 continue
             attr_base = _nix_id(name) if "." in name else name
             if not target.variants:
@@ -601,9 +611,9 @@ def _expand_build_spec(project: Project, spec: str) -> list[str]:
         raise BuildError(
             f"target {name!r} is a test target; use `rigx test {name}` instead"
         )
-    if tgt_kind == "script":
+    if tgt_kind in ("script", "testbed"):
         raise BuildError(
-            f"target {name!r} is a script target (produces no artifact); "
+            f"target {name!r} is a {tgt_kind} target (produces no artifact); "
             f"use `rigx run {name}` instead"
         )
     return [_resolve_attr(project, spec)]

@@ -149,7 +149,7 @@ def _list_local_deps(project, prefix: str, kind_filter: str | None = None) -> in
         if not sub:
             continue
         for tname, target in sub.targets.items():
-            if target.kind == "script":
+            if target.kind in ("script", "testbed"):
                 continue
             if kind_filter and target.kind != kind_filter:
                 continue
@@ -327,7 +327,8 @@ def cmd_test(args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    """Execute a script-kind target (e.g. publish, deploy)."""
+    """Execute a script- or testbed-kind target (publish, deploy,
+    interactive testbed scenario, …)."""
     project = _load(args)
     try:
         builder.run_named_script(project, args.target, args.script_args)
@@ -460,7 +461,7 @@ def build_parser() -> argparse.ArgumentParser:
         "kind",
         choices=[
             "executable", "static_library", "python_script",
-            "custom", "script", "run", "test",
+            "custom", "script", "run", "test", "testbed",
         ],
     )
     sp.add_argument("name", help="target name")
@@ -475,9 +476,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser(
         "run",
-        help="execute a script-kind target (e.g. `rigx run publish [-- args…]`)",
+        help="execute a script or testbed target "
+             "(e.g. `rigx run publish [-- args…]`)",
     )
-    sp.add_argument("target", help="script target name")
+    sp.add_argument("target", help="script or testbed target name")
     # No script_args declared here — `main()` slices argv on the first `--`
     # so any flags after it (e.g. `rigx run pub -- --foo`) pass through verbatim.
     sp.set_defaults(func=cmd_run, script_args=[])

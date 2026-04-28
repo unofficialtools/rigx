@@ -985,8 +985,8 @@ def _capsule_runner_script(
     """Body of the bash runner that starts the capsule.
 
     Two flavors share most of the boilerplate (engine detection, host-store
-    mount setup, per-container nix-state dirs, port/env plumbing): `mode =
-    "run"` runs the user's entrypoint as the container's command;
+    mount setup, per-container nix-state dirs, port/env/volume plumbing):
+    `mode = "run"` runs the user's entrypoint as the container's command;
     `mode = "shell"` overrides the entrypoint with bash so you can poke
     around inside.
 
@@ -999,12 +999,18 @@ def _capsule_runner_script(
     store paths so PATH never needs to contain bash.
 
     Env knobs the orchestrator (rigx.capsule / rigx.testbed) sets:
-      RIGX_NAME      stable container name (default: random uuid)
-      RIGX_DETACH    1 = `-d` instead of `-it`; default interactive
-      RIGX_NETWORK   join an existing docker network
-      RIGX_PUBLISH   comma-list of `host:container` port pairs
-      RIGX_ENV       comma-list of `KEY=VALUE` extra env vars
-      RIGX_KEEP_STATE 1 = persist per-container profile/gcroot dirs
+      RIGX_NAME         stable container name (default: random uuid)
+      RIGX_DETACH       1 = `-d` instead of `-it`; default interactive
+      RIGX_NETWORK      join an existing docker network
+      RIGX_PUBLISH      comma-list of `host:container` port pairs
+      RIGX_ENV          comma-list of `KEY=VALUE` extra env vars
+      RIGX_VOLUMES      comma-list of `host:container[:mode]` bind-mounts
+                        appended to the TOML-declared set; relative `host`
+                        paths resolve against `RIGX_PROJECT_ROOT`
+      RIGX_PROJECT_ROOT absolute project root (used to resolve relative
+                        host paths in TOML and RIGX_VOLUMES). Auto-detected
+                        by walking up from `$PWD` if unset.
+      RIGX_KEEP_STATE   1 = persist per-container profile/gcroot dirs
     """
     image_tag = _capsule_image_tag(target)
     hostname = target.hostname or target.name
@@ -1015,6 +1021,8 @@ def _capsule_runner_script(
     entrypoint_flag = (
         f'--entrypoint "{_PLACEHOLDER_BASH_BIN}"' if mode == "shell" else ""
     )
+    toml_volumes_block = _emit_toml_volumes_array(target)
+    volume_helpers_block = _emit_volume_helpers(label)
     return f"""\
 #!/usr/bin/env bash
 set -euo pipefail
@@ -1059,6 +1067,18 @@ if [ -n "${{RIGX_ENV:-}}" ]; then
     for e in "${{EVS[@]}}"; do RUN_FLAGS+=(-e "$e"); done
 fi
 
+{volume_helpers_block}
+{toml_volumes_block}
+for _v in "${{TOML_VOLUMES[@]}}"; do
+    RUN_FLAGS+=(-v "$(_rigx_resolve_volume "$_v")")
+done
+if [ -n "${{RIGX_VOLUMES:-}}" ]; then
+    IFS=',' read -ra _RUNTIME_VOLS <<< "$RIGX_VOLUMES"
+    for _v in "${{_RUNTIME_VOLS[@]}}"; do
+        RUN_FLAGS+=(-v "$(_rigx_resolve_volume "$_v")")
+    done
+fi
+
 exec "$ENGINE" run "${{RUN_FLAGS[@]}}" \\
     --hostname "{hostname}" \\
     -v /nix/store:/nix/store:ro \\
@@ -1072,6 +1092,64 @@ exec "$ENGINE" run "${{RUN_FLAGS[@]}}" \\
     {image_tag} \\
     "$@"
 """
+
+
+def _emit_toml_volumes_array(target: Target) -> str:
+    """Bake `target.volumes` into a bash array literal in the runner.
+
+    Each element is a `host:container:mode` triple. Empty array if no
+    volumes are declared. Bash quoting is permissive here — the config
+    layer rejects `:` and `,` in either path, so the only quoting we
+    need to handle is shell metacharacters like spaces."""
+    if not target.volumes:
+        return "TOML_VOLUMES=()"
+    lines = ["TOML_VOLUMES=("]
+    for v in target.volumes:
+        triple = f"{v.host}:{v.container}:{v.mode}"
+        lines.append(f"    {_shell_quote(triple)}")
+    lines.append(")")
+    return "\n".join(lines)
+
+
+def _emit_volume_helpers(label: str) -> str:
+    """Bash helpers that resolve a `host:cont[:mode]` spec, prepending
+    `RIGX_PROJECT_ROOT` to a relative host path. The helpers are
+    embedded in the runner; they're shared verbatim between the
+    `run-` and `shell-` runners and the nixos runner.
+
+    The runner walks up from `$PWD` to find a `rigx.toml` if
+    `RIGX_PROJECT_ROOT` isn't set — same convention `rigx.capsule`
+    uses on the orchestration side, so a user can `cd $repo &&
+    output/.../bin/run-svc` without preset env vars."""
+    return f"""\
+RIGX_PROJECT_ROOT="${{RIGX_PROJECT_ROOT:-}}"
+if [ -z "$RIGX_PROJECT_ROOT" ]; then
+    _d="$PWD"
+    while [ "$_d" != "/" ] && [ -n "$_d" ]; do
+        if [ -f "$_d/rigx.toml" ]; then RIGX_PROJECT_ROOT="$_d"; break; fi
+        _d="$(dirname "$_d")"
+    done
+fi
+
+_rigx_resolve_volume() {{
+    local spec="$1" h c m colons
+    colons=$(awk -F: '{{print NF-1}}' <<< "$spec")
+    case "$colons" in
+        1) h="${{spec%:*}}"; c="${{spec##*:}}"; m="rw";;
+        2) h="${{spec%%:*}}"; rest="${{spec#*:}}"
+           c="${{rest%:*}}"; m="${{rest##*:}}";;
+        *) echo "{label}: malformed volume spec: $spec" >&2; exit 1;;
+    esac
+    case "$h" in
+        /*|~*) ;;
+        *) if [ -z "$RIGX_PROJECT_ROOT" ]; then
+               echo "{label}: relative host path '$h' needs RIGX_PROJECT_ROOT or a rigx.toml in \\$PWD or above" >&2
+               exit 1
+           fi
+           h="$RIGX_PROJECT_ROOT/$h" ;;
+    esac
+    printf '%s:%s:%s' "$h" "$c" "$m"
+}}"""
 
 
 def _mk_capsule_derivation(target: Target, project: Project) -> str:
@@ -1425,20 +1503,23 @@ def _mk_nixos_capsule_derivation(target: Target, project: Project) -> str:
     # equivalent fine-grained setup) plus tmpfs for /run, /tmp, /var/log
     # so it can write its runtime state. Otherwise the same RIGX_*
     # env-var contract as lite.
+    nixos_label = f"run-{target.name}"
+    nixos_volumes_array = _emit_toml_volumes_array(target)
+    nixos_volume_helpers = _emit_volume_helpers(nixos_label)
     runner_body = f"""\
 #!/usr/bin/env bash
 set -euo pipefail
 
 if command -v docker >/dev/null 2>&1; then ENGINE=docker
 elif command -v podman >/dev/null 2>&1; then ENGINE=podman
-else echo "run-{target.name}: docker or podman is required on PATH" >&2; exit 1
+else echo "{nixos_label}: docker or podman is required on PATH" >&2; exit 1
 fi
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 
 CID="${{RIGX_NAME:-rigx-{target.name}-$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid)}}"
 
-echo "[run-{target.name}] loading {image_tag}" >&2
+echo "[{nixos_label}] loading {image_tag}" >&2
 "$ENGINE" load < "$HERE/image/image.tar.gz" >&2
 
 RUN_FLAGS=(--rm --privileged)
@@ -1458,6 +1539,18 @@ fi
 if [ -n "${{RIGX_ENV:-}}" ]; then
     IFS=',' read -ra EVS <<< "$RIGX_ENV"
     for e in "${{EVS[@]}}"; do RUN_FLAGS+=(-e "$e"); done
+fi
+
+{nixos_volume_helpers}
+{nixos_volumes_array}
+for _v in "${{TOML_VOLUMES[@]}}"; do
+    RUN_FLAGS+=(-v "$(_rigx_resolve_volume "$_v")")
+done
+if [ -n "${{RIGX_VOLUMES:-}}" ]; then
+    IFS=',' read -ra _RUNTIME_VOLS <<< "$RIGX_VOLUMES"
+    for _v in "${{_RUNTIME_VOLS[@]}}"; do
+        RUN_FLAGS+=(-v "$(_rigx_resolve_volume "$_v")")
+    done
 fi
 
 exec "$ENGINE" run "${{RUN_FLAGS[@]}}" \\
@@ -1639,6 +1732,13 @@ def _mk_qemu_capsule_derivation(target: Target, project: Project) -> str:
 #!/usr/bin/env bash
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
+
+if [ -n "${{RIGX_VOLUMES:-}}" ]; then
+    echo "run-{target.name}: RIGX_VOLUMES is not supported on backend=qemu" >&2
+    echo "    (qemu volumes need NixOS-time virtualisation.sharedDirectories;" >&2
+    echo "     declare them in rigx.toml on a lite/nixos capsule instead.)" >&2
+    exit 1
+fi
 
 QEMU_NET_OPTS="${{QEMU_NET_OPTS:-}}"
 if [ -n "${{RIGX_PUBLISH:-}}" ]; then
@@ -1848,8 +1948,9 @@ def _flake_attrs(project: Project) -> list[str]:
     out: list[str] = []
     for tname, target in project.targets.items():
         # Skip host-side targets — they don't become Nix derivations.
-        # `script` is always host. `test` is only a derivation when sandboxed.
-        if target.kind == "script":
+        # `script` and `testbed` are always host. `test` is only a
+        # derivation when sandboxed.
+        if target.kind in ("script", "testbed"):
             continue
         if target.kind == "test" and not target.sandbox:
             continue
@@ -1944,8 +2045,9 @@ def generate(project: Project) -> str:
         # `script` and `test` targets are host-side tasks; they don't become
         # Nix derivations (they run via `rigx run` / `rigx test`).
         # Skip host-side targets — they don't become Nix derivations.
-        # `script` is always host. `test` is only a derivation when sandboxed.
-        if target.kind == "script":
+        # `script` and `testbed` are always host. `test` is only a
+        # derivation when sandboxed.
+        if target.kind in ("script", "testbed"):
             continue
         if target.kind == "test" and not target.sandbox:
             continue

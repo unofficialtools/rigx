@@ -39,6 +39,7 @@ _TARGET_FIELD_ORDER = [
     "entrypoint",
     "hostname",
     "ports",
+    "volumes",
     "env",
     "python_version",
     "python_project",
@@ -58,7 +59,10 @@ _TARGET_FIELD_ORDER = [
     "build_script",
     "install_script",
     "script",
+    "sandbox",
+    "exclusive",
     "native_build_inputs",
+    "nixos_modules",
 ]
 
 

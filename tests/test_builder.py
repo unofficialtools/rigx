@@ -215,7 +215,9 @@ class RunNamedScript(unittest.TestCase):
         proj = _project_with(
             hello=Target(name="hello", kind="executable", sources=["m.cpp"]),
         )
-        with self.assertRaisesRegex(BuildError, "is not a script target"):
+        with self.assertRaisesRegex(
+            BuildError, "is not a script or testbed target"
+        ):
             builder.run_named_script(proj, "hello")
 
     def test_extra_args_forwarded_to_bash_as_positional(self):

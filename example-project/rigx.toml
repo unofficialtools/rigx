@@ -213,6 +213,52 @@ echo "[test_hello_x86] saw expected greeting"
 # echo "[test_hello_arm] saw expected greeting"
 # """
 
+# Volumes + shared_volume + expose + kind = "testbed" #############################
+#
+# Two capsules cooperating through a shared host directory:
+#   - `note_writer` appends a line to /shared/log every second
+#   - `note_viewer` serves /shared over HTTP so a browser can watch
+# `volumes` is the declarative shape — bake mounts into the runner.
+# `kind = "testbed"` is the interactive scenario that wires both up
+# through the testbed's `shared_volume()` (auto-allocated tempdir) and
+# exposes the viewer on 0.0.0.0 so a browser can reach it.
+
+[targets.note_writer]
+kind          = "capsule"
+backend       = "lite"
+deps.nixpkgs  = ["coreutils", "bash"]
+entrypoint    = """
+mkdir -p /shared
+while true; do
+    echo "[note_writer $(date -Iseconds)] tick" >> /shared/log
+    sleep 1
+done
+"""
+volumes = [
+    # Relative path resolves against the project root at runtime
+    # (RIGX_PROJECT_ROOT, set by rigx.capsule.start). The directory
+    # is created automatically by the testbed's shared_volume() call.
+    { host = "testbed-data/notes", container = "/shared", mode = "rw" },
+]
+
+[targets.note_viewer]
+kind          = "capsule"
+backend       = "lite"
+deps.nixpkgs  = ["python3"]
+entrypoint    = "cd /shared && python3 -m http.server 8000"
+ports         = [8000]
+volumes = [
+    { host = "testbed-data/notes", container = "/shared", mode = "ro" },
+]
+
+[targets.notes_demo]
+kind          = "testbed"
+deps.internal = ["note_writer", "note_viewer"]
+deps.nixpkgs  = ["python3"]
+script = """
+python3 testbeds/notes_demo.py
+"""
+
 # `custom` is the escape hatch for non-trivial workflows the first-class
 # kinds don't cover. Here it stitches together previously-built targets
 # into a release tarball — using ${dep} interpolation to reach into each

@@ -65,11 +65,64 @@ PublishSpec = int | tuple[str, int]
 The testbed sets the tuple form when distinct addresses are in use."""
 
 
+PublishMapping = PublishSpec | list[PublishSpec]
+"""A container port may map to one host endpoint *or* a list of them.
+The list form is what the testbed produces when a port is both
+proxied (loopback alias) and exposed externally (`expose=` on
+`Network.declare`); each entry renders to its own `-p` flag."""
+
+
+VolumeSpec = str | tuple[str, str]
+"""Volume-mapping value — a container path (mode defaults to "rw") or
+a `(container_path, mode)` tuple. Hosts are the keys in the
+`volumes={}` dict; both `Path` and `str` work."""
+
+
 def _split_publish(value: PublishSpec) -> tuple[str, int]:
     """Normalize a publish-mapping value to `(host_addr, host_port)`."""
     if isinstance(value, tuple):
         return value
     return ("127.0.0.1", value)
+
+
+def _publish_specs(value: PublishMapping) -> list[PublishSpec]:
+    """A `publish[port]` value may be a single spec or a list. Always
+    return the list form so downstream code can iterate uniformly."""
+    if isinstance(value, list):
+        return list(value)
+    return [value]
+
+
+def _normalize_volumes(
+    volumes: dict[Path | str, VolumeSpec] | None,
+) -> list[tuple[str, str, str]]:
+    """Normalize the user-facing `volumes={}` dict into a list of
+    `(host, container, mode)` triples. Host paths are stringified
+    (Path → str) and may be relative — the runner resolves relative
+    paths against `RIGX_PROJECT_ROOT`. Reject `:` and `,` in either
+    field to keep the env-var encoding unambiguous."""
+    if not volumes:
+        return []
+    out: list[tuple[str, str, str]] = []
+    for host, spec in volumes.items():
+        host_str = str(host)
+        if isinstance(spec, tuple):
+            container, mode = spec
+        else:
+            container, mode = spec, "rw"
+        if mode not in ("rw", "ro"):
+            raise ValueError(
+                f"volumes[{host!r}]: mode must be 'rw' or 'ro' "
+                f"(got {mode!r})"
+            )
+        for ch in (":", ","):
+            if ch in host_str or ch in container:
+                raise ValueError(
+                    f"volumes[{host!r}]: paths may not contain {ch!r} "
+                    f"(reserved as a separator in RIGX_VOLUMES)"
+                )
+        out.append((host_str, container, mode))
+    return out
 
 
 @dataclass
@@ -81,8 +134,13 @@ class Capsule:
     container_name: str
     capsule_dir: Path
     manifest: dict[str, Any]
-    publish: dict[int, PublishSpec] = field(default_factory=dict)
-    publish_udp: dict[int, PublishSpec] = field(default_factory=dict)
+    publish: dict[int, PublishMapping] = field(default_factory=dict)
+    publish_udp: dict[int, PublishMapping] = field(default_factory=dict)
+    # Resolved bind-mounts: each entry is `(host, container, mode)`.
+    # Includes only what was passed via `start(volumes=…)`; volumes
+    # baked into the runner from `[targets.<name>].volumes` aren't
+    # reflected here (the runner applies those internally).
+    volumes: list[tuple[str, str, str]] = field(default_factory=list)
     # `lite` and `nixos` use docker/podman, which is detached/named —
     # no process handle to track. `qemu` runs the runner via `Popen`
     # (the VM is a child of the test process), so we keep the handle
@@ -113,9 +171,12 @@ class Capsule:
         self, container_port: int, *, proto: str = "tcp"
     ) -> tuple[str, int]:
         """Full `(addr, port)` host-side endpoint for the given
-        container port. `proto` selects TCP (default) or UDP. Errors
-        clearly when no mapping was configured — the most common cause
-        of a confusing 'connection refused' downstream."""
+        container port. `proto` selects TCP (default) or UDP. When a
+        port has multiple mappings (e.g. a testbed `expose=` adds a
+        public bind alongside the loopback alias), the *first*
+        mapping is returned — that's the canonical "where do peers
+        inside the testbed reach this port" answer. Errors clearly
+        when no mapping was configured."""
         pmap = self.publish_udp if proto == "udp" else self.publish
         if container_port not in pmap:
             raise KeyError(
@@ -124,7 +185,8 @@ class Capsule:
                 f"publish={self.publish or None}, "
                 f"publish_udp={self.publish_udp or None})"
             )
-        return _split_publish(pmap[container_port])
+        specs = _publish_specs(pmap[container_port])
+        return _split_publish(specs[0])
 
     def wait_for_port(
         self,
@@ -252,8 +314,10 @@ def start(
     name: str,
     *,
     env: dict[str, str] | None = None,
-    publish: dict[int, PublishSpec] | None = None,
-    publish_udp: dict[int, PublishSpec] | None = None,
+    publish: dict[int, PublishMapping] | None = None,
+    publish_udp: dict[int, PublishMapping] | None = None,
+    volumes: dict[Path | str, VolumeSpec] | None = None,
+    project_root: Path | str | None = None,
     network: str | None = None,
     container_name: str | None = None,
     output_dir: Path | str | None = None,
@@ -271,13 +335,26 @@ def start(
       env: extra env vars set inside the container. Override the
             image's `Env` defaults.
       publish: TCP container_port → host mapping. Each value is either
-            an `int` (host port; binds on `0.0.0.0`) or a
+            an `int` (host port; binds on `0.0.0.0`), a
             `(host_addr, host_port)` tuple (binds on the given
             loopback alias — `rigx.testbed` produces this form when
-            a subnet is configured). `None` = no TCP port forwarding.
+            a subnet is configured), or a *list* of those (one
+            container port may map to multiple host endpoints, e.g.
+            an internal loopback alias and an externally-exposed
+            address). `None` = no TCP port forwarding.
       publish_udp: UDP container_port → host mapping, same value
             shapes as `publish`. Renders to `docker -p` flags with
             the `/udp` suffix.
+      volumes: bind-mounts to add at runtime, on top of any declared
+            in `[targets.<name>].volumes`. Keys are host paths
+            (`Path` or `str`); values are either a container path
+            (mode defaults to `"rw"`) or a `(container_path, mode)`
+            tuple. Relative host paths are resolved by the runner
+            against `RIGX_PROJECT_ROOT`.
+      project_root: absolute project root used to resolve relative
+            host volume paths. Default: walk up from `output_dir` /
+            cwd to find `rigx.toml`. Surfaces as
+            `RIGX_PROJECT_ROOT` in the runner env.
       network: docker network the container joins (lets multiple
             capsules reach each other by container name).
       container_name: stable container name. Default: `rigx-<name>-<uuid8>`.
@@ -344,10 +421,12 @@ def start(
         # docker -p syntax: `host:cont` (binds 0.0.0.0) or
         # `host_addr:host_port:cont` (binds the given address). UDP
         # entries get the `/udp` suffix; TCP is the default and
-        # doesn't need one. The qemu runner translates this to
-        # `QEMU_NET_OPTS=hostfwd=...` at the start of its body so the
-        # underlying NixOS vm script sees an additional hostfwd rule
-        # per declared port.
+        # doesn't need one. List-valued mappings expand to one
+        # entry per host endpoint — letting a container port also
+        # be reachable on an externally-exposed address. The qemu
+        # runner translates this to `QEMU_NET_OPTS=hostfwd=...` at
+        # the start of its body so the underlying NixOS vm script
+        # sees an additional hostfwd rule per declared port.
         def _fmt(spec: PublishSpec, cont: int, proto: str) -> str:
             if isinstance(spec, tuple):
                 addr, host_port = spec
@@ -357,13 +436,37 @@ def start(
             return f"{base}/udp" if proto == "udp" else base
 
         parts: list[str] = []
-        for cont, spec in (publish or {}).items():
-            parts.append(_fmt(spec, cont, "tcp"))
-        for cont, spec in (publish_udp or {}).items():
-            parts.append(_fmt(spec, cont, "udp"))
+        for cont, mapping in (publish or {}).items():
+            for spec in _publish_specs(mapping):
+                parts.append(_fmt(spec, cont, "tcp"))
+        for cont, mapping in (publish_udp or {}).items():
+            for spec in _publish_specs(mapping):
+                parts.append(_fmt(spec, cont, "udp"))
         runner_env["RIGX_PUBLISH"] = ",".join(parts)
     if env:
         runner_env["RIGX_ENV"] = ",".join(f"{k}={v}" for k, v in env.items())
+
+    vols = _normalize_volumes(volumes)
+    if vols:
+        if backend == "qemu":
+            raise RuntimeError(
+                f"capsule {name!r}: volumes= is not supported on "
+                f"backend=qemu (use TOML volumes on a lite/nixos capsule)"
+            )
+        runner_env["RIGX_VOLUMES"] = ",".join(
+            f"{h}:{c}:{m}" for h, c, m in vols
+        )
+
+    # Surface a project root for the runner so relative host paths in
+    # TOML/RIGX_VOLUMES resolve. Falls back to walking up from
+    # `output_dir`'s parent (the same dir we already walked up from to
+    # find `rigx.toml`).
+    if project_root is not None:
+        runner_env["RIGX_PROJECT_ROOT"] = str(Path(project_root).resolve())
+    else:
+        runner_env.setdefault(
+            "RIGX_PROJECT_ROOT", str(output.parent.resolve())
+        )
 
     proc: subprocess.Popen | None = None
     log_path: Path | None = None
@@ -434,6 +537,7 @@ def start(
         manifest=manifest,
         publish=dict(publish or {}),
         publish_udp=dict(publish_udp or {}),
+        volumes=list(vols),
         _proc=proc,
         _log_path=log_path,
     )

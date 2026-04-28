@@ -42,12 +42,15 @@ from __future__ import annotations
 import ipaddress
 import os
 import random
+import shutil
 import socket
 import sys
+import tempfile
 import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Iterator
 
 
@@ -185,6 +188,39 @@ class _CapsuleEntry:
     address: str = "127.0.0.1"
     port_map: dict[int, int] = field(default_factory=dict)
     udp_port_map: dict[int, int] = field(default_factory=dict)
+    # Container-port → list of `(host_addr, host_port)` extra
+    # publishes. Set by `declare(expose=…)`; appended to each port's
+    # canonical loopback-alias publish in `bindings()` so docker
+    # binds the same container port on multiple host endpoints.
+    expose: dict[int, list[tuple[str, int]]] = field(default_factory=dict)
+    udp_expose: dict[int, list[tuple[str, int]]] = field(default_factory=dict)
+    # Bind-mounts requested via `declare(volumes=…)`. Each entry is
+    # `(handle, container_path, mode)`; the handle's `host_path` is
+    # populated lazily at `__enter__` time when the testbed
+    # allocates tempdirs for shared volumes.
+    volumes: list[tuple["SharedVolume", str, str]] = field(default_factory=list)
+
+
+@dataclass(eq=False)
+class SharedVolume:
+    """A writable host directory shared across capsules in a testbed.
+
+    Returned by `Network.shared_volume(name)`. The host-side tempdir
+    is allocated when the testbed's context manager enters and
+    cleaned up on exit. Capsules attach via `declare(volumes={vol:
+    "/path"})`; `bindings()` resolves the handle to a host path that
+    `rigx.capsule.start()` wires up as a `-v` flag.
+
+    The `name` is a human-readable label for diagnostics — multiple
+    volumes can share a name without conflict.
+
+    Identity-based equality (`eq=False`): two `SharedVolume` instances
+    with the same `name` are still distinct handles, and we want them
+    usable as dict keys in `declare(volumes={…})` even though
+    `host_path` mutates over the testbed lifecycle.
+    """
+    name: str
+    host_path: Path | None = None  # set by Network._start, cleared by _stop
 
 
 @dataclass
@@ -262,6 +298,11 @@ class Network:
         self._threads: list[threading.Thread] = []
         self._running = False
         self._stopping = False
+        # Shared volumes — registered up-front via `shared_volume()`,
+        # allocated on `__enter__`, deleted on `__exit__`. Stored as
+        # a list because handle identity (not name) is what `declare`
+        # references; multiple volumes can share a name.
+        self._volumes: list[SharedVolume] = []
 
         self._subnet: ipaddress.IPv4Network | None = None
         self._addr_pool: Iterator[str] | None = None
@@ -283,6 +324,25 @@ class Network:
 
     # --- Topology declaration ------------------------------------------
 
+    def shared_volume(self, name: str) -> SharedVolume:
+        """Register a writable host directory shared across capsules.
+
+        Returns a `SharedVolume` handle. Multiple capsules attach via
+        `declare(volumes={handle: "/container/path"})`. The host-side
+        tempdir is allocated on `__enter__` (so creating the handle is
+        cheap and side-effect-free) and deleted on `__exit__`.
+
+        Calling the testbed's `with` block before declaring all
+        volumes is fine; calling `shared_volume` *after* entering is
+        not — same lifecycle as `declare`."""
+        if self._running:
+            raise RuntimeError(
+                "shared_volume() must be called before entering the testbed"
+            )
+        sv = SharedVolume(name=name)
+        self._volumes.append(sv)
+        return sv
+
     def declare(
         self,
         capsule: str,
@@ -290,6 +350,9 @@ class Network:
         address: str | None = None,
         listens_on: list[int] | None = None,
         udp_listens_on: list[int] | None = None,
+        expose: list[tuple[str, int]] | None = None,
+        udp_expose: list[tuple[str, int]] | None = None,
+        volumes: dict[SharedVolume, str | tuple[str, str]] | None = None,
     ) -> None:
         """Register a capsule, pre-allocating host-side ports for each
         of its declared listening container ports.
@@ -300,6 +363,22 @@ class Network:
                   TCP and UDP port spaces are independent, so a
                   capsule may declare the same port number in both
                   lists and they map to distinct host ports.
+          expose: extra `(host_addr, container_port)` publishes for
+                  TCP. The capsule's port stays reachable on its
+                  loopback alias for inter-capsule traffic; the
+                  exposed endpoint is an *additional* docker `-p`
+                  bind, useful for "open this in a browser" workflows
+                  on `0.0.0.0:8000`. Each container port must already
+                  appear in `listens_on`. Faults declared via
+                  `link()` don't apply to traffic that arrives via
+                  the exposed endpoint — the proxy never sees it.
+          udp_expose: same shape, for UDP. Container ports must
+                  appear in `udp_listens_on`.
+          volumes: bind-mounts attached to this capsule, keyed by a
+                  handle from `shared_volume()`. Value is a container
+                  path (mode `"rw"`) or a `(container_path, mode)`
+                  tuple. `bindings()` includes the resolved volumes
+                  in the kwargs passed to `rigx.capsule.start()`.
 
         With no `subnet` on the Network and no explicit `address`,
         every capsule shares `host` (default `127.0.0.1`). Distinguish
@@ -336,9 +415,54 @@ class Network:
         udp_port_map = {
             p: _free_port(address, "udp") for p in (udp_listens_on or [])
         }
+
+        expose_map: dict[int, list[tuple[str, int]]] = {}
+        for addr, port in (expose or []):
+            if port not in port_map:
+                raise ValueError(
+                    f"expose entry ({addr!r}, {port}): port {port} is not "
+                    f"in listens_on={sorted(port_map)} for capsule "
+                    f"{capsule!r}"
+                )
+            expose_map.setdefault(port, []).append((addr, port))
+        udp_expose_map: dict[int, list[tuple[str, int]]] = {}
+        for addr, port in (udp_expose or []):
+            if port not in udp_port_map:
+                raise ValueError(
+                    f"udp_expose entry ({addr!r}, {port}): port {port} is "
+                    f"not in udp_listens_on={sorted(udp_port_map)} for "
+                    f"capsule {capsule!r}"
+                )
+            udp_expose_map.setdefault(port, []).append((addr, port))
+
+        vol_entries: list[tuple[SharedVolume, str, str]] = []
+        for handle, spec in (volumes or {}).items():
+            if not isinstance(handle, SharedVolume):
+                raise TypeError(
+                    f"volumes key must be a SharedVolume handle "
+                    f"(got {type(handle).__name__}); use net.shared_volume()"
+                )
+            if handle not in self._volumes:
+                raise ValueError(
+                    f"volumes: handle {handle.name!r} was not produced by "
+                    f"this testbed's shared_volume()"
+                )
+            if isinstance(spec, tuple):
+                cont, mode = spec
+            else:
+                cont, mode = spec, "rw"
+            if mode not in ("rw", "ro"):
+                raise ValueError(
+                    f"volumes[{handle.name!r}]: mode must be 'rw' or 'ro' "
+                    f"(got {mode!r})"
+                )
+            vol_entries.append((handle, cont, mode))
+
         self._capsules[capsule] = _CapsuleEntry(
             name=capsule, address=address,
             port_map=port_map, udp_port_map=udp_port_map,
+            expose=expose_map, udp_expose=udp_expose_map,
+            volumes=vol_entries,
         )
 
     def link(
@@ -407,6 +531,10 @@ class Network:
         Returns:
           publish: TCP listening ports forwarded to the capsule's
                    loopback alias as `(host_addr, host_port)` tuples.
+                   When `declare(expose=…)` was set, the value
+                   becomes a list — the canonical loopback alias
+                   first, then each exposed `(addr, port)`. List
+                   entries render to one docker `-p` flag each.
           publish_udp: same, for UDP listening ports. Always present;
                    empty dict if the capsule declared no UDP ports.
                    `rigx.capsule` formats both as docker `-p` flags
@@ -415,15 +543,38 @@ class Network:
                    named `<DST>_<PORT>[_<PROTO>]_ADDR`. TCP links use
                    the bare form (`FC_5001_ADDR`) for backward compat;
                    UDP links append `_UDP` (`FC_5001_UDP_ADDR`).
+          volumes: host-path → container-path mapping (with mode
+                   recorded as the value when non-default — actually
+                   keyed as `Path(host) -> container_path` in the
+                   default `"rw"` case, or `Path(host) -> (cont,
+                   mode)` if `"ro"`). Always present; empty dict if
+                   the capsule declared no volumes. The testbed must
+                   have entered (`__enter__`) so host paths are
+                   resolved.
         """
         cap = self._capsules.get(capsule)
         if cap is None:
             raise ValueError(f"capsule {capsule!r} not declared")
+
+        def _publish_value(
+            cont: int, addr: str, host_port: int,
+            extras: list[tuple[str, int]],
+        ):
+            """Single tuple if no extras; list when expose adds bindings."""
+            if not extras:
+                return (addr, host_port)
+            return [(addr, host_port), *extras]
+
         publish = {
-            cont: (cap.address, host) for cont, host in cap.port_map.items()
+            cont: _publish_value(
+                cont, cap.address, host, cap.expose.get(cont, []),
+            )
+            for cont, host in cap.port_map.items()
         }
         publish_udp = {
-            cont: (cap.address, host)
+            cont: _publish_value(
+                cont, cap.address, host, cap.udp_expose.get(cont, []),
+            )
             for cont, host in cap.udp_port_map.items()
         }
         env: dict[str, str] = {}
@@ -434,10 +585,24 @@ class Network:
             env[f"{dst.upper()}_{port}{suffix}_ADDR"] = (
                 f"{link.listen_addr}:{link.listen_port}"
             )
+
+        volumes: dict[Path | str, str | tuple[str, str]] = {}
+        for handle, container, mode in cap.volumes:
+            if handle.host_path is None:
+                raise RuntimeError(
+                    f"capsule {capsule!r}: shared volume {handle.name!r} "
+                    f"has no host path — call bindings() inside the "
+                    f"testbed's `with` block"
+                )
+            volumes[handle.host_path] = (
+                container if mode == "rw" else (container, mode)
+            )
+
         return {
             "publish": publish,
             "publish_udp": publish_udp,
             "env": env,
+            "volumes": volumes,
         }
 
     # --- Fault injection ------------------------------------------------
@@ -529,6 +694,21 @@ class Network:
         if self._running:
             return
         self._running = True
+        # Allocate per-volume tempdirs before starting proxies so a
+        # later `bindings()` call has something to point capsules at.
+        # Failure here aborts entry — partially-allocated dirs are
+        # cleaned up via `_stop` since we already flipped `_running`.
+        for sv in self._volumes:
+            try:
+                sv.host_path = Path(
+                    tempfile.mkdtemp(prefix=f"rigx-vol-{sv.name}-")
+                )
+            except OSError as e:
+                self._stop()
+                raise RuntimeError(
+                    f"testbed: cannot allocate shared volume "
+                    f"{sv.name!r}: {e}"
+                ) from e
         for link in self._links.values():
             if link.proto == "udp":
                 self._start_udp_link(link)
@@ -595,6 +775,10 @@ class Network:
             t.join(timeout=1.0)
         self._listeners.clear()
         self._threads.clear()
+        for sv in self._volumes:
+            if sv.host_path is not None:
+                shutil.rmtree(sv.host_path, ignore_errors=True)
+                sv.host_path = None
         self._running = False
 
     # --- Internal proxy plumbing ---------------------------------------

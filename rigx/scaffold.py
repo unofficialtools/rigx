@@ -183,6 +183,22 @@ def _test(name: str) -> Scaffold:
     return Scaffold(toml_block=block, files={})
 
 
+def _testbed(name: str) -> Scaffold:
+    block = (
+        f'\n[targets.{name}]\n'
+        f'kind         = "testbed"\n'
+        f'deps.nixpkgs = []\n'
+        f'script       = """\n'
+        f'# interactive scenario — sets things up, then waits.\n'
+        f'# invoke with `rigx run {name}`.\n'
+        f'echo "[{name}] starting"\n'
+        f'echo "press Enter to tear down…"\n'
+        f'read -r _\n'
+        f'"""\n'
+    )
+    return Scaffold(toml_block=block, files={})
+
+
 def scaffold(kind: str, name: str, language: str, run_target: str | None) -> Scaffold:
     if kind == "executable":
         return _executable(name, language)
@@ -198,7 +214,9 @@ def scaffold(kind: str, name: str, language: str, run_target: str | None) -> Sca
         return _run(name, run_target)
     if kind == "test":
         return _test(name)
+    if kind == "testbed":
+        return _testbed(name)
     raise ValueError(
         f"unknown kind {kind!r}; supported: executable, static_library, "
-        f"python_script, custom, script, run, test"
+        f"python_script, custom, script, run, test, testbed"
     )

@@ -54,6 +54,7 @@ VALID_KINDS = {
     "custom",
     "script",
     "test",
+    "testbed",
     "capsule",
 }
 
@@ -87,6 +88,23 @@ RESERVED_CAPSULE_BACKENDS = {"docker"}
 # typo doesn't silently produce a broken docker invocation.
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
+# Capsule backends that accept `volumes` declarations. v1: lite + nixos
+# only — qemu would need 9p shared-directory plumbing through
+# `virtualisation.sharedDirectories` plus runtime `-virtfs` injection,
+# which is out of scope while the testbed shared-volume use case lives
+# entirely on docker-shaped backends.
+VOLUME_CAPABLE_BACKENDS = {"lite", "nixos"}
+
+# Container paths we refuse to bind-mount onto. Overmounting these
+# would either break the runner contract (rigx mounts `/nix/store`,
+# `/nix/var/nix/daemon-socket`, …) or cause confusing failures.
+# Light list — the user can shoot themselves in the foot with
+# `/etc/hostname` if they really want to.
+_FORBIDDEN_VOLUME_TARGETS = (
+    "/nix/store", "/nix/var/nix/daemon-socket", "/nix/var/nix/profiles",
+    "/nix/var/nix/gcroots", "/etc/nix",
+)
+
 
 @dataclass
 class GitDep:
@@ -116,6 +134,25 @@ class TargetDeps:
     internal: list[str] = field(default_factory=list)
     nixpkgs: list[str] = field(default_factory=list)
     git: list[str] = field(default_factory=list)
+
+
+@dataclass
+class Volume:
+    """One bind-mount declared on a capsule target.
+
+    `host` is the host-side path. Absolute paths pass through verbatim;
+    relative paths are resolved against the project root at runner time
+    (the runner reads `RIGX_PROJECT_ROOT`, falling back to walking up
+    from `$PWD` for a `rigx.toml`). `container` is where the mount
+    appears inside the capsule. `mode` is `"rw"` (default) or `"ro"`.
+
+    Volumes declared here are baked into the runner script as default
+    `-v` flags. Additional volumes can be added at runtime via
+    `RIGX_VOLUMES` (see the runner's contract); both sets compose.
+    """
+    host: str
+    container: str
+    mode: str = "rw"
 
 
 @dataclass
@@ -221,6 +258,10 @@ class Target:
     # volumes, swap kernel packages, etc. — anything you'd put in a
     # NixOS configuration. Globs are expanded against the project root.
     nixos_modules: list[str] = field(default_factory=list)
+    # Bind-mounts declared on the capsule. Lite/nixos only in v1
+    # (qemu rejects with a clear error). Each entry maps a host path
+    # (absolute or project-relative) to a container path with a mode.
+    volumes: list[Volume] = field(default_factory=list)
     variants: dict[str, Variant] = field(default_factory=dict)
     # Module namespace (`[modules]` form). Empty for parent-owned targets.
     # The full identity is `namespace.name` when namespace is set; this is
@@ -381,6 +422,82 @@ def _expand_globs(
         if not matches:
             raise ConfigError(f"{ctx}: glob {item!r} matched no files under {root}")
         out.extend(matches)
+    return out
+
+
+def _parse_volumes(
+    raw, ctx: str, *, path_prefix: str = "",
+) -> list[Volume]:
+    """Parse a `volumes = [{ host, container, mode }, …]` list.
+
+    Each entry must be an inline table with at least `host` and
+    `container`. `mode` defaults to `"rw"`; `"ro"` is the only other
+    accepted value. Relative `host` paths get the module path prefix
+    prepended so a module that says `host = "data"` ends up referring
+    to `<module>/data` from the parent root, mirroring how source
+    paths are rewritten elsewhere. Absolute paths and paths starting
+    with `~` are left alone — the runner expands `~` at runtime."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ConfigError(f"{ctx}: volumes must be a list of inline tables")
+    out: list[Volume] = []
+    seen: set[str] = set()
+    for i, entry in enumerate(raw):
+        ectx = f"{ctx}.volumes[{i}]"
+        if not isinstance(entry, dict):
+            raise ConfigError(
+                f"{ectx}: must be an inline table with `host` and `container`"
+            )
+        unknown = set(entry.keys()) - {"host", "container", "mode"}
+        if unknown:
+            raise ConfigError(
+                f"{ectx}: unknown keys {sorted(unknown)} "
+                f"(allowed: host, container, mode)"
+            )
+        host = entry.get("host")
+        container = entry.get("container")
+        mode = entry.get("mode", "rw")
+        if not isinstance(host, str) or not host:
+            raise ConfigError(f"{ectx}: 'host' must be a non-empty string")
+        if not isinstance(container, str) or not container.startswith("/"):
+            raise ConfigError(
+                f"{ectx}: 'container' must be an absolute path "
+                f"(got {container!r})"
+            )
+        if mode not in ("rw", "ro"):
+            raise ConfigError(
+                f"{ectx}: 'mode' must be 'rw' or 'ro' (got {mode!r})"
+            )
+        # Reject characters that would corrupt the docker -v / RIGX_VOLUMES
+        # encoding. `:` and `,` are the field separators in both layers.
+        for ch in (":", ","):
+            if ch in host:
+                raise ConfigError(
+                    f"{ectx}: 'host' may not contain {ch!r} "
+                    f"(reserved as a separator in -v / RIGX_VOLUMES)"
+                )
+            if ch in container:
+                raise ConfigError(
+                    f"{ectx}: 'container' may not contain {ch!r}"
+                )
+        for forbidden in _FORBIDDEN_VOLUME_TARGETS:
+            if container == forbidden or container.startswith(forbidden + "/"):
+                raise ConfigError(
+                    f"{ectx}: container path {container!r} overmounts "
+                    f"a rigx-managed location ({forbidden})"
+                )
+        if container in seen:
+            raise ConfigError(
+                f"{ectx}: container path {container!r} declared twice"
+            )
+        seen.add(container)
+        # Relative host paths in modules need the module's path_prefix
+        # prepended so they resolve against the parent root the same
+        # way `nixos_modules` paths do.
+        if path_prefix and not host.startswith(("/", "~")):
+            host = path_prefix + host
+        out.append(Volume(host=host, container=container, mode=mode))
     return out
 
 
@@ -582,6 +699,9 @@ def _build_target(
         f"{tctx}.nixos_modules",
         output_prefix=path_prefix,
     )
+    volumes = _parse_volumes(
+        tconf.get("volumes"), tctx, path_prefix=path_prefix,
+    )
 
     return Target(
         name=tname,
@@ -622,6 +742,7 @@ def _build_target(
         hostname=hostname,
         ports=ports,
         nixos_modules=nixos_modules,
+        volumes=volumes,
         variants=variants,
         namespace=namespace,
     )
@@ -956,6 +1077,13 @@ def _load(root: Path, _visited: set[Path]) -> Project:
                 raise ConfigError(
                     f"target {tname}: kind='test' requires 'script'"
                 )
+        if target.kind == "testbed":
+            if not target.script:
+                raise ConfigError(
+                    f"target {tname}: kind='testbed' requires 'script' "
+                    f"(an interactive host-side scenario; runs via "
+                    f"`rigx run {tname}`)"
+                )
         if target.kind == "run":
             if not target.run:
                 raise ConfigError(f"target {tname}: kind='run' requires 'run = <name>'")
@@ -1023,6 +1151,16 @@ def _load(root: Path, _visited: set[Path]) -> Project:
                 raise ConfigError(
                     f"target {qname}: nixos_modules is only valid for "
                     f"backend='qemu' or backend='nixos' "
+                    f"(got backend={target.backend!r})"
+                )
+            # `volumes` lands as docker `-v` flags on lite/nixos. Qemu
+            # needs `virtualisation.sharedDirectories` (eval-time
+            # absolute paths) plus runtime fstab/mount plumbing — out
+            # of scope for v1.
+            if target.volumes and target.backend not in VOLUME_CAPABLE_BACKENDS:
+                raise ConfigError(
+                    f"target {qname}: volumes is only valid for "
+                    f"backend in {sorted(VOLUME_CAPABLE_BACKENDS)} "
                     f"(got backend={target.backend!r})"
                 )
 

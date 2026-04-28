@@ -871,6 +871,41 @@ Credentials needed by the script (`UV_PUBLISH_TOKEN`, cloud CLI creds, SSH
 keys, …) are read from your shell environment — set them before invoking
 `rigx run <target>`.
 
+### `testbed` — interactive multi-capsule scenario
+
+```toml
+[targets.start_lander_demo]
+kind         = "testbed"
+deps.nixpkgs = ["python3"]
+deps.internal = [
+    "telemetry_receiver", "telemetry_visualizer", "lander_simulator",
+]
+script = """
+python3 testbeds/lander_demo.py
+"""
+```
+
+A testbed target is a host-side scenario that **stands up a set of
+capsules and waits** — typically printing a "open this URL" message
+and reading from stdin until the user is done. It shares the runtime
+contract with `kind = "script"` (host-side, `nix shell` for
+`deps.nixpkgs`, no sandbox, runs via `rigx run <name>`), but the
+distinct kind:
+
+- discovers cleanly via `rigx list --kind testbed` so users can find
+  scenarios without sifting through every host-side helper;
+- documents intent — "this is a long-running interactive
+  setup," not "this exits 0/1 like a test or a publish step;"
+- composes with the testbed Python helpers (`rigx.testbed.Network`,
+  `rigx.capsule.start`) without forcing them through a `kind = "test"`
+  + `sandbox = false` workaround that signals "asserts and exits."
+
+Like `kind = "script"`, testbeds aren't buildable — naming one in
+`rigx build` redirects to `rigx run`. A typical body uses
+`rigx.testbed` + `rigx.capsule.start` (see Advanced features below)
+and ends with `read -r _` or `input(...)` so the user can hold the
+scenario open while they poke at it.
+
 ### `capsule` — runnable container artifact (experimental)
 
 ```toml
@@ -1033,12 +1068,13 @@ rigx new executable hello                 # cxx default; src/hello.cpp
 rigx new executable tool --language go    # src/tool.go
 rigx new static_library mylib             # src/mylib.cpp + include/mylib.h
 rigx new test smoke                       # kind=test stub; run via `rigx test`
+rigx new testbed lander                   # interactive scenario stub; `rigx run lander`
 rigx new run gen --run my_tool            # kind=run, invokes my_tool
 ```
 
 Supported kinds: `executable`, `static_library`, `python_script`,
-`custom`, `script`, `run`, `test`. Languages for the first two:
-`c`, `cxx`, `go`, `rust`, `zig`, `nim`.
+`custom`, `script`, `run`, `test`, `testbed`. Languages for the first
+two: `c`, `cxx`, `go`, `rust`, `zig`, `nim`.
 
 ### `rigx watch [target …]` — rebuild on change
 
@@ -1180,13 +1216,42 @@ manifest.json      # contract: name, backend, ports, image locator, env
 
 The runner inherits a few env knobs that orchestrators set:
 
-| env var          | purpose                                          |
-|------------------|--------------------------------------------------|
-| `RIGX_NAME`      | stable container name (default: random uuid)     |
-| `RIGX_DETACH`    | `1` = `docker run -d` (default: foreground)      |
-| `RIGX_NETWORK`   | join an existing docker network                  |
-| `RIGX_PUBLISH`   | `host:cont,host:cont,…` port forwards            |
-| `RIGX_ENV`       | `K=V,K=V,…` extra env vars                       |
+| env var             | purpose                                          |
+|---------------------|--------------------------------------------------|
+| `RIGX_NAME`         | stable container name (default: random uuid)     |
+| `RIGX_DETACH`       | `1` = `docker run -d` (default: foreground)      |
+| `RIGX_NETWORK`      | join an existing docker network                  |
+| `RIGX_PUBLISH`      | `host:cont,host:cont,…` port forwards            |
+| `RIGX_ENV`          | `K=V,K=V,…` extra env vars                       |
+| `RIGX_VOLUMES`      | `host:cont[:mode],…` extra bind-mounts (`mode`: `rw` / `ro`, default `rw`). Relative `host` paths resolve against `RIGX_PROJECT_ROOT`. Appended to any `volumes` declared in `rigx.toml`. |
+| `RIGX_PROJECT_ROOT` | absolute project root used to resolve relative `host` paths in `RIGX_VOLUMES` and TOML-declared volumes. Default: walk up from `$PWD` to find `rigx.toml`. |
+
+#### Bind-mount volumes (lite + nixos)
+
+Capsules can declare bind-mounts so they can read/write files on the
+host — useful for staging data between cooperating capsules
+(telemetry-receiver writes a column store, telemetry-visualizer reads
+it back), persisting state across runs, or surfacing a config tree
+the entrypoint expects to find:
+
+```toml
+[targets.telemetry_receiver]
+kind       = "capsule"
+backend    = "lite"
+entrypoint = "${rx_bin}/bin/rx --out /shared"
+volumes    = [
+    # relative paths resolve against the project root at runtime
+    { host = "testbed-data", container = "/shared", mode = "rw" },
+    # absolute paths and `~` pass through verbatim
+    { host = "/var/log/myapp", container = "/var/log/myapp", mode = "ro" },
+]
+```
+
+`volumes` is supported on `backend = "lite"` and `backend = "nixos"`
+in v1; qemu capsules reject it (the equivalent
+`virtualisation.sharedDirectories` plumbing is deferred). TOML-declared
+mounts are baked into the runner; orchestrators can add more at runtime
+via `RIGX_VOLUMES`.
 
 ### `backend = "nixos"` — NixOS userspace under systemd in a container
 
@@ -1392,10 +1457,75 @@ with Network() as net:
 
 `bindings("sim")` returns kwargs ready for `start()`:
 - `publish` maps each declared listening port to a testbed-allocated
-  host endpoint (`(addr, port)` tuple), so `wait_for_port` works.
+  host endpoint. By default each value is a `(addr, port)` tuple; if
+  `declare(expose=…)` adds external publishes, the value becomes a
+  list and `start()` emits one `-p` flag per entry.
+- `publish_udp`: the same shape, for UDP listening ports.
 - `env` exposes peer endpoints as `<DST>_<PORT>_ADDR` env vars (e.g.
   `FC_5001_ADDR=127.0.0.1:5023`). The capsule's entrypoint reads
   these to know where to connect.
+- `volumes` resolves any `shared_volume()` handles attached to the
+  capsule into a host-path → container-path mapping. Empty if no
+  shared volumes were declared.
+
+#### Shared volumes between capsules — `shared_volume` + `declare(volumes=…)`
+
+When two or more capsules need to read/write the same files (a
+telemetry pipeline staging columns, a simulator picking up a config
+tree dropped by a setup script), allocate a `shared_volume` on the
+testbed and attach it to each capsule with a container-side path:
+
+```python
+from rigx.capsule import start
+from rigx.testbed import Network
+
+with Network() as net:
+    data = net.shared_volume("data")           # tempdir, auto-cleaned
+    net.declare("rx", listens_on=[8001], volumes={data: "/shared"})
+    net.declare("vis", listens_on=[8000],
+                volumes={data: ("/shared", "ro")})  # read-only mount
+
+    with start("telemetry_receiver",   **net.bindings("rx"))  as rx, \
+         start("telemetry_visualizer", **net.bindings("vis")) as vis:
+        rx.wait_for_port(8001)
+        vis.wait_for_port(8000)
+        # rx writes to /shared inside its container; vis sees the
+        # same files at /shared (read-only).
+```
+
+The handle owns a host tempdir for the lifetime of the testbed's
+`with` block. `bindings("…")` includes a resolved `volumes={host:
+container}` entry that `start()` wires up as `RIGX_VOLUMES`. Volumes
+attached this way only apply to capsules with backends that accept
+volumes (`lite`, `nixos`); attempting to attach one to a `qemu`
+capsule fails fast at `start()` with a clear error.
+
+#### Exposing a capsule port externally — `declare(expose=…)`
+
+The proxy is a great fit for inter-capsule traffic with faults, but
+the wrong shape for "open this in a browser" — the loopback alias the
+testbed allocates isn't reachable from outside the host. `expose=`
+adds an *additional* `(addr, port)` publish on top of the normal
+loopback alias, so a port stays reachable both ways:
+
+```python
+with Network(subnet="127.0.10.0/24") as net:
+    net.declare("vis", listens_on=[8000],
+                expose=[("0.0.0.0", 8000)])
+    # vis is reachable to other capsules on its 127.0.10.X alias
+    # (proxied, fault-injectable) AND to a browser on 0.0.0.0:8000
+    # (direct, no faults — the proxy never sees it).
+
+    with start("telemetry_visualizer", **net.bindings("vis")) as vis:
+        vis.wait_for_port(8000)
+        print("open http://localhost:8000 in your browser")
+        input("press Enter to tear down…")
+```
+
+Each exposed port must already appear in `listens_on` (or
+`udp_listens_on` for `udp_expose=`). Faults declared with
+`net.fault(...)` apply only to traffic that goes through the proxy
+— exposed-endpoint traffic bypasses the rule chain.
 
 ### Backend support and mixing
 
