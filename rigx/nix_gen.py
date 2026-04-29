@@ -1010,6 +1010,10 @@ def _capsule_runner_script(
       RIGX_PROJECT_ROOT absolute project root (used to resolve relative
                         host paths in TOML and RIGX_VOLUMES). Auto-detected
                         by walking up from `$PWD` if unset.
+      RIGX_USER         override the TOML-declared `user` (`<user>[:<group>]`,
+                        canonical: `$UID:$GID` so bind-mounted volumes
+                        don't fill up with root-owned files). Empty/unset
+                        falls back to the TOML default.
       RIGX_KEEP_STATE   1 = persist per-container profile/gcroot dirs
     """
     image_tag = _capsule_image_tag(target)
@@ -1023,6 +1027,13 @@ def _capsule_runner_script(
     )
     toml_volumes_block = _emit_toml_volumes_array(target)
     volume_helpers_block = _emit_volume_helpers(label)
+    # `--user` is the canonical way to keep bind-mounted host volumes
+    # from filling up with root-owned files. The TOML default goes
+    # through bash's `${VAR:-default}` so `$UID:$GID` (validated as
+    # the only allowed bash form) expands at runner time, and
+    # `RIGX_USER` can override per-invocation. Empty default = the
+    # block is a no-op unless the orchestrator sets RIGX_USER.
+    user_default = target.user
     return f"""\
 #!/usr/bin/env bash
 set -euo pipefail
@@ -1056,6 +1067,9 @@ else
 fi
 [ -n "${{RIGX_NAME:-}}" ] && RUN_FLAGS+=(--name "$RIGX_NAME")
 [ -n "${{RIGX_NETWORK:-}}" ] && RUN_FLAGS+=(--network "$RIGX_NETWORK")
+
+USER_VAL="${{RIGX_USER:-{user_default}}}"
+[ -n "$USER_VAL" ] && RUN_FLAGS+=(--user "$USER_VAL")
 
 if [ -n "${{RIGX_PUBLISH:-}}" ]; then
     IFS=',' read -ra PUBS <<< "$RIGX_PUBLISH"

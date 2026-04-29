@@ -702,5 +702,230 @@ class TestbedKind(unittest.TestCase):
         self.assertIn("press Enter", s.toml_block)
 
 
+# ---------------------------------------------------------------------------
+# 5. Capsule `user` field — docker `--user` knob, with `$UID:$GID` as the
+# canonical value so bind-mounted volumes don't fill up with root-owned
+# files. Only valid for backend="lite" (nixos systemd needs uid 0; qemu
+# has no `--user`). RIGX_USER env var overrides per-invocation.
+# ---------------------------------------------------------------------------
+
+
+class CapsuleUserParse(unittest.TestCase):
+    def test_loads_user_field(self):
+        body = """
+            [project]
+            name = "p"
+
+            [targets.svc]
+            kind       = "capsule"
+            backend    = "lite"
+            entrypoint = "/bin/true"
+            user       = "$UID:$GID"
+        """
+        with TempProject(body) as root:
+            proj = config.load(root)
+        self.assertEqual(proj.targets["svc"].user, "$UID:$GID")
+
+    def test_user_default_is_empty(self):
+        body = """
+            [project]
+            name = "p"
+
+            [targets.svc]
+            kind       = "capsule"
+            backend    = "lite"
+            entrypoint = "/bin/true"
+        """
+        with TempProject(body) as root:
+            proj = config.load(root)
+        self.assertEqual(proj.targets["svc"].user, "")
+
+    def test_user_accepts_numeric_pair(self):
+        body = """
+            [project]
+            name = "p"
+
+            [targets.svc]
+            kind       = "capsule"
+            backend    = "lite"
+            entrypoint = "/bin/true"
+            user       = "1000:1000"
+        """
+        with TempProject(body) as root:
+            proj = config.load(root)
+        self.assertEqual(proj.targets["svc"].user, "1000:1000")
+
+    def test_user_accepts_bare_name(self):
+        body = """
+            [project]
+            name = "p"
+
+            [targets.svc]
+            kind       = "capsule"
+            backend    = "lite"
+            entrypoint = "/bin/true"
+            user       = "nobody"
+        """
+        with TempProject(body) as root:
+            proj = config.load(root)
+        self.assertEqual(proj.targets["svc"].user, "nobody")
+
+    def test_user_rejects_shell_metacharacters(self):
+        body = """
+            [project]
+            name = "p"
+
+            [targets.svc]
+            kind       = "capsule"
+            backend    = "lite"
+            entrypoint = "/bin/true"
+            user       = "1000; rm -rf /"
+        """
+        with TempProject(body) as root:
+            with self.assertRaisesRegex(ConfigError, "must match"):
+                config.load(root)
+
+    def test_user_rejects_curly_brace_expansion(self):
+        # Only bare `$VAR` is accepted — `${VAR}` would collide with the
+        # Nix interpolation escape pass that bakes the runner.
+        body = """
+            [project]
+            name = "p"
+
+            [targets.svc]
+            kind       = "capsule"
+            backend    = "lite"
+            entrypoint = "/bin/true"
+            user       = "${UID}:${GID}"
+        """
+        with TempProject(body) as root:
+            with self.assertRaisesRegex(ConfigError, "must match"):
+                config.load(root)
+
+    def test_user_rejected_on_nixos_backend(self):
+        body = """
+            [project]
+            name = "p"
+
+            [targets.svc]
+            kind       = "capsule"
+            backend    = "nixos"
+            entrypoint = "/bin/true"
+            user       = "$UID:$GID"
+        """
+        with TempProject(body) as root:
+            with self.assertRaisesRegex(ConfigError, "user is only valid"):
+                config.load(root)
+
+    def test_user_rejected_on_qemu_backend(self):
+        body = """
+            [project]
+            name = "p"
+
+            [targets.svc]
+            kind       = "capsule"
+            backend    = "qemu"
+            entrypoint = "/bin/true"
+            user       = "$UID:$GID"
+        """
+        with TempProject(body) as root:
+            with self.assertRaisesRegex(ConfigError, "user is only valid"):
+                config.load(root)
+
+
+class CapsuleUserRunnerEmit(unittest.TestCase):
+    def test_lite_runner_bakes_user_default(self):
+        body = """
+            [project]
+            name = "p"
+
+            [targets.svc]
+            kind       = "capsule"
+            backend    = "lite"
+            entrypoint = "/bin/true"
+            user       = "$UID:$GID"
+        """
+        with TempProject(body) as root:
+            proj = config.load(root)
+            flake = nix_gen.generate(proj)
+        # Nix indented-string escape rewrites `${` to `''${`; the bash
+        # `$UID`/`$GID` (no curly) pass through verbatim and expand at
+        # runner-launch time. `--user "$USER_VAL"` is also unescaped.
+        self.assertIn("''${RIGX_USER:-$UID:$GID}", flake)
+        self.assertIn('--user "$USER_VAL"', flake)
+
+    def test_lite_runner_emits_user_block_even_without_default(self):
+        # Empty default still emits the override block so RIGX_USER
+        # works without a TOML-side declaration.
+        body = """
+            [project]
+            name = "p"
+
+            [targets.svc]
+            kind       = "capsule"
+            backend    = "lite"
+            entrypoint = "/bin/true"
+        """
+        with TempProject(body) as root:
+            proj = config.load(root)
+            flake = nix_gen.generate(proj)
+        self.assertIn("''${RIGX_USER:-}", flake)
+        self.assertIn('--user "$USER_VAL"', flake)
+
+
+class CapsuleUserRunnerExec(unittest.TestCase):
+    """Render the user-flag block in isolation and run it under bash to
+    verify the runtime behavior (including the `$UID:$GID` expansion
+    and RIGX_USER override)."""
+
+    def _run_flag_script(self, user_default: str) -> str:
+        # Same shape as the lite runner emits — Python f-string here so
+        # we can drop the value in the same place. Mirrors the literal
+        # string in `_capsule_runner_script`.
+        return (
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            "RUN_FLAGS=()\n"
+            f'USER_VAL="${{RIGX_USER:-{user_default}}}"\n'
+            '[ -n "$USER_VAL" ] && RUN_FLAGS+=(--user "$USER_VAL")\n'
+            'printf "%s\\n" "${RUN_FLAGS[@]}"\n'
+        )
+
+    def test_uid_gid_expand_at_runtime(self):
+        import subprocess
+        script = self._run_flag_script("$UID:$GID")
+        env = {**os.environ, "UID": "4242", "GID": "4243"}
+        env.pop("RIGX_USER", None)
+        r = subprocess.run(
+            ["bash", "-c", script], env=env,
+            capture_output=True, text=True, check=True,
+        )
+        lines = [l for l in r.stdout.splitlines() if l]
+        self.assertEqual(lines, ["--user", "4242:4243"])
+
+    def test_rigx_user_overrides_toml_default(self):
+        import subprocess
+        script = self._run_flag_script("$UID:$GID")
+        env = {**os.environ, "UID": "4242", "GID": "4243",
+               "RIGX_USER": "9000:9000"}
+        r = subprocess.run(
+            ["bash", "-c", script], env=env,
+            capture_output=True, text=True, check=True,
+        )
+        lines = [l for l in r.stdout.splitlines() if l]
+        self.assertEqual(lines, ["--user", "9000:9000"])
+
+    def test_no_user_flag_when_neither_set(self):
+        import subprocess
+        script = self._run_flag_script("")
+        env = {k: v for k, v in os.environ.items() if k != "RIGX_USER"}
+        r = subprocess.run(
+            ["bash", "-c", script], env=env,
+            capture_output=True, text=True, check=True,
+        )
+        lines = [l for l in r.stdout.splitlines() if l]
+        self.assertEqual(lines, [])
+
+
 if __name__ == "__main__":
     unittest.main()

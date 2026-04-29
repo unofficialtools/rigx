@@ -1225,6 +1225,7 @@ The runner inherits a few env knobs that orchestrators set:
 | `RIGX_ENV`          | `K=V,K=V,…` extra env vars                       |
 | `RIGX_VOLUMES`      | `host:cont[:mode],…` extra bind-mounts (`mode`: `rw` / `ro`, default `rw`). Relative `host` paths resolve against `RIGX_PROJECT_ROOT`. Appended to any `volumes` declared in `rigx.toml`. |
 | `RIGX_PROJECT_ROOT` | absolute project root used to resolve relative `host` paths in `RIGX_VOLUMES` and TOML-declared volumes. Default: walk up from `$PWD` to find `rigx.toml`. |
+| `RIGX_USER`         | override the TOML `user` (`<user>[:<group>]`); empty/unset keeps the TOML default. |
 
 #### Bind-mount volumes (lite + nixos)
 
@@ -1252,6 +1253,30 @@ in v1; qemu capsules reject it (the equivalent
 `virtualisation.sharedDirectories` plumbing is deferred). TOML-declared
 mounts are baked into the runner; orchestrators can add more at runtime
 via `RIGX_VOLUMES`.
+
+#### Running as the host user (lite only)
+
+By default a docker container runs as `root`, which means files the
+capsule writes into a bind-mounted volume end up root-owned on the
+host — annoying when you want to inspect them after the run. Set
+`user = "$UID:$GID"` on the capsule and the runner will pass
+`--user` to docker, expanding `$UID`/`$GID` against the *host*
+shell at runner-launch time:
+
+```toml
+[targets.telemetry_receiver]
+kind       = "capsule"
+backend    = "lite"
+entrypoint = "${rx_bin}/bin/rx --out /shared"
+user       = "$UID:$GID"   # canonical: container files are yours
+volumes    = [{ host = "testbed-data", container = "/shared" }]
+```
+
+Numeric ids (`"1000:1000"`) and bare names (`"nobody"`,
+`"myuser:mygroup"`) also work; only a single `$VAR` per side is
+allowed (no `${VAR}`, no command substitution). Lite-only — `nixos`'s
+systemd needs to start as uid 0, and `qemu` has no `--user` knob.
+`RIGX_USER` overrides the TOML default per invocation.
 
 ### `backend = "nixos"` — NixOS userspace under systemd in a container
 

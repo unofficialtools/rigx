@@ -88,6 +88,22 @@ RESERVED_CAPSULE_BACKENDS = {"docker"}
 # typo doesn't silently produce a broken docker invocation.
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
+# Capsule `user` field: a docker `--user <user>[:<group>]` value. Each
+# field is a name, a numeric id, or a single `$VAR` bash expansion
+# resolved at runner time (the canonical case is `$UID:$GID`, so the
+# container runs as the host user and bind-mounted volumes don't end
+# up root-owned). Strict regex — no shell metacharacters, no command
+# substitution, no `${VAR:-...}` forms — keeps the value safe to splice
+# into the runner's bash double-quoted string.
+_USER_VALUE_RE = re.compile(
+    r"^(\$?[A-Za-z_][A-Za-z0-9_]*|\d+)(:(\$?[A-Za-z_][A-Za-z0-9_]*|\d+))?$"
+)
+
+# Capsule backends that accept the `user` field. systemd (nixos) needs
+# pid 1 to be uid 0; qemu runs everything inside the VM where the host
+# UID is irrelevant. Only lite has a meaningful `--user` knob.
+USER_CAPABLE_BACKENDS = {"lite"}
+
 # Capsule backends that accept `volumes` declarations. v1: lite + nixos
 # only — qemu would need 9p shared-directory plumbing through
 # `virtualisation.sharedDirectories` plus runtime `-virtfs` injection,
@@ -262,6 +278,11 @@ class Target:
     # (qemu rejects with a clear error). Each entry maps a host path
     # (absolute or project-relative) to a container path with a mode.
     volumes: list[Volume] = field(default_factory=list)
+    # Capsule docker `--user` value. Lite-only (nixos systemd needs uid
+    # 0; qemu has no `--user`). Bash expansions like `$UID:$GID` are
+    # left literal here — the runner script is bash, so they expand
+    # at runner-launch time. Empty string = don't pass `--user`.
+    user: str = ""
     variants: dict[str, Variant] = field(default_factory=dict)
     # Module namespace (`[modules]` form). Empty for parent-owned targets.
     # The full identity is `namespace.name` when namespace is set; this is
@@ -702,6 +723,7 @@ def _build_target(
     volumes = _parse_volumes(
         tconf.get("volumes"), tctx, path_prefix=path_prefix,
     )
+    user = str(tconf.get("user", "") or "")
 
     return Target(
         name=tname,
@@ -743,6 +765,7 @@ def _build_target(
         ports=ports,
         nixos_modules=nixos_modules,
         volumes=volumes,
+        user=user,
         variants=variants,
         namespace=namespace,
     )
@@ -1163,6 +1186,21 @@ def _load(root: Path, _visited: set[Path]) -> Project:
                     f"backend in {sorted(VOLUME_CAPABLE_BACKENDS)} "
                     f"(got backend={target.backend!r})"
                 )
+            if target.user:
+                if target.backend not in USER_CAPABLE_BACKENDS:
+                    raise ConfigError(
+                        f"target {qname}: user is only valid for "
+                        f"backend in {sorted(USER_CAPABLE_BACKENDS)} "
+                        f"(got backend={target.backend!r}); nixos systemd "
+                        f"needs to start as uid 0, qemu has no --user knob"
+                    )
+                if not _USER_VALUE_RE.match(target.user):
+                    raise ConfigError(
+                        f"target {qname}: user={target.user!r} must match "
+                        f"`<user>[:<group>]` where each side is a name, a "
+                        f"numeric id, or a single `$VAR` reference "
+                        f"(canonical: `$UID:$GID`)"
+                    )
 
     return Project(
         name=name,
