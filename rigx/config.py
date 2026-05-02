@@ -307,6 +307,23 @@ class Project:
     root: Path
     description: str = ""
     local_deps: dict[str, "LocalDep"] = field(default_factory=dict)
+    # `[project] sources` — repo-wide include globs that act as the baseline
+    # source-set for every derivation. When set, each target's `src` is
+    # narrowed to the intersection of this list, the target's own `sources`,
+    # minus `excludes`, minus gitignored paths (when `respect_gitignore`).
+    # When unset (default), rigx falls back to the legacy "whole-tree minus
+    # a basename blacklist" srcRoot — opt-in until enough projects use it.
+    sources: list[str] = field(default_factory=list)
+    # `[project] excludes` — globs subtracted from the include set. Use for
+    # generated files / __pycache__ / vendored caches that match an include
+    # glob but shouldn't ship into derivations.
+    excludes: list[str] = field(default_factory=list)
+    # `[project] respect_gitignore` — when true (default) and git is
+    # available in this checkout, intersect the include set with
+    # `git ls-files --cached --others --exclude-standard` so `.gitignore`
+    # naturally suppresses build outputs / .venv / node_modules. Silently
+    # no-ops when the project root isn't a git checkout.
+    respect_gitignore: bool = True
 
     def find_target(self, qualified: str) -> tuple["Project", str] | None:
         """Resolve a possibly-qualified target name (e.g. 'frontend.app') to
@@ -1002,6 +1019,22 @@ def _load(root: Path, _visited: set[Path]) -> Project:
     version = proj.get("version", "0.0.0")
     description = str(proj.get("description", ""))
 
+    # Optional source-filter knobs. Globs are kept in raw form here — the
+    # `rigx.sources` module expands them against the project tree at codegen
+    # time so we share one implementation between flake.nix `src` filters
+    # and `rigx ls-source <target>`.
+    proj_sources_raw = proj.get("sources", [])
+    if not isinstance(proj_sources_raw, list) or not all(
+        isinstance(x, str) for x in proj_sources_raw
+    ):
+        raise ConfigError("[project].sources must be a list of glob strings")
+    proj_excludes_raw = proj.get("excludes", [])
+    if not isinstance(proj_excludes_raw, list) or not all(
+        isinstance(x, str) for x in proj_excludes_raw
+    ):
+        raise ConfigError("[project].excludes must be a list of glob strings")
+    respect_gitignore = bool(proj.get("respect_gitignore", True))
+
     nixpkgs = data.get("nixpkgs", {})
     nixpkgs_ref = nixpkgs.get("ref", "nixos-24.11")
 
@@ -1211,4 +1244,7 @@ def _load(root: Path, _visited: set[Path]) -> Project:
         local_deps=local_deps,
         targets=targets,
         root=root,
+        sources=list(proj_sources_raw),
+        excludes=list(proj_excludes_raw),
+        respect_gitignore=respect_gitignore,
     )

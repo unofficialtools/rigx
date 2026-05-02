@@ -8,7 +8,7 @@ import os
 import sys
 from pathlib import Path
 
-from rigx import __version__, builder, config, fmt, graph, nix_gen, scaffold
+from rigx import __version__, builder, config, fmt, graph, nix_gen, scaffold, sources
 
 
 def _find_project_root(start: Path) -> Path:
@@ -338,6 +338,56 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_ls_source(args: argparse.Namespace) -> int:
+    """Print the resolved per-target source set, one path per line, with
+    a `<count> files, <bytes> total` summary on stderr.
+
+    The output is exactly what the generated flake's `src` for that target
+    contains — same code path that `nix_gen` consumes — so it answers
+    "why is this file in my artifact?" without `nix-store --dump`."""
+    project = _load(args)
+    if not sources.project_filtering_enabled(project):
+        print(
+            "rigx: ls-source requires `[project].sources = [...]` to be set "
+            "in rigx.toml — without it, every target's src is the whole "
+            "tree minus a basename blacklist (legacy behavior).",
+            file=sys.stderr,
+        )
+        return 1
+    if args.target not in project.targets:
+        print(
+            f"rigx: target {args.target!r} not found in project",
+            file=sys.stderr,
+        )
+        return 1
+    target = project.targets[args.target]
+    try:
+        files = sources.compute_target_files(project, target)
+    except ValueError as e:
+        print(f"rigx: {e}", file=sys.stderr)
+        return 1
+    total_bytes = 0
+    for rel in files:
+        print(rel)
+        try:
+            total_bytes += (project.root / rel).stat().st_size
+        except OSError:
+            pass
+    print(
+        f"\n{len(files)} files, {_format_bytes(total_bytes)} total.",
+        file=sys.stderr,
+    )
+    return 0
+
+
+def _format_bytes(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.1f} {unit}" if unit != "B" else f"{n} B"
+        n /= 1024
+    return f"{n} B"
+
+
 def cmd_pkg(args: argparse.Namespace) -> int:
     """Run any binary from the project's pinned nixpkgs.
 
@@ -483,6 +533,14 @@ def build_parser() -> argparse.ArgumentParser:
     # No script_args declared here — `main()` slices argv on the first `--`
     # so any flags after it (e.g. `rigx run pub -- --foo`) pass through verbatim.
     sp.set_defaults(func=cmd_run, script_args=[])
+
+    sp = sub.add_parser(
+        "ls-source",
+        help="print the resolved file list for a target's `src` "
+             "(requires [project].sources to be set)",
+    )
+    sp.add_argument("target", help="target name")
+    sp.set_defaults(func=cmd_ls_source)
 
     sp = sub.add_parser(
         "pkg",

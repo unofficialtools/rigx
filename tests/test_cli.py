@@ -1,10 +1,15 @@
 """Tests for argv-splitting in the rigx CLI."""
 
 import io
+import sys
+import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
+from textwrap import dedent
 from unittest import mock
 
-from rigx import cli
+from rigx import cli, sources
 
 
 class SplitRunPassthrough(unittest.TestCase):
@@ -182,6 +187,103 @@ class BuildHints(unittest.TestCase):
             ),
             [],
         )
+
+
+class _LsSourceFixture:
+    """Spin up a temp project with a populated tree for `rigx ls-source`
+    integration tests. Mirrors the fixture in test_sources but goes through
+    the CLI entry point so we cover argument parsing and stdout layout."""
+
+    def __init__(self, toml_body: str, files: dict[str, str]):
+        self.toml_body = dedent(toml_body).lstrip()
+        self.files = files
+
+    def __enter__(self) -> Path:
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        for rel, body in self.files.items():
+            p = root / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(body)
+        (root / "rigx.toml").write_text(self.toml_body)
+        sources._project_files_cached.cache_clear()
+        return root
+
+    def __exit__(self, *exc) -> None:
+        sources._project_files_cached.cache_clear()
+        self._tmp.cleanup()
+
+
+class LsSourceCLI(unittest.TestCase):
+    def _run(self, root: Path, target: str) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            rc = cli.main(["-C", str(root), "ls-source", target])
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_prints_resolved_files_and_summary(self):
+        body = """
+            [project]
+            name = "p"
+            sources = ["**/*.cpp", "**/*.h"]
+            respect_gitignore = false
+
+            [targets.hello]
+            kind = "executable"
+            sources = ["src/main.cpp"]
+            includes = ["include"]
+            language = "cxx"
+        """
+        files = {
+            "src/main.cpp": "int main(){}",
+            "include/foo.h": "#define FOO\n",
+            "data/unused.txt": "x",
+        }
+        with _LsSourceFixture(body, files) as root:
+            rc, out, err = self._run(root, "hello")
+        self.assertEqual(rc, 0)
+        self.assertIn("src/main.cpp", out)
+        self.assertIn("include/foo.h", out)
+        self.assertNotIn("data/unused.txt", out)
+        self.assertRegex(err, r"\b2 files,")
+
+    def test_unset_project_sources_returns_error(self):
+        body = """
+            [project]
+            name = "p"
+
+            [targets.t]
+            kind = "custom"
+            install_script = "true"
+        """
+        with _LsSourceFixture(body, {}) as root:
+            rc, _out, err = self._run(root, "t")
+        self.assertEqual(rc, 1)
+        self.assertIn("[project].sources", err)
+
+    def test_unknown_target_returns_error(self):
+        body = """
+            [project]
+            name = "p"
+            sources = ["**/*"]
+            respect_gitignore = false
+        """
+        with _LsSourceFixture(body, {"a.txt": ""}) as root:
+            rc, _out, err = self._run(root, "ghost")
+        self.assertEqual(rc, 1)
+        self.assertIn("'ghost' not found", err)
+
+
+class FormatBytes(unittest.TestCase):
+    def test_b(self):
+        self.assertEqual(cli._format_bytes(0), "0 B")
+        self.assertEqual(cli._format_bytes(500), "500 B")
+
+    def test_kb(self):
+        self.assertEqual(cli._format_bytes(2048), "2.0 KB")
+
+    def test_mb(self):
+        self.assertEqual(cli._format_bytes(2_500_000), "2.4 MB")
 
 
 class MainModuleExitCode(unittest.TestCase):

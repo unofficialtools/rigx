@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 
+from rigx import sources
 from rigx.config import GitDep, Project, Target, Variant
 
 
@@ -1994,14 +1995,35 @@ def _local_dep_url(project: Project, ldep) -> str:
         return f"path:{ldep.path}"
 
 
+def _per_target_src_let(target: Target, project: Project) -> str:
+    """Return `"let src = mkSrc \"<name>\" [ ... ]; in "` (the Nix prefix
+    that binds a per-target `src` for the surrounding derivation), or
+    `""` when the project hasn't opted into per-target source filtering.
+
+    Compute the file list eagerly here so any `target.sources` entry that
+    isn't covered by `[project].sources` raises a clear ConfigError-style
+    message at flake-gen time rather than producing a build that can't
+    find its inputs."""
+    if not sources.project_filtering_enabled(project):
+        return ""
+    files = sources.compute_target_files(project, target)
+    rels = sorted(set(files) | set(sources.ancestor_dirs(files)))
+    quoted = " ".join(_nix_str(r) for r in rels)
+    return (
+        f"let src = mkSrc {_nix_str(target.qualified_name)} "
+        f"[ {quoted} ]; in "
+    )
+
+
 def _target_block(target: Target, project: Project) -> str:
     # `attr_base` is the rec-attr key. For B-merged targets it's the sanitized
     # qualified name (`frontend_greet`); for parent-owned targets it equals
     # `target.name` since `_nix_id` is a no-op on plain identifiers.
     attr_base = _nix_id(target.qualified_name)
+    src_let = _per_target_src_let(target, project)
     if not target.variants:
         body = _mk_derivation(target, None, project)
-        return f"{attr_base} = {body};"
+        return f"{attr_base} = {src_let}{body};"
 
     lines: list[str] = []
     first_variant = sorted(target.variants.keys())[0]
@@ -2009,7 +2031,7 @@ def _target_block(target: Target, project: Project) -> str:
         variant = target.variants[vname]
         attr = f"{attr_base}-{vname}"
         body = _mk_derivation(target, variant, project)
-        lines.append(f"{attr} = {body};")
+        lines.append(f"{attr} = {src_let}{body};")
     # Alias unqualified name to first variant
     lines.append(f"{attr_base} = {attr_base}-{first_variant};")
     return "\n".join(lines)
@@ -2038,21 +2060,47 @@ def generate(project: Project) -> str:
     w("    let")
     w('      systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];')
     w("      forAll = f: nixpkgs.lib.genAttrs systems f;")
-    w("      srcRoot = builtins.path {")
-    w("        path = ./.;")
-    w('        name = "source";')
-    w("        filter = path: type:")
-    w("          let base = baseNameOf (toString path); in")
-    w('          !(builtins.elem base [')
-    w('            ".rigx" "output" ".git" "result"')
-    w('            "flake.nix" "flake.lock"')
-    w('          ]);')
-    w("      };")
+    if sources.project_filtering_enabled(project):
+        # Per-target `src` derived from explicit allow-lists baked in by
+        # `_per_target_src_let`. The filter looks each path up in an
+        # attrset rather than walking a list — O(1) per node and the
+        # eval cost stays linear in the project's file count.
+        w("      mkSrc = name: rels:")
+        w("        let")
+        w("          allowed = builtins.listToAttrs (")
+        w("            map (p: { name = p; value = true; }) rels")
+        w("          );")
+        w("          rootStr = toString ./.;")
+        w("          prefix = rootStr + \"/\";")
+        w("          prefixLen = builtins.stringLength prefix;")
+        w("        in builtins.path {")
+        w("          path = ./.;")
+        w('          name = "rigx-src-" + name;')
+        w("          filter = path: type:")
+        w("            let")
+        w("              ps = toString path;")
+        w("              rel = if ps == rootStr")
+        w("                    then \"\"")
+        w("                    else builtins.substring prefixLen (-1) ps;")
+        w("            in rel == \"\" || builtins.hasAttr rel allowed;")
+        w("        };")
+    else:
+        w("      srcRoot = builtins.path {")
+        w("        path = ./.;")
+        w('        name = "source";')
+        w("        filter = path: type:")
+        w("          let base = baseNameOf (toString path); in")
+        w('          !(builtins.elem base [')
+        w('            ".rigx" "output" ".git" "result"')
+        w('            "flake.nix" "flake.lock"')
+        w('          ]);')
+        w("      };")
     w("    in {")
     w("      packages = forAll (system:")
     w("        let")
     w("          pkgs = import nixpkgs { inherit system; };")
-    w("          src = srcRoot;")
+    if not sources.project_filtering_enabled(project):
+        w("          src = srcRoot;")
     w("        in rec {")
 
     for tname, target in project.targets.items():
