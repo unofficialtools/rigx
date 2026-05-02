@@ -1345,5 +1345,75 @@ class Includes(unittest.TestCase):
                 config.load(root)
 
 
+class RigxMinVersion(unittest.TestCase):
+    """`[project].rigx_min_version` blocks loading when the running rigx
+    is older than the declared requirement. Enforced at config-load time
+    so the user sees a clear "upgrade me" message before parsing wanders
+    into fields newer rigx versions may have introduced."""
+
+    def test_unset_is_no_op(self):
+        body = """
+            [project]
+            name = "p"
+        """
+        with TempProject(body) as root:
+            proj = config.load(root)
+        self.assertEqual(proj.rigx_min_version, "")
+
+    def test_current_version_satisfies(self):
+        from rigx import __version__ as cur
+        body = f"""
+            [project]
+            name = "p"
+            rigx_min_version = "{cur.split('+')[0]}"
+        """
+        # On editable installs cur is "0.0.0+unknown"; the check skips
+        # when "+unknown" is in the running version. We strip the suffix
+        # so the requirement is parseable either way.
+        with TempProject(body) as root:
+            proj = config.load(root)
+        self.assertEqual(proj.rigx_min_version, cur.split("+")[0])
+
+    def test_future_version_raises(self):
+        from rigx import __version__ as cur
+        if "+unknown" in cur:
+            self.skipTest("editable install — version check intentionally skipped")
+        major = int(cur.split(".")[0])
+        future = f"{major + 100}.0.0"
+        body = f"""
+            [project]
+            name = "p"
+            rigx_min_version = "{future}"
+        """
+        with TempProject(body) as root:
+            with self.assertRaisesRegex(ConfigError, r"requires rigx >= "):
+                config.load(root)
+
+    def test_malformed_version_raises(self):
+        body = """
+            [project]
+            name = "p"
+            rigx_min_version = "not-a-version"
+        """
+        with TempProject(body) as root:
+            with self.assertRaisesRegex(ConfigError, r"not a valid X\.Y\.Z"):
+                config.load(root)
+
+    def test_check_helper_skips_unknown_running_version(self):
+        # White-box test of the editable-install fallback. Patch
+        # rigx.__version__ to the sentinel so we don't depend on test
+        # order or how the test runner installed rigx.
+        import rigx
+        from rigx.config import _check_rigx_version
+        saved = rigx.__version__
+        try:
+            rigx.__version__ = "0.0.0+unknown"
+            # Should not raise — the require version is well past
+            # whatever an editable install reports.
+            _check_rigx_version("99.0.0")
+        finally:
+            rigx.__version__ = saved
+
+
 if __name__ == "__main__":
     unittest.main()

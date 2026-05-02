@@ -307,6 +307,11 @@ class Project:
     root: Path
     description: str = ""
     local_deps: dict[str, "LocalDep"] = field(default_factory=dict)
+    # `[project] rigx_min_version` — when set, fail config-load with a
+    # clear message if the running `rigx` is older. Format is `X.Y.Z`;
+    # empty disables the check. Editable dev installs (whose reported
+    # version is `0.0.0+unknown`) skip the check silently.
+    rigx_min_version: str = ""
     # `[project] sources` — repo-wide include globs that act as the baseline
     # source-set for every derivation. When set, each target's `src` is
     # narrowed to the intersection of this list, the target's own `sources`,
@@ -344,6 +349,50 @@ class Project:
 
 class ConfigError(ValueError):
     pass
+
+
+_VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)")
+
+
+def _parse_version(s: str) -> tuple[int, int, int] | None:
+    """Extract the leading X.Y.Z triple from a version string. Returns
+    None if `s` doesn't start with three dotted integers — caller decides
+    whether that's an error (declared version) or a soft skip (running
+    rigx version on an editable dev install reporting `0.0.0+unknown`)."""
+    m = _VERSION_RE.match(s)
+    if m is None:
+        return None
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+
+
+def _check_rigx_version(required: str) -> None:
+    """Enforce `[project].rigx_min_version`. No-op when `required` is empty
+    or when the running rigx reports the editable-install fallback
+    (`0.0.0+unknown`) — under that fallback we can't reliably compare,
+    and refusing to load every project would be more annoying than the
+    check is worth on dev checkouts."""
+    if not required:
+        return
+    req = _parse_version(required)
+    if req is None:
+        raise ConfigError(
+            f"[project].rigx_min_version: {required!r} is not a valid "
+            f"X.Y.Z version string"
+        )
+    # Imported lazily to avoid an import-time cycle when this module is
+    # loaded as part of `rigx`'s package initialisation.
+    from rigx import __version__ as current
+    if "+unknown" in current:
+        return
+    cur = _parse_version(current)
+    if cur is None:
+        return
+    if cur < req:
+        raise ConfigError(
+            f"this project requires rigx >= {required}, but you're "
+            f"running rigx {current}. Upgrade rigx, or lower "
+            f"[project].rigx_min_version if the requirement is wrong."
+        )
 
 
 def _load_vars(
@@ -1015,6 +1064,11 @@ def _load(root: Path, _visited: set[Path]) -> Project:
     proj = data.get("project")
     if not proj or "name" not in proj:
         raise ConfigError("missing [project] section with 'name'")
+    # Run the rigx-version check first so a project that targets a newer
+    # rigx fails with a clear "upgrade me" message before the loader
+    # walks into fields that newer rigx versions might have introduced.
+    rigx_min_version = str(proj.get("rigx_min_version", "") or "")
+    _check_rigx_version(rigx_min_version)
     name = proj["name"]
     version = proj.get("version", "0.0.0")
     description = str(proj.get("description", ""))
@@ -1247,4 +1301,5 @@ def _load(root: Path, _visited: set[Path]) -> Project:
         sources=list(proj_sources_raw),
         excludes=list(proj_excludes_raw),
         respect_gitignore=respect_gitignore,
+        rigx_min_version=rigx_min_version,
     )

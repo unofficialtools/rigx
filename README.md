@@ -315,9 +315,10 @@ Semantics:
 
 ```toml
 [project]
-name        = "myproject"        # required. Used as the generated flake's identity.
-version     = "0.1.0"            # optional; default "0.0.0". Used as Nix derivation version.
-description = "A short summary"  # optional; defaults to "rigx build for <name>". Shown in `nix flake metadata`.
+name             = "myproject"   # required. Used as the generated flake's identity.
+version          = "0.1.0"       # optional; default "0.0.0". Used as Nix derivation version.
+description      = "A short summary"  # optional; defaults to "rigx build for <name>". Shown in `nix flake metadata`.
+rigx_min_version = "0.5.0"       # optional. Refuse to load with a clear error if the running rigx is older. Format X.Y.Z; editable dev installs skip the check.
 
 # Optional source-filter (opt-in). When `sources` is set, every target's
 # derivation `src` is narrowed to the include set instead of hashing the
