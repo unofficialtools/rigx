@@ -4,6 +4,29 @@
 name = "hello-example"
 version = "0.1.0"
 
+# Opt-in source filter. With `sources = […]` set, every target's derivation
+# `src` is narrowed to the include set instead of hashing the whole repo —
+# tutorials, build/, and stray artifacts at the project root no longer
+# invalidate any target's input hash. List file extensions actually used in
+# the project; targets pick up further narrowing automatically (see the
+# per-target `sources` and `includes` fields below). Run
+# `rigx ls-source <target>` to print the resolved file set for any target.
+sources = [
+    "**/*.c", "**/*.cpp", "**/*.h",
+    "**/*.go", "**/*.rs", "**/*.zig", "**/*.nim",
+    "**/*.py",
+]
+# Subtract anything that matches an include glob but shouldn't ship into a
+# derivation (generated files, vendored caches).
+excludes = [
+    "**/__pycache__/**",
+    "**/*_generated.*",
+]
+# `respect_gitignore = true` is the default; the include set is also
+# intersected with `git ls-files` output when the project is a git
+# checkout (silent no-op otherwise). Drop `build/`, `output/`, and any
+# `.gitignore`-listed artifacts without restating them here.
+
 [nixpkgs]
 ref = "nixos-24.11"
 

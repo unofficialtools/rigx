@@ -249,6 +249,7 @@ rigx test 'unit_*'        # filters are fnmatch patterns — globs work too
 rigx test -j 4            # up to 4 tests concurrently (exclusives still serial)
 rigx graph hello          # print a Mermaid dep graph for one target
 rigx flake                # print generated flake.nix (for debugging)
+rigx ls-source hello      # print the resolved `src` file list for a target (requires [project].sources)
 rigx fmt [--write]        # canonical-format rigx.toml (comments not preserved)
 rigx new executable foo   # scaffold a new target + stub source files
 rigx clean                # remove output/
@@ -317,7 +318,25 @@ Semantics:
 name        = "myproject"        # required. Used as the generated flake's identity.
 version     = "0.1.0"            # optional; default "0.0.0". Used as Nix derivation version.
 description = "A short summary"  # optional; defaults to "rigx build for <name>". Shown in `nix flake metadata`.
+
+# Optional source-filter (opt-in). When `sources` is set, every target's
+# derivation `src` is narrowed to the include set instead of hashing the
+# whole repo. Smaller store copies, fewer rebuilds when unrelated files
+# change. Unset → today's whole-tree-with-basename-blacklist behavior.
+sources           = ["**/*.cpp", "**/*.h", "**/*.nim", "**/*.py"]
+excludes          = ["**/*_generated.nim", "**/__pycache__/**"]
+respect_gitignore = true         # default true; intersects with `git ls-files` when in a git checkout
 ```
+
+**Source-filter rules** — when `[project].sources` is set:
+
+- A target with no `sources` field of its own gets the full project baseline.
+- A target with `sources = [...]` gets the union of: its listed sources, every project-baseline file under any directory listed in `includes` / `public_headers`, and any `nixos_modules` paths. Anything in `target.sources` that doesn't appear in the project baseline is a config error (typo / missing extension / forgotten include).
+- Glob syntax is path-aware: `*` (any chars except `/`), `?` (single non-`/`), `**` (zero or more path components), `[abc]` (character class). Globs match against POSIX paths relative to the project root.
+- `excludes` apply after the include set; gitignore filtering applies on top of that when `respect_gitignore` is true and the project root is a git checkout.
+- Use `rigx ls-source <target>` to print the resolved file list and verify what's about to be hashed into a derivation.
+
+For data files alongside code: list the data directory in the target's `includes` field (its contents are bundled into `src` automatically), or omit `target.sources` so the target inherits the full project baseline.
 
 ### `[nixpkgs]`
 
