@@ -463,6 +463,7 @@ class BuildPerAttrIsolation(unittest.TestCase):
         results_iter = iter(mock.Mock(returncode=rc) for rc in codes)
         with mock.patch("rigx.builder.write_flake"), \
              mock.patch("rigx.builder._nix_bin", return_value="/usr/bin/nix"), \
+             mock.patch("rigx.builder._flake_is_tracked", return_value=False), \
              mock.patch(
                  "rigx.builder.subprocess.run",
                  side_effect=lambda *a, **kw: next(results_iter),
