@@ -257,6 +257,12 @@ class CapsuleNixGen(unittest.TestCase):
         )
         self.assertIn('Hostname = "svc"', flake)
         self.assertIn('"5000/tcp" = { }', flake)
+        # /bin/sh -> bash baked into the image root so software that
+        # hardcodes /bin/sh (popen, system(3), `#!/bin/sh` scripts)
+        # works without the user having to ship coreutils + create the
+        # symlink at entrypoint time.
+        self.assertIn("mkdir -p $out/bin", flake)
+        self.assertIn("ln -s ${pkgs.bash}/bin/bash $out/bin/sh", flake)
 
     def test_emits_run_and_shell_runners_with_nix_escapes(self):
         """Bash `${RIGX_NAME}` etc. inside the runner body must be

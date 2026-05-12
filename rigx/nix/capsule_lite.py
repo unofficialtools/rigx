@@ -59,7 +59,13 @@ def mk_lite_capsule_derivation(target: Target, project: Project) -> str:
     lines.append("    mkdir -p $out/nix/var/nix/daemon-socket")
     lines.append("    mkdir -p $out/tmp")
     lines.append("    mkdir -p $out/root")
+    lines.append("    mkdir -p $out/bin")
     lines.append("    chmod 1777 $out/tmp")
+    # /bin/sh -> bash so third-party software that hardcodes /bin/sh
+    # (popen, system(3), `#!/bin/sh` scripts) works without forcing the
+    # user to list coreutils in deps.nixpkgs and rebuild the symlink at
+    # entrypoint time. Bash invoked as `sh` enters POSIX mode.
+    lines.append("    ln -s ${pkgs.bash}/bin/bash $out/bin/sh")
     lines.append("    cat > $out/etc/nix.conf <<NIXCONF")
     lines.append("    store = daemon")
     lines.append("    experimental-features = nix-command flakes")
