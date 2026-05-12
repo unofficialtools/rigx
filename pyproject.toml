@@ -4,12 +4,43 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rigx"
-version = "0.6.5"
+version = "0.7.0"
 description = "A Nix-backed declarative build system"
+readme = "README.md"
 requires-python = ">=3.11"
 authors = [{ name = "Massimo Di Pierro" }]
 license = "BSD-2-Clause"
 license-files = ["LICENSE.md"]
+keywords = [
+    "nix",
+    "build-system",
+    "reproducible-builds",
+    "c",
+    "cpp",
+    "rust",
+    "go",
+    "zig",
+    "nim",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Build Tools",
+]
+
+[project.urls]
+Homepage = "https://github.com/unofficialtools/rigx"
+Issues = "https://github.com/unofficialtools/rigx/issues"
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff", "mypy"]
 
 [project.scripts]
 rigx = "rigx.cli:main"

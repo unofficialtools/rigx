@@ -256,12 +256,26 @@ class Network:
     `with` block (binds proxy listeners, runs test logic, tears down).
     Use as a context manager.
 
+    Supported transports: TCP and UDP. Both have independent port
+    spaces (so the same port number can be used for one of each),
+    independent links, and the same fault chain (`drop_rate`,
+    `delay_ms`, …) applies. UDP-specific notes:
+      - The proxy is connectionless: it tracks src→dst sessions by
+        source `(addr, port)`, with a 60s idle timeout for GC.
+      - `delay_ms` on UDP blocks the forwarding thread for that link
+        (no per-datagram timers in v1) — use sparingly when running
+        many UDP links in parallel.
+      - `wait_for_port` is TCP-only (there is no UDP "accept"); for
+        UDP, send-and-retry from the test or sleep briefly.
+
     Limitations (v1):
-      - TCP only. UDP simulation deferred.
       - L4 byte-level rules. No L2/L3 (no MTU, fragmentation, ARP, …).
       - Topology is fixed at `with`-entry; new links can't be added
         after the testbed is running. Re-enter with a fresh `Network`
         if you need a different shape.
+      - `expose=` external bind on UDP and per-datagram corrupt timing
+        for delayed UDP are partial — see the proxy comments in
+        `_udp_forward` for current behavior.
     """
 
     def __init__(

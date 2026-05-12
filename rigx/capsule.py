@@ -147,6 +147,10 @@ class Capsule:
     # plus a log path so `stop()` and `logs()` know where to look.
     _proc: subprocess.Popen | None = None
     _log_path: Path | None = None
+    # Path to the JSON runtime-spec tempfile, if one was written. The
+    # runner reads `RIGX_RUNTIME_SPEC` at startup; we delete the file
+    # in `stop()` to keep /tmp tidy.
+    _runtime_spec_path: Path | None = None
     _stopped: bool = False
 
     @property
@@ -468,6 +472,54 @@ def start(
             "RIGX_PROJECT_ROOT", str(output.parent.resolve())
         )
 
+    # JSON runtime spec — primary contract since 0.7. Carries env,
+    # publish, publish_udp, volumes, network, name as structured data so
+    # values with commas, newlines, or shell metacharacters round-trip
+    # cleanly. The legacy `RIGX_PUBLISH` / `RIGX_ENV` / `RIGX_VOLUMES`
+    # vars set above are kept as a fallback: a runner without jq, or an
+    # older runner that doesn't read RIGX_RUNTIME_SPEC, still works. New
+    # runners ALSO consume the legacy vars as overrides (the loader uses
+    # `${VAR:-jq_value}`), so anything set before this block wins.
+    spec: dict = {"name": container_name}
+    if network:
+        spec["network"] = network
+    if backend != "qemu":
+        spec["detach"] = True
+    if publish:
+        pub_entries: list[str] = []
+        for cont, mapping in publish.items():
+            for s in _publish_specs(mapping):
+                if isinstance(s, tuple):
+                    pub_entries.append(f"{s[0]}:{s[1]}:{cont}")
+                else:
+                    pub_entries.append(f"{s}:{cont}")
+        spec["publish"] = pub_entries
+    if publish_udp:
+        udp_entries: list[str] = []
+        for cont, mapping in publish_udp.items():
+            for s in _publish_specs(mapping):
+                if isinstance(s, tuple):
+                    udp_entries.append(f"{s[0]}:{s[1]}:{cont}")
+                else:
+                    udp_entries.append(f"{s}:{cont}")
+        spec["publish_udp"] = udp_entries
+    if env:
+        spec["env"] = dict(env)
+    if vols:
+        spec["volumes"] = [f"{h}:{c}:{m}" for h, c, m in vols]
+
+    spec_handle = tempfile.NamedTemporaryFile(
+        mode="w", delete=False,
+        prefix=f"rigx-spec-{name}-",
+        suffix=".json",
+    )
+    spec_path = Path(spec_handle.name)
+    try:
+        json.dump(spec, spec_handle)
+    finally:
+        spec_handle.close()
+    runner_env["RIGX_RUNTIME_SPEC"] = str(spec_path)
+
     proc: subprocess.Popen | None = None
     log_path: Path | None = None
 
@@ -540,13 +592,15 @@ def start(
         volumes=list(vols),
         _proc=proc,
         _log_path=log_path,
+        _runtime_spec_path=spec_path,
     )
     try:
         yield cap
     finally:
         cap.stop()
-        if log_path is not None:
-            try:
-                log_path.unlink()
-            except OSError:
-                pass
+        for tmp in (log_path, spec_path):
+            if tmp is not None:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass

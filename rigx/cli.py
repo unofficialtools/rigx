@@ -1,406 +1,50 @@
-"""Command-line interface for rigx."""
+"""Command-line interface for rigx — argparse wiring only.
+
+Each `cmd_<name>` lives in `rigx.commands.<name>`. They are re-exported
+here so existing callers (`rigx.cli.cmd_build`, `rigx.cli._load`,
+`rigx.cli._build_hint_lines`, `rigx.cli._format_bytes`) continue to work.
+"""
 
 from __future__ import annotations
 
 import argparse
-import json
-import os
 import sys
-from pathlib import Path
 
-from rigx import __version__, builder, config, fmt, graph, nix_gen, scaffold, sources
+from rigx import __version__, config
+from rigx.commands.build import cmd_build
+from rigx.commands.clean import cmd_clean
+from rigx.commands.flake_cmd import cmd_flake
+from rigx.commands.fmt_cmd import cmd_fmt
+from rigx.commands.graph_cmd import cmd_graph
+from rigx.commands.helpers import (
+    attr_to_target as _attr_to_target,
+    build_hint_lines as _build_hint_lines,
+    find_project_root as _find_project_root,
+    format_bytes as _format_bytes,
+    report_build_error as _report_build_error,
+)
 
 
-def _find_project_root(start: Path) -> Path:
-    cur = start.resolve()
-    for candidate in [cur, *cur.parents]:
-        if (candidate / "rigx.toml").is_file():
-            return candidate
-    raise SystemExit(
-        "rigx.toml not found in the current directory or any parent"
-    )
+def _load(args):
+    """Resolve `args.project` to a loaded `Project`.
 
-
-def _load(args: argparse.Namespace) -> config.Project:
+    Defined here (rather than re-exported from `commands.helpers`) so
+    `mock.patch("rigx.cli._load", ...)` in tests overrides every command
+    handler's project load — each `commands/<x>.cmd_*` does a late
+    `from rigx import cli; cli._load(args)` so the lookup hits this
+    module's namespace at call time, not import time."""
+    from pathlib import Path
     root = Path(args.project) if args.project else _find_project_root(Path.cwd())
     return config.load(root)
-
-
-def _report_build_error(e: builder.BuildError) -> None:
-    if isinstance(e, builder.NixNotFoundError):
-        # The message is already multi-line and self-contained.
-        print(str(e), file=sys.stderr)
-    else:
-        print(f"rigx: {e}", file=sys.stderr)
-
-
-def cmd_version(args: argparse.Namespace) -> int:
-    """Print the rigx package version."""
-    print(f"rigx {__version__}")
-    return 0
-
-
-def cmd_build(args: argparse.Namespace) -> int:
-    project = _load(args)
-    try:
-        results = builder.build(project, args.targets, jobs=args.jobs)
-    except builder.BuildError as e:
-        _report_build_error(e)
-        return 1
-    if args.json:
-        # Machine-readable form for CI / scripts. One JSON array per call;
-        # each element is `{attr, output}` (the symlink path under output/).
-        print(json.dumps(
-            [{"attr": a, "output": str(p)} for a, p in results],
-            indent=2,
-        ))
-    else:
-        for attr, link in results:
-            print(f"  {attr} -> {link}")
-            for hint in _build_hint_lines(project, attr, link):
-                print(f"      {hint}")
-    return 0
-
-
-def _attr_to_target(project: config.Project, attr: str) -> config.Target | None:
-    """Reverse-map a Nix attr (`hello`, `hello-debug`, `frontend_app`) to
-    the rigx Target it was built from. Used by `_build_hint_lines` so
-    we can render kind-specific guidance ("run with: …", "shell into:
-    …") after each successful `rigx build`."""
-    for name, target in project.targets.items():
-        sanitized = name.replace(".", "_")
-        if sanitized == attr:
-            return target
-        for vname in target.variants:
-            if f"{sanitized}-{vname}" == attr:
-                return target
-    return None
-
-
-def _build_hint_lines(
-    project: config.Project, attr: str, link: Path
-) -> list[str]:
-    """Return per-kind "what to do with this artifact" lines printed
-    underneath each `attr -> output/...` line. Kept narrow — only kinds
-    where there's a single obvious entry point (executable, capsule,
-    python_script) get hints. Static/shared libraries and `custom`
-    targets get nothing; they're consumed by linking or follow-up
-    scripts, not invoked directly."""
-    target = _attr_to_target(project, attr)
-    if target is None:
-        return []
-    # Render paths relative to cwd so the user can copy-paste — same
-    # framing as the `attr -> link` line above.
-    try:
-        rel = Path(os.path.relpath(link, Path.cwd()))
-    except ValueError:
-        rel = link
-    if target.kind == "executable":
-        return [f"run:   {rel}/bin/{target.name}"]
-    if target.kind == "python_script":
-        return [f"run:   {rel}/bin/{target.name}"]
-    if target.kind == "capsule":
-        # Capsules ship two runners — `run-<name>` boots the entrypoint,
-        # `shell-<name>` drops into bash. Surface both so users discover
-        # the debug path without reading the README.
-        return [
-            f"start: {rel}/bin/run-{target.name}",
-            f"shell: {rel}/bin/shell-{target.name}",
-        ]
-    return []
-
-
-def cmd_lock(args: argparse.Namespace) -> int:
-    project = _load(args)
-    try:
-        builder.update_lock(project)
-    except builder.BuildError as e:
-        _report_build_error(e)
-        return 1
-    print("lock updated")
-    return 0
-
-
-def cmd_list(args: argparse.Namespace) -> int:
-    project = _load(args)
-    kf = args.kind
-    shown = 0
-    for name, target in project.targets.items():
-        if kf and target.kind != kf:
-            continue
-        if target.variants:
-            variants = ", ".join(target.variant_names())
-            print(f"  {name} [{target.kind}] variants: {variants}")
-        else:
-            print(f"  {name} [{target.kind}]")
-        shown += 1
-    # Cross-flake (local-dep) targets, recursively flattened. Shown with the
-    # dotted CLI form so the user can copy-paste into `rigx build`.
-    shown += _list_local_deps(project, prefix="", kind_filter=kf)
-    if kf and shown == 0:
-        print(f"  (no targets with kind={kf!r})", file=sys.stderr)
-    return 0
-
-
-def _list_local_deps(project, prefix: str, kind_filter: str | None = None) -> int:
-    shown = 0
-    for lname, ldep in project.local_deps.items():
-        sub = ldep.sub_project
-        if not sub:
-            continue
-        for tname, target in sub.targets.items():
-            if target.kind in ("script", "testbed"):
-                continue
-            if kind_filter and target.kind != kind_filter:
-                continue
-            qual = f"{prefix}{lname}.{tname}"
-            if target.variants:
-                variants = ", ".join(target.variant_names())
-                print(f"  {qual} [{target.kind}, local-dep] variants: {variants}")
-            else:
-                print(f"  {qual} [{target.kind}, local-dep]")
-            shown += 1
-        shown += _list_local_deps(sub, prefix=f"{prefix}{lname}.", kind_filter=kind_filter)
-    return shown
-
-
-def cmd_clean(args: argparse.Namespace) -> int:
-    project = _load(args)
-    builder.clean(project)
-    print("output/ cleaned")
-    return 0
-
-
-def cmd_flake(args: argparse.Namespace) -> int:
-    """Print the generated flake.nix to stdout (useful for debugging)."""
-    project = _load(args)
-    sys.stdout.write(nix_gen.generate(project))
-    return 0
-
-
-def cmd_graph(args: argparse.Namespace) -> int:
-    """Print a Mermaid `graph TD` for the dep tree of the given target."""
-    project = _load(args)
-    try:
-        sys.stdout.write(graph.mermaid(project, args.target))
-    except ValueError as e:
-        print(f"rigx: {e}", file=sys.stderr)
-        return 1
-    return 0
-
-
-def cmd_watch(args: argparse.Namespace) -> int:
-    """Re-build target(s) whenever a source file changes. Polls every 0.5s,
-    skipping output/, .git, flake.lock — keeps the implementation portable
-    (no inotify/fsevents dependency). Exit with Ctrl-C."""
-    import time
-    project = _load(args)
-    targets = args.targets
-    print(f"[rigx] watching {project.root} (Ctrl-C to stop)")
-
-    def scan() -> float:
-        latest = 0.0
-        skip = {".git", "output", "result", ".rigx"}
-        skip_files = {"flake.lock"}
-        for path in project.root.rglob("*"):
-            if any(part in skip for part in path.relative_to(project.root).parts):
-                continue
-            if path.name in skip_files:
-                continue
-            if path.is_file():
-                m = path.stat().st_mtime
-                if m > latest:
-                    latest = m
-        return latest
-
-    last = scan()
-    # Trigger one build at startup so the user sees current state.
-    try:
-        results = builder.build(project, targets)
-        for attr, link in results:
-            print(f"  {attr} -> {link}")
-        print("[rigx] watching for changes…")
-    except builder.BuildError as e:
-        _report_build_error(e)
-        print("[rigx] (still watching — fix the error to retry)")
-    try:
-        while True:
-            time.sleep(0.5)
-            now = scan()
-            if now > last:
-                last = now
-                print("[rigx] change detected, rebuilding…")
-                try:
-                    results = builder.build(project, targets)
-                    for attr, link in results:
-                        print(f"  {attr} -> {link}")
-                    print("[rigx] OK")
-                except builder.BuildError as e:
-                    _report_build_error(e)
-    except KeyboardInterrupt:
-        print()
-        return 0
-
-
-def cmd_new(args: argparse.Namespace) -> int:
-    """Append a new `[targets.<name>]` block (and stub source files) to the
-    current rigx.toml. Refuses to overwrite existing target names or files."""
-    root = Path(args.project) if args.project else Path.cwd()
-    toml_path = root / "rigx.toml"
-    if not toml_path.is_file():
-        print(
-            f"rigx: no rigx.toml at {toml_path} — create one with a "
-            f"[project] section first.",
-            file=sys.stderr,
-        )
-        return 1
-    # Cheap target-name collision check via TOML parse (we don't need the
-    # full Project graph here — just to know which names are taken).
-    import tomllib
-    with toml_path.open("rb") as f:
-        data = tomllib.load(f)
-    if args.name in data.get("targets", {}):
-        print(
-            f"rigx: target {args.name!r} already exists in {toml_path}",
-            file=sys.stderr,
-        )
-        return 1
-    try:
-        s = scaffold.scaffold(args.kind, args.name, args.language, args.run)
-    except ValueError as e:
-        print(f"rigx: {e}", file=sys.stderr)
-        return 1
-    for rel, body in s.files.items():
-        path = root / rel
-        if path.exists():
-            print(f"rigx: refusing to overwrite existing file {path}", file=sys.stderr)
-            return 1
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(body)
-        print(f"  wrote {rel}")
-    with toml_path.open("a") as f:
-        f.write(s.toml_block)
-    print(f"  appended [targets.{args.name}] to rigx.toml")
-    return 0
-
-
-def cmd_fmt(args: argparse.Namespace) -> int:
-    """Print a canonical reformat of rigx.toml to stdout. With `--write`,
-    overwrite the file in place. Comments are not preserved (tomllib
-    strips them on parse) — pipe through stdout to inspect first."""
-    root = Path(args.project) if args.project else Path.cwd()
-    toml_path = root / "rigx.toml"
-    if not toml_path.is_file():
-        print(f"rigx: no rigx.toml at {toml_path}", file=sys.stderr)
-        return 1
-    canonical = fmt.format_file(toml_path, write=args.write)
-    if not args.write:
-        sys.stdout.write(canonical)
-    return 0
-
-
-def cmd_test(args: argparse.Namespace) -> int:
-    """Discover and run every `kind = "test"` target. Prints a per-test
-    PASS/FAIL line plus a summary; exit code is the worst test exit code."""
-    project = _load(args)
-    try:
-        results = builder.run_tests(
-            project, args.targets or None, jobs=args.jobs,
-        )
-    except builder.BuildError as e:
-        _report_build_error(e)
-        return 1
-    if not results:
-        msg = "no test targets found" if not args.targets else \
-            f"no matching test targets: {args.targets}"
-        print(f"rigx test: {msg}", file=sys.stderr)
-        return 0 if not args.targets else 1
-    passed = [n for n, rc in results if rc == 0]
-    failed = [(n, rc) for n, rc in results if rc != 0]
-    print()
-    for n in passed:
-        print(f"  PASS  {n}")
-    for n, rc in failed:
-        print(f"  FAIL  {n}  (exit {rc})")
-    print(f"\n{len(passed)} passed, {len(failed)} failed")
-    return 0 if not failed else max(rc for _, rc in failed)
-
-
-def cmd_run(args: argparse.Namespace) -> int:
-    """Execute a script- or testbed-kind target (publish, deploy,
-    interactive testbed scenario, …)."""
-    project = _load(args)
-    try:
-        builder.run_named_script(project, args.target, args.script_args)
-    except builder.BuildError as e:
-        _report_build_error(e)
-        return 1
-    return 0
-
-
-def cmd_ls_source(args: argparse.Namespace) -> int:
-    """Print the resolved per-target source set, one path per line, with
-    a `<count> files, <bytes> total` summary on stderr.
-
-    The output is exactly what the generated flake's `src` for that target
-    contains — same code path that `nix_gen` consumes — so it answers
-    "why is this file in my artifact?" without `nix-store --dump`."""
-    project = _load(args)
-    if not sources.project_filtering_enabled(project):
-        print(
-            "rigx: ls-source requires `[project].sources = [...]` to be set "
-            "in rigx.toml — without it, every target's src is the whole "
-            "tree minus a basename blacklist (legacy behavior).",
-            file=sys.stderr,
-        )
-        return 1
-    if args.target not in project.targets:
-        print(
-            f"rigx: target {args.target!r} not found in project",
-            file=sys.stderr,
-        )
-        return 1
-    target = project.targets[args.target]
-    try:
-        files = sources.compute_target_files(project, target)
-    except ValueError as e:
-        print(f"rigx: {e}", file=sys.stderr)
-        return 1
-    total_bytes = 0
-    for rel in files:
-        print(rel)
-        try:
-            total_bytes += (project.root / rel).stat().st_size
-        except OSError:
-            pass
-    print(
-        f"\n{len(files)} files, {_format_bytes(total_bytes)} total.",
-        file=sys.stderr,
-    )
-    return 0
-
-
-def _format_bytes(n: int) -> str:
-    for unit in ("B", "KB", "MB", "GB"):
-        if n < 1024 or unit == "GB":
-            return f"{n:.1f} {unit}" if unit != "B" else f"{n} B"
-        n /= 1024
-    return f"{n} B"
-
-
-def cmd_pkg(args: argparse.Namespace) -> int:
-    """Run any binary from the project's pinned nixpkgs.
-
-    `rigx pkg <attr> [-- args…]` invokes `nix run nixpkgs/<ref>#<attr>` with
-    the args after `--` (or directly after `<attr>`) forwarded verbatim.
-    Useful for one-off tooling — `uv lock`, `jq …`, etc. — without having
-    to declare a `kind = "script"` target."""
-    project = _load(args)
-    try:
-        return builder.run_nixpkgs_tool(project, args.attr, args.pkg_args)
-    except builder.BuildError as e:
-        _report_build_error(e)
-        return 1
+from rigx.commands.list_cmd import cmd_list
+from rigx.commands.lock import cmd_lock
+from rigx.commands.ls_source import cmd_ls_source
+from rigx.commands.new import cmd_new
+from rigx.commands.pkg import cmd_pkg
+from rigx.commands.run_cmd import cmd_run
+from rigx.commands.test_cmd import cmd_test
+from rigx.commands.version_cmd import cmd_version
+from rigx.commands.watch import cmd_watch
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -501,6 +145,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="rebuild on source change (polling, Ctrl-C to stop)",
     )
     sp.add_argument("targets", nargs="*", help="target[@variant] selectors")
+    sp.add_argument(
+        "--watch-all",
+        action="store_true",
+        dest="watch_all",
+        help="watch every file under the project root (legacy behavior); "
+             "by default rigx only watches each target's declared inputs",
+    )
     sp.set_defaults(func=cmd_watch)
 
     sp = sub.add_parser(
@@ -530,8 +181,6 @@ def build_parser() -> argparse.ArgumentParser:
              "(e.g. `rigx run publish [-- args…]`)",
     )
     sp.add_argument("target", help="script or testbed target name")
-    # No script_args declared here — `main()` slices argv on the first `--`
-    # so any flags after it (e.g. `rigx run pub -- --foo`) pass through verbatim.
     sp.set_defaults(func=cmd_run, script_args=[])
 
     sp = sub.add_parser(
@@ -547,8 +196,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="run a nixpkgs binary (e.g. `rigx pkg uv -- lock`)",
     )
     sp.add_argument("attr", help="nixpkgs attr name (uv, jq, ripgrep, …)")
-    # `pkg_args` filled in by `main()` after the manual argv split so any
-    # flags after `--` (or after `<attr>`) reach the underlying tool intact.
     sp.set_defaults(func=cmd_pkg, pkg_args=[])
 
     return p
@@ -556,12 +203,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _split_pkg_passthrough(argv: list[str]) -> tuple[list[str], list[str]] | None:
     """If `rigx pkg <attr> …` is invoked, split off the trailing args for
-    forwarding to the nixpkgs binary.
-
-    Convention: everything after `<attr>` is forwarded; an optional `--`
-    separator is consumed (so `rigx pkg uv -- lock` and `rigx pkg uv lock`
-    are equivalent). Returns None if no `pkg` subcommand or no attr follows.
-    """
+    forwarding to the nixpkgs binary."""
     try:
         i = argv.index("pkg")
     except ValueError:
@@ -579,11 +221,7 @@ def _split_pkg_passthrough(argv: list[str]) -> tuple[list[str], list[str]] | Non
 
 
 def _split_run_passthrough(argv: list[str]) -> tuple[list[str], list[str]] | None:
-    """If `rigx run TARGET -- …` is invoked, split off the post-`--` tail.
-
-    Everything after the first `--` is forwarded to the script as `$1`, `$2`, …
-    Returns None if there's no `run` subcommand or no `--` separator.
-    """
+    """If `rigx run TARGET -- …` is invoked, split off the post-`--` tail."""
     try:
         i = argv.index("run")
     except ValueError:

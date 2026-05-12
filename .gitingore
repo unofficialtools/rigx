@@ -1,7 +1,0 @@
-.*
-*~
-#*
-*.pyc
-*.mp4
-__pycache__
-node_modules
