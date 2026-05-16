@@ -69,6 +69,23 @@ to maintain your own toolchains. Moreover, Rigx supports the unique
 concepts of capsules and testbeds which allow you to orchestrate
 and test distributed applications.
 
+**Why use rigx instead of Cargo?** For a pure Rust project, you
+shouldn't — Cargo is the standard: crates.io, semver resolution,
+incremental per-crate compilation, `cargo test`/`bench`/`doc`, and the
+entire ecosystem assumes it. rigx's `rustc`-based `kind = "executable"`
+is for single-source Rust binaries; it has no crate graph and no
+crates.io integration. Where rigx complements Cargo is (1) polyglot
+projects — if Rust is one component alongside C++, Go, Python, etc.,
+Cargo only covers its slice while rigx describes the whole tree in one
+`rigx.toml`; (2) system-level reproducibility — `Cargo.lock` pins crates
+but not `rustc`, not `openssl`, not `libpq`, whereas rigx pins the
+toolchain and every system dep through `nixpkgs` + `flake.lock`; and
+(3) wrapping a Cargo workspace via `kind = "custom"`, which gives you
+the sandboxed, pinned-toolchain, content-addressed-cached envelope
+around `cargo build`, plus integration into capsules and testbeds.
+Rule of thumb: pure Rust → cargo; Rust plus anything else, or Rust
+where the host environment varies → rigx wrapping cargo.
+
 **How well is it tested?** rigx has more than 300 unit tests covering
 config parsing, Nix generation, capsule construction, the testbed
 proxy, and the CLI workflow.
