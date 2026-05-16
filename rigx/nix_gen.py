@@ -105,7 +105,7 @@ _mk_capsule_derivation = _flake.mk_capsule_derivation
 _mk_derivation = _flake.mk_derivation
 _flake_attrs = _flake.flake_attrs
 _local_dep_url = _flake.local_dep_url
-_per_target_src_let = _flake.per_target_src_let
+_collect_src_bindings = _flake.collect_src_bindings
 _target_block = _flake.target_block
 
 __all__ = ["generate"]

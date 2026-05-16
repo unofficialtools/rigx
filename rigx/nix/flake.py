@@ -335,22 +335,76 @@ def local_dep_url(project: Project, ldep) -> str:
         return f"path:{ldep.path}"
 
 
-def per_target_src_let(target: Target, project: Project) -> str:
-    """Return `"let src = mkSrc \"<name>\" [ ... ]; in "` or `""`."""
+def _emitted_targets(project: Project) -> list[Target]:
+    """Targets that appear under `packages.${system}` and therefore need a
+    `src` binding. Mirrors the filtering done in `generate()`."""
+    out: list[Target] = []
+    for target in project.targets.values():
+        if target.kind in ("script", "testbed"):
+            continue
+        if target.kind == "test" and not target.sandbox:
+            continue
+        out.append(target)
+    return out
+
+
+def collect_src_bindings(
+    project: Project,
+) -> tuple[list[tuple[str, str, list[str]]], dict[str, str]]:
+    """Plan the `src` derivations for the outer let-binding.
+
+    Returns `(bindings, target_ref)`:
+      * `bindings` is a list of `(nix_var, display_name, rels)` tuples to
+        emit as `nix_var = mkSrc "display_name" [ ... ];` in the outer
+        let. Always starts with the project baseline (`projectSrc`); a
+        per-target binding is added only when the target's file set
+        differs from the baseline.
+      * `target_ref` maps each emitted target's qualified name to the
+        nix variable its `src` should resolve to. Targets that match the
+        baseline map to `"projectSrc"` so they share one derivation.
+
+    Both are empty when `[project].sources` filtering is disabled —
+    callers fall back to the legacy `srcRoot` path.
+    """
     if not sources.project_filtering_enabled(project):
-        return ""
-    files = sources.compute_target_files(project, target)
-    rels = sorted(set(files) | set(sources.ancestor_dirs(files)))
-    quoted = " ".join(nix_str(r) for r in rels)
-    return (
-        f"let src = mkSrc {nix_str(target.qualified_name)} "
-        f"[ {quoted} ]; in "
-    )
+        return [], {}
+
+    base = sources.compute_project_files(project)
+    base_set = set(base)
+    target_ref: dict[str, str] = {}
+    per_target: list[tuple[str, str, list[str]]] = []
+    baseline_used = False
+
+    for target in _emitted_targets(project):
+        files = sources.compute_target_files(project, target)
+        if set(files) == base_set:
+            target_ref[target.qualified_name] = "projectSrc"
+            baseline_used = True
+            continue
+        rels = sorted(set(files) | set(sources.ancestor_dirs(files)))
+        var = "srcs__" + nix_id(target.qualified_name)
+        per_target.append((var, target.qualified_name, rels))
+        target_ref[target.qualified_name] = var
+
+    bindings: list[tuple[str, str, list[str]]] = []
+    if baseline_used:
+        base_rels = sorted(base_set | set(sources.ancestor_dirs(base)))
+        bindings.append(("projectSrc", "project", base_rels))
+    bindings.extend(per_target)
+    return bindings, target_ref
 
 
-def target_block(target: Target, project: Project) -> str:
+def target_block(
+    target: Target,
+    project: Project,
+    src_ref: str = "",
+) -> str:
+    """Render a target's attrset entries. `src_ref` is the outer-let
+    variable that this target's `src` should bind to (e.g. `"projectSrc"`
+    or `"srcs__exe"`); empty when source-filtering is disabled, in which
+    case `src` comes from the enclosing `packages.${system}` let."""
     attr_base = nix_id(target.qualified_name)
-    src_let = per_target_src_let(target, project)
+    src_let = f"let src = {src_ref}; in " if src_ref else ""
     if not target.variants:
         body = mk_derivation(target, None, project)
         return f"{attr_base} = {src_let}{body};"
@@ -389,7 +443,9 @@ def generate(project: Project) -> str:
     w("    let")
     w('      systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];')
     w("      forAll = f: nixpkgs.lib.genAttrs systems f;")
-    if sources.project_filtering_enabled(project):
+    filtering_enabled = sources.project_filtering_enabled(project)
+    src_bindings, target_ref = collect_src_bindings(project)
+    if filtering_enabled:
         w("      mkSrc = name: rels:")
         w("        let")
         w("          allowed = builtins.listToAttrs (")
@@ -409,6 +465,9 @@ def generate(project: Project) -> str:
         w("                    else builtins.substring prefixLen (-1) ps;")
         w("            in rel == \"\" || builtins.hasAttr rel allowed;")
         w("        };")
+        for var, display, rels in src_bindings:
+            quoted = " ".join(nix_str(r) for r in rels)
+            w(f"      {var} = mkSrc {nix_str(display)} [ {quoted} ];")
     else:
         w("      srcRoot = builtins.path {")
         w("        path = ./.;")
@@ -424,7 +483,7 @@ def generate(project: Project) -> str:
     w("      packages = forAll (system:")
     w("        let")
     w("          pkgs = import nixpkgs { inherit system; };")
-    if not sources.project_filtering_enabled(project):
+    if not filtering_enabled:
         w("          src = srcRoot;")
     w("        in rec {")
 
@@ -433,7 +492,7 @@ def generate(project: Project) -> str:
             continue
         if target.kind == "test" and not target.sandbox:
             continue
-        block = target_block(target, project)
+        block = target_block(target, project, target_ref.get(target.qualified_name, ""))
         w(indent(block, 10))
 
     for lname, ldep in project.local_deps.items():
