@@ -56,15 +56,13 @@ VALID_KINDS = {
     "test",
     "testbed",
     "capsule",
-    "generated_source",
 }
 
-# `kind = "generated_source"` runs a command at build time to produce one or
-# more output files (any extension — generated source code, protobuf
-# bindings, fcslc Nim modules, OpenAPI clients, generated headers,
-# proto-compiled libs, etc.). The result is a Nix store path downstream
-# targets reference via `${target}/<file>`. Cacheable, sandboxed,
-# composable across languages.
+# Code generation is a `kind = "custom"` target whose `install_script`
+# writes the generated files into `$out`. Downstream targets reference
+# those files via `${<gen-target>}/<file>` in any interpolated field
+# (sources, includes, flags, …) — the dep edge is auto-derived from the
+# interpolation (see `_scan_interpolated_refs`).
 
 # Bucket names allowed in `[external_inputs.<name>].buckets` — kept as a
 # permissive POSIX identifier pattern so users can declare whatever
@@ -302,17 +300,7 @@ class Target:
     python_venv_extra: list[str] = field(default_factory=list)
     run: str | None = None                          # for kind = "run"
     args: list[str] = field(default_factory=list)   # for kind = "run"
-    outputs: list[str] = field(default_factory=list)  # for kind = "run" + "generated_source"
-    # `kind = "generated_source"` only. `inputs` lists project-relative
-    # source files passed to the generator; `command` is the shell line
-    # that produces files into `$out`. Inside `command`, `$inputs`
-    # expands to the space-joined input paths and `${dep}` interpolates
-    # rigx-built deps' store paths (same convention as `custom`/`run`).
-    # The generator's output store path is exposed to downstream targets
-    # as `${<this-target>}/<file>` — usable in any field that supports
-    # interpolation (sources, includes, flags, etc.).
-    inputs: list[str] = field(default_factory=list)
-    command: str = ""
+    outputs: list[str] = field(default_factory=list)  # for kind = "run"
     build_script: str | None = None                 # for kind = "custom"
     install_script: str | None = None               # for kind = "custom"
     native_build_inputs: list[str] = field(default_factory=list)  # nixpkgs attrs
@@ -585,8 +573,8 @@ def _expand_globs(
     `frontend/src/main.cpp` relative to the parent root.
 
     Entries that start with `${` are Nix-style interpolations (e.g. a
-    `generated_source` reference like `${gen}/foo.nim`) and pass through
-    untouched — no filesystem lookup, no prefix prepended."""
+    reference into a `custom` target's `$out` like `${gen}/foo.nim`) and
+    pass through untouched — no filesystem lookup, no prefix prepended."""
     out: list[str] = []
     for item in items:
         if item.startswith("${"):
@@ -890,17 +878,6 @@ def _build_target(
     )
     user = str(tconf.get("user", "") or "")
 
-    # `generated_source` inputs: globbed like sources, project-relative
-    # paths to the source files the command reads. `command` is a free-form
-    # shell line; same `${dep}` interpolation rules as `custom`/`run`.
-    inputs = _expand_globs(
-        _expand_list(tconf.get("inputs", []), vars_table, f"{tctx}.inputs"),
-        glob_root,
-        f"{tctx}.inputs",
-        output_prefix=path_prefix,
-    )
-    command = str(tconf.get("command", "") or "")
-
     return Target(
         name=tname,
         kind=kind,
@@ -942,8 +919,6 @@ def _build_target(
         nixos_modules=nixos_modules,
         volumes=volumes,
         user=user,
-        inputs=inputs,
-        command=command,
         variants=variants,
         namespace=namespace,
     )
@@ -1431,10 +1406,10 @@ def _load(root: Path, _visited: set[Path]) -> Project:
     # (b) a `<localdep>.<target>` cross-flake ref into a sibling project.
     for qname, target in targets.items():
         # Auto-derive deps.internal from `${<name>}` interpolations in
-        # `sources`. Lets the user write a `generated_source` reference
-        # like `sources = ["${gen}/foo.nim"]` without also restating
-        # `deps.internal = ["gen"]` — the interpolation already names
-        # the producer, so the dep is implied.
+        # `sources`. Lets the user write `sources = ["${gen}/foo.nim"]`
+        # — pointing into a sibling `custom` target's `$out` — without
+        # also restating `deps.internal = ["gen"]`; the interpolation
+        # already names the producer, so the dep is implied.
         for ref in _scan_interpolated_refs(target.sources):
             if ref in targets and ref not in target.deps.internal:
                 target.deps.internal.append(ref)
@@ -1483,20 +1458,6 @@ def _load(root: Path, _visited: set[Path]) -> Project:
                     f"target {tname}: kind='testbed' requires 'script' "
                     f"(an interactive host-side scenario; runs via "
                     f"`rigx run {tname}`)"
-                )
-        if target.kind == "generated_source":
-            if not target.command:
-                raise ConfigError(
-                    f"target {qname}: kind='generated_source' requires "
-                    f"'command' (shell line that writes files into $out; "
-                    f"use $inputs for the source list and ${{<dep>}} to "
-                    f"interpolate rigx-built deps)"
-                )
-            if not target.outputs:
-                raise ConfigError(
-                    f"target {qname}: kind='generated_source' requires "
-                    f"'outputs' (files the command writes into $out — "
-                    f"verified after the command runs)"
                 )
         if target.kind == "run":
             if not target.run:

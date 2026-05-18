@@ -753,32 +753,18 @@ class CrossCompilation(unittest.TestCase):
         self.assertIn("pkgs.pkgsCross.aarch64-multiplatform.stdenv", out)
 
 
-class GenerateGeneratedSource(unittest.TestCase):
-    def test_basic_command_and_outputs(self):
-        gen = Target(
-            name="bindings",
-            kind="generated_source",
-            inputs=["schema.json"],
-            command="protoc $inputs --out=$out",
-            outputs=["bindings.py"],
-            deps=TargetDeps(nixpkgs=["protobuf"]),
-        )
-        out = nix_gen.generate(_project(targets={"bindings": gen}))
-        self.assertIn('pname = "bindings"', out)
-        self.assertIn("pkgs.protobuf", out)
-        self.assertIn('inputs="schema.json"', out)
-        self.assertIn("protoc $inputs --out=$out", out)
-        # Output existence is asserted as part of the install phase.
-        self.assertIn("test -e $out/bindings.py", out)
+class GenerateCodeGenViaCustom(unittest.TestCase):
+    """Code generation is a `custom` target whose `install_script` writes the
+    generated files into `$out`. Downstream targets reference those files via
+    `${gen}/foo.ext` in their `sources`; the resulting flake routes the
+    interpolation through the rec scope so Nix substitutes the generator's
+    store path at eval time."""
 
     def test_downstream_source_interpolation_rewrites(self):
-        # Downstream's `sources = ["${gen}/foo.nim"]` survives codegen as
-        # `${gen}/foo.nim` (still a Nix interp into the rec scope).
         gen = Target(
             name="gen",
-            kind="generated_source",
-            command="echo > $out/foo.nim",
-            outputs=["foo.nim"],
+            kind="custom",
+            install_script="mkdir -p $out && echo > $out/foo.nim",
         )
         downstream = Target(
             name="app",
@@ -793,19 +779,6 @@ class GenerateGeneratedSource(unittest.TestCase):
         self.assertIn("${gen}/foo.nim", out)
         # `gen` is a rec attr in the same packages set.
         self.assertIn("gen = ", out)
-
-    def test_outputs_can_be_arbitrary_files(self):
-        # generated_source outputs aren't restricted to source code — any
-        # filename works (headers, binaries, configs, …).
-        gen = Target(
-            name="assets",
-            kind="generated_source",
-            command="cp foo.txt $out/data.bin && cp bar.txt $out/info.json",
-            outputs=["data.bin", "info.json"],
-        )
-        out = nix_gen.generate(_project(targets={"assets": gen}))
-        self.assertIn("test -e $out/data.bin", out)
-        self.assertIn("test -e $out/info.json", out)
 
 
 class GenerateExternalInputs(unittest.TestCase):

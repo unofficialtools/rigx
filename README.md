@@ -179,10 +179,12 @@ What's different:
 - **Multi-folder projects**: split a project into subfolders via
   `[modules]` (merged into one flake) or `[dependencies.local.*]` (each
   subfolder is its own flake, parent depends on built artifacts).
-- **Code generation as first-class targets** via `kind =
-  "generated_source"`: a cacheable derivation that runs a tool
-  (protoc, fcslc, OpenAPI, …) to produce files downstream targets
-  reference via `${gen}/foo.ext` — works in any language.
+- **Code generation as ordinary builds**: a `kind = "custom"` target
+  whose `install_script` runs your generator (protoc, fcslc, OpenAPI,
+  …) and writes the result into `$out`. Downstream targets pick the
+  files up by writing `${gen}/foo.ext` into `sources` / `includes` /
+  `flags`; the dep edge is auto-derived from the interpolation, so no
+  restating required. Works in any language.
 - **Host-provided binary inputs** via `[external_inputs.*]`: wire
   vendor SDKs / system libs into the sandbox by env-var, with
   optional content-hash pinning so builds break loudly when the host
@@ -891,59 +893,6 @@ outputs        = ["extracted"]       # directory; cp -r handles it
   evaluation time.
 - `outputs` are captured with `cp -r`, so directories work.
 
-### `generated_source` — run a tool to produce files used by other targets
-
-A cacheable derivation that runs a command at build time to produce one or
-more files (any kind — Nim modules, protobuf bindings, OpenAPI clients,
-generated headers, compiled assets, …). Downstream targets reference the
-files inside via `${<this-target>}/<file>`, so the dep edge is implicit
-when written into `sources` / `includes` / `flags`.
-
-```toml
-# Generate Nim bindings from a JSON schema using an in-tree compiler.
-[targets.lander-control-zenoh-nim]
-kind          = "generated_source"
-deps.internal = ["fcslc"]
-inputs        = ["examples/lander/fc/lander_control_zenoh.json"]
-command       = "${fcslc}/bin/fcslc $inputs -o $out/lander_control_zenoh.nim"
-outputs       = ["lander_control_zenoh.nim"]
-
-# Downstream target picks the generated file up by name.
-[targets.lander-fcsl-zenoh-binary]
-kind     = "executable"
-language = "nim"
-sources  = ["${lander-control-zenoh-nim}/lander_control_zenoh.nim"]
-```
-
-Mechanics:
-
-- `inputs` — project-relative file paths the command will read. Globbed
-  the same way as `sources`. Available to the command as `$inputs` (a
-  space-joined list).
-- `command` — a free-form shell line. Writes its results into `$out`.
-  `${dep}` interpolations resolve rigx-built deps (same convention as
-  `custom`/`run`); `${ext.bucket}` resolves
-  [`[external_inputs]`](#external_inputsname).
-- `outputs` — the files (or directories) the command is expected to
-  produce under `$out`. Each entry is verified to exist after the command
-  runs; a missing one fails the build with a clear error.
-- `deps.nixpkgs` / `deps.git` bring tools onto PATH inside the sandbox;
-  `deps.internal` exposes built deps for `${dep}` interpolation.
-
-The result is a Nix derivation like any other:
-
-- **Cacheable.** Same `inputs` + `command` + dep closure → same store
-  path → no rebuild.
-- **Sandboxed.** No host filesystem, no network — only `inputs`, deps,
-  and `nixpkgs` tools.
-- **Composable.** A downstream target referencing
-  `${gen-target}/foo.nim` in `sources` (or `${gen-target}/foo.h` in
-  `includes`) implicitly gets `gen-target` added to its `deps.internal`,
-  so the dep edge needs no manual restating.
-- **Polyglot.** Works for protobuf, capnp, fcslc, OpenAPI, ROS message
-  generation, or any other code-gen step in any language — outputs
-  aren't restricted to source code.
-
 ### `custom` — user-supplied build/install scripts (escape hatch)
 
 Use `custom` when the first-class kinds aren't enough — e.g. a Cargo
@@ -979,6 +928,39 @@ tar -C $TMPDIR -czf $out/release.tar.gz release
   PATH and their libraries/headers are on the usual compile/link paths.
 - Literal `${` inside a script must be written as `''${` (Nix indented-string
   escape) because `${var}` is interpreted by Nix.
+
+#### Code generation with `custom`
+
+Code-generation steps (protoc, capnp, OpenAPI, fcslc, ROS message
+generation, …) are just `custom` targets whose `install_script` writes the
+generated files into `$out`. Downstream targets reference the produced
+files via `${<gen-target>}/<file>` in `sources` / `includes` / `flags`;
+the dep edge is auto-derived from the interpolation (the producer's name
+appears in the path), so no `deps.internal` restatement is needed.
+
+```toml
+# Generate Nim bindings from a JSON schema using an in-tree compiler.
+[targets.lander-control-zenoh-nim]
+kind           = "custom"
+deps.internal  = ["fcslc"]
+sources        = ["examples/lander/fc/lander_control_zenoh.json"]
+install_script = """
+mkdir -p $out
+${fcslc}/bin/fcslc examples/lander/fc/lander_control_zenoh.json \\
+  -o $out/lander_control_zenoh.nim
+"""
+
+# Downstream target picks the generated file up by name. The interpolation
+# implicitly adds `lander-control-zenoh-nim` to this target's deps.internal.
+[targets.lander-fcsl-zenoh-binary]
+kind     = "executable"
+language = "nim"
+sources  = ["${lander-control-zenoh-nim}/lander_control_zenoh.nim"]
+```
+
+Mechanics are exactly those of any other `custom` build — cacheable on
+input hash, sandboxed (no host filesystem, no network), composable
+across languages.
 
 ### `script` — host-side task (publish, deploy, release)
 

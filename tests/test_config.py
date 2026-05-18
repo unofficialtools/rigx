@@ -377,65 +377,21 @@ class ValidationErrors(unittest.TestCase):
                 config.load(root)
 
 
-class GeneratedSource(unittest.TestCase):
-    def test_parses_inputs_and_command(self):
-        body = """
-            [project]
-            name = "p"
-
-            [targets.gen]
-            kind    = "generated_source"
-            inputs  = ["schema.json"]
-            command = "tool $inputs -o $out/out.nim"
-            outputs = ["out.nim"]
-        """
-        with TempProject(body) as root:
-            (root / "schema.json").write_text("{}")
-            proj = config.load(root)
-        t = proj.targets["gen"]
-        self.assertEqual(t.kind, "generated_source")
-        self.assertEqual(t.inputs, ["schema.json"])
-        self.assertEqual(t.outputs, ["out.nim"])
-        self.assertIn("$inputs", t.command)
-
-    def test_missing_command_raises(self):
-        body = """
-            [project]
-            name = "p"
-
-            [targets.gen]
-            kind    = "generated_source"
-            outputs = ["x"]
-        """
-        with TempProject(body) as root:
-            with self.assertRaisesRegex(ConfigError, "requires 'command'"):
-                config.load(root)
-
-    def test_missing_outputs_raises(self):
-        body = """
-            [project]
-            name = "p"
-
-            [targets.gen]
-            kind    = "generated_source"
-            command = "true"
-        """
-        with TempProject(body) as root:
-            with self.assertRaisesRegex(ConfigError, "requires 'outputs'"):
-                config.load(root)
+class GeneratedSourceViaCustom(unittest.TestCase):
+    """A `custom` target whose `install_script` writes generated source files
+    into `$out` is the canonical code-gen pattern. Downstream consumers point
+    at the produced files with `${gen}/foo.ext` in their `sources` — the dep
+    edge is auto-derived from the interpolation, so no explicit
+    `deps.internal` restatement is required."""
 
     def test_source_interpolation_auto_qualifies_internal_dep(self):
-        # `sources = ["${gen}/foo.nim"]` should imply `deps.internal = ["gen"]`
-        # — the user wrote the producer's name in the interpolation, so the
-        # dep edge is implied. No need to restate it.
         body = """
             [project]
             name = "p"
 
             [targets.gen]
-            kind    = "generated_source"
-            command = "echo hi > $out/foo.nim"
-            outputs = ["foo.nim"]
+            kind           = "custom"
+            install_script = "mkdir -p $out && echo hi > $out/foo.nim"
 
             [targets.app]
             kind     = "executable"
@@ -445,7 +401,7 @@ class GeneratedSource(unittest.TestCase):
         with TempProject(body) as root:
             proj = config.load(root)
         self.assertIn("gen", proj.targets["app"].deps.internal)
-        # And the source entry passes through verbatim (no on-disk glob).
+        # The source entry passes through verbatim (no on-disk glob).
         self.assertEqual(proj.targets["app"].sources, ["${gen}/foo.nim"])
 
 

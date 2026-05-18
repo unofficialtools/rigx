@@ -218,61 +218,6 @@ def _external_input_bindings(project: Project) -> list[str]:
     return lines
 
 
-def mk_generated_source_derivation(target: Target, project: Project) -> str:
-    """Pass-through derivation that runs a user command to produce files.
-
-    The command sees `$inputs` (space-joined input paths, relative to the
-    derivation's `$src`) and `$out` (the output store directory the command
-    should populate). Internal/external deps interpolate via `${dep}` /
-    `${dep.bucket}`. After the command runs, every entry in `outputs` is
-    verified to exist under `$out` — a missing one fails the build with a
-    clear pointer at what wasn't produced."""
-    if not target.command:
-        raise ValueError(
-            f"generated_source {target.qualified_name!r}: missing command"
-        )
-    inputs_exprs = build_inputs(target, project)
-    native = [f"pkgs.{p}" for p in target.native_build_inputs]
-    # Build the inputs assignment as a single bash-double-quoted string so
-    # `$inputs` (unquoted) word-splits across the input paths inside the
-    # user's command. Paths with spaces aren't supported here — every other
-    # `sources`-style field in rigx makes the same assumption.
-    quoted_inputs = " ".join(target.inputs)
-    cmd_body = rewrite_interp(target.command.strip("\n"), project)
-
-    lines = [
-        "pkgs.stdenv.mkDerivation {",
-        f"  pname = {nix_str(target.qualified_name)};",
-        f"  version = {nix_str(project.version)};",
-        "  inherit src;",
-        f"  buildInputs = {nix_list(inputs_exprs)};",
-    ]
-    if native:
-        lines.append(f"  nativeBuildInputs = {nix_list(native)};")
-    lines.extend([
-        "  dontConfigure = true;",
-        "  dontBuild = true;",
-        "  installPhase = ''",
-        "    runHook preInstall",
-        "    mkdir -p $out",
-        f'    inputs="{quoted_inputs}"',
-        f"    {cmd_body}",
-    ])
-    for out in target.outputs:
-        lines.append(
-            f"    test -e $out/{out} || "
-            f"{{ echo \"generated_source {target.qualified_name}: "
-            f"command did not produce expected output {out!r}\" >&2; "
-            f"exit 1; }}"
-        )
-    lines.extend([
-        "    runHook postInstall",
-        "  '';",
-        "}",
-    ])
-    return "\n".join(lines)
-
-
 def mk_capsule_derivation(target: Target, project: Project) -> str:
     """Dispatch a `kind = "capsule"` target to its backend-specific builder."""
     if target.backend == "lite":
@@ -298,8 +243,6 @@ def mk_derivation(
         return mk_custom_derivation(target, project)
     if target.kind == "capsule":
         return mk_capsule_derivation(target, project)
-    if target.kind == "generated_source":
-        return mk_generated_source_derivation(target, project)
 
     pname = (
         target.qualified_name
