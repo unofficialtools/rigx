@@ -215,6 +215,15 @@ class ExternalInput:
     hashes whatever it finds and rigx prints a WARN — reproducible
     across runs of the same host, but silently drifts if the host
     blob is updated.
+
+    `lazy = true` defers env-var + `require_files` validation until a
+    target that lists this input in `deps.external` is in the
+    requested target set. Use it for inputs whose env vars only need
+    to be set on the host where their consumer is actually built —
+    e.g. a cross-compile SDK that's only present on CI, or an
+    aarch64 vendor blob that's irrelevant when developing an
+    unrelated x86 target. Non-lazy inputs (the default) are still
+    validated eagerly at config-load.
     """
     name: str
     # `bucket-name → env-var-name`. Bucket names are free-form; what
@@ -224,8 +233,16 @@ class ExternalInput:
     # Optional `bucket-name → sha256` pinning. Buckets without an
     # entry hash whatever's on disk and warn.
     sha256: dict[str, str] = field(default_factory=dict)
-    # Resolved at config-load time: `bucket-name → host directory`.
+    # Resolved at config-load time (non-lazy) or at first-consumer
+    # time (lazy): `bucket-name → host directory`. Empty until
+    # `resolve_external_inputs(...)` runs for a lazy input.
     bucket_paths: dict[str, str] = field(default_factory=dict)
+    # When true, env-var lookup + `require_files` existence checks are
+    # deferred until a target with `deps.external = [<this-name>]` is
+    # requested. Lets a project ship one rigx.toml that documents
+    # every host-provided input without forcing every developer to
+    # set every env var.
+    lazy: bool = False
 
 
 @dataclass
@@ -989,6 +1006,63 @@ def load(root: Path) -> Project:
     return _load(root.resolve(), _visited=set())
 
 
+def resolve_external_inputs(
+    project: Project, target_names: list[str] | None = None,
+) -> None:
+    """Validate any `lazy = true` external inputs reachable from the
+    requested target set, in place on `project.external_inputs`.
+
+    `target_names`:
+      - `None` or `[]` → resolve every lazy input referenced by any
+        target in the project (used by `rigx flake` and `rigx build`
+        with no args, which materialize the whole flake).
+      - otherwise → walk each named target's `deps.internal` closure
+        (intra-project edges only — cross-flake refs land in another
+        project's `external_inputs`, not ours) and resolve any lazy
+        input that any reached target lists in `deps.external`.
+
+    Idempotent: a lazy input whose `bucket_paths` is already populated
+    is skipped. Non-lazy inputs were resolved at parse time and stay
+    untouched."""
+    if not project.external_inputs:
+        return
+
+    if not target_names:
+        reached = set(project.targets.keys())
+    else:
+        reached: set[str] = set()
+        pending = [n for n in target_names if n in project.targets]
+        while pending:
+            cur = pending.pop()
+            if cur in reached:
+                continue
+            reached.add(cur)
+            target = project.targets[cur]
+            # Only follow refs that resolve to another target in this
+            # project. Cross-flake refs (`localdep.attr`) and bare
+            # nixpkgs / git deps don't contribute external_inputs here.
+            for d in target.deps.internal:
+                if d in project.targets and d not in reached:
+                    pending.append(d)
+            if (
+                target.run
+                and target.run in project.targets
+                and target.run not in reached
+            ):
+                pending.append(target.run)
+
+    needed: set[str] = set()
+    for tname in reached:
+        for d in project.targets[tname].deps.external:
+            needed.add(d)
+
+    for ename in needed:
+        ext = project.external_inputs.get(ename)
+        if ext is None or not ext.lazy or ext.bucket_paths:
+            continue
+        _resolve_external_input(ext, f"external_inputs.{ename}")
+
+
 def _parse_git_deps(section: dict, source_label: str) -> dict[str, GitDep]:
     out: dict[str, GitDep] = {}
     for gname, gconf in section.items():
@@ -1172,9 +1246,12 @@ def _parse_external_inputs(
     layer can splice them into `builtins.path` expressions. A missing
     env var or missing file is a config error with a clear pointer at
     what's wrong — better to fail fast at `rigx.toml`-load than to
-    produce a flake that explodes at eval."""
-    import os
-    import sys
+    produce a flake that explodes at eval.
+
+    Entries with `lazy = true` skip the env-var + `require_files`
+    checks at parse time; the deferred resolution happens via
+    `resolve_external_inputs(project, target_names)` once a consumer
+    is known to be in the requested target set."""
 
     if section is None or section == {}:
         return {}
@@ -1189,11 +1266,16 @@ def _parse_external_inputs(
             raise ConfigError(
                 f"{ectx}: must be a table (got {type(econf).__name__})"
             )
-        unknown = set(econf.keys()) - {"buckets", "require_files", "sha256"}
+        unknown = set(econf.keys()) - {"buckets", "require_files", "sha256", "lazy"}
         if unknown:
             raise ConfigError(
                 f"{ectx}: unknown keys {sorted(unknown)} "
-                f"(allowed: buckets, require_files, sha256)"
+                f"(allowed: buckets, require_files, sha256, lazy)"
+            )
+        lazy_raw = econf.get("lazy", False)
+        if not isinstance(lazy_raw, bool):
+            raise ConfigError(
+                f"{ectx}: 'lazy' must be a bool (got {type(lazy_raw).__name__})"
             )
         buckets_raw = econf.get("buckets", {})
         if not isinstance(buckets_raw, dict) or not buckets_raw:
@@ -1258,56 +1340,77 @@ def _parse_external_inputs(
                 f"<bucket> -> <hash> table"
             )
 
-        # Resolve env vars and verify each require_files entry.
-        bucket_paths: dict[str, str] = {}
-        for bname, env_name in buckets.items():
-            value = os.environ.get(env_name, "")
-            if not value:
-                raise ConfigError(
-                    f"{ectx}: env var {env_name!r} is not set — needed to "
-                    f"locate the {bname!r} bucket for external input "
-                    f"'{ename}'"
-                )
-            bucket_paths[bname] = value
-
-        for spec in require_files:
-            if "@" not in spec:
-                raise ConfigError(
-                    f"{ectx}: require_files entry {spec!r} must be of the "
-                    f"form '<filename>@<bucket>'"
-                )
-            filename, bucket = spec.rsplit("@", 1)
-            if bucket not in buckets:
-                raise ConfigError(
-                    f"{ectx}: require_files entry {spec!r} references "
-                    f"bucket {bucket!r}, but no such bucket is declared "
-                    f"(known buckets: {sorted(buckets)})"
-                )
-            full = Path(bucket_paths[bucket]) / filename
-            if not full.is_file():
-                raise ConfigError(
-                    f"{ectx}: require_files entry {spec!r} not found at "
-                    f"{full} (resolved from ${buckets[bucket]} = "
-                    f"{bucket_paths[bucket]!r})"
-                )
-        out[ename] = ExternalInput(
+        ext = ExternalInput(
             name=ename,
             buckets=buckets,
             require_files=list(require_files),
             sha256=sha256,
-            bucket_paths=bucket_paths,
+            bucket_paths={},
+            lazy=lazy_raw,
         )
-        unpinned = [b for b in buckets if b not in sha256]
-        if unpinned:
-            print(
-                f"[rigx] WARN: external_inputs.{ename} bucket(s) "
-                f"{unpinned} have no `sha256` — rigx will hash whatever "
-                f"is at the host paths, so the build silently drifts if "
-                f"the blob changes. Set `sha256 = {{ <bucket> = \"…\" }}` "
-                f"to pin.",
-                file=sys.stderr,
-            )
+        if not ext.lazy:
+            _resolve_external_input(ext, ectx)
+        out[ename] = ext
     return out
+
+
+def _resolve_external_input(ext: ExternalInput, ectx: str) -> None:
+    """Look up each bucket's env var on the host, verify `require_files`
+    exists on disk, and populate `ext.bucket_paths`. Raises `ConfigError`
+    with a clear pointer at what's wrong on failure.
+
+    Called eagerly at parse time for non-lazy inputs and at consumer-
+    request time for lazy ones; both paths share this so error
+    messages, WARN behavior, and `bucket_paths` layout stay identical."""
+    import os
+    import sys
+
+    if ext.bucket_paths:
+        return  # already resolved (idempotent for lazy double-call)
+
+    bucket_paths: dict[str, str] = {}
+    for bname, env_name in ext.buckets.items():
+        value = os.environ.get(env_name, "")
+        if not value:
+            raise ConfigError(
+                f"{ectx}: env var {env_name!r} is not set — needed to "
+                f"locate the {bname!r} bucket for external input "
+                f"'{ext.name}'"
+            )
+        bucket_paths[bname] = value
+
+    for spec in ext.require_files:
+        if "@" not in spec:
+            raise ConfigError(
+                f"{ectx}: require_files entry {spec!r} must be of the "
+                f"form '<filename>@<bucket>'"
+            )
+        filename, bucket = spec.rsplit("@", 1)
+        if bucket not in ext.buckets:
+            raise ConfigError(
+                f"{ectx}: require_files entry {spec!r} references "
+                f"bucket {bucket!r}, but no such bucket is declared "
+                f"(known buckets: {sorted(ext.buckets)})"
+            )
+        full = Path(bucket_paths[bucket]) / filename
+        if not full.is_file():
+            raise ConfigError(
+                f"{ectx}: require_files entry {spec!r} not found at "
+                f"{full} (resolved from ${ext.buckets[bucket]} = "
+                f"{bucket_paths[bucket]!r})"
+            )
+    ext.bucket_paths = bucket_paths
+
+    unpinned = [b for b in ext.buckets if b not in ext.sha256]
+    if unpinned:
+        print(
+            f"[rigx] WARN: external_inputs.{ext.name} bucket(s) "
+            f"{unpinned} have no `sha256` — rigx will hash whatever "
+            f"is at the host paths, so the build silently drifts if "
+            f"the blob changes. Set `sha256 = {{ <bucket> = \"…\" }}` "
+            f"to pin.",
+            file=sys.stderr,
+        )
 
 
 def _load(root: Path, _visited: set[Path]) -> Project:

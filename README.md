@@ -543,6 +543,14 @@ How it works:
 - `sha256` is optional. **Set it.** When unset, rigx hashes whatever it
   finds and prints a WARN — reproducible across runs on the same host,
   but silently drifts if the host blob is updated.
+- `lazy = true` defers env-var + `require_files` validation until a
+  target with `deps.external = ["<this-name>"]` is in the requested
+  target set. Use it when one rigx.toml documents inputs that only some
+  developers / CI hosts have set up — e.g. an aarch64 vendor SDK that's
+  irrelevant when building unrelated x86 targets. Lazy inputs still
+  validate eagerly (env var, files, sha256 WARN) the moment a consumer
+  is requested, so the diagnostic stays the same; you just don't pay
+  for it on `rigx build other-target`.
 
 Targets opt in via `deps.external` and reference the resolved paths with
 `${<name>.<bucket>}`:

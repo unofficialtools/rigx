@@ -10,7 +10,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from rigx import nix_gen
-from rigx.config import Project
+from rigx.config import Project, resolve_external_inputs
 
 OUTPUT_DIR = "output"
 FLAKE_FILE = "flake.nix"
@@ -303,6 +303,9 @@ def run_named_script(
             f"target {name!r} (kind={target.kind!r}) is not a script or "
             f"testbed target; use `rigx build {name}` instead"
         )
+    # Scripts and testbeds can reference `${X.bucket}` from deps.external
+    # via shell interpolation; resolve any lazy inputs for this target now.
+    resolve_external_inputs(project, [name])
     print(f"[rigx] running {name}")
     rc = run_script_target(project, target, extra_args)
     if rc != 0:
@@ -348,6 +351,11 @@ def run_tests(
 
     if not host_tests and not sandboxed:
         return []
+
+    # Selected test targets become the consumer set for lazy externals.
+    resolve_external_inputs(
+        project, [n for n, _ in (host_tests + sandboxed)],
+    )
 
     results: list[tuple[str, int]] = []
     if sandboxed:
@@ -580,6 +588,26 @@ def _has_glob(s: str) -> bool:
     return any(c in s for c in "*?[")
 
 
+def _spec_target_names(project: Project, specs: list[str]) -> list[str]:
+    """CLI specs → matching target names (variant suffix stripped).
+
+    Mirrors `_expand_build_spec`'s name-matching half (sans variant
+    expansion) so `resolve_external_inputs` gets the set of consumers
+    that map to user-visible `[targets.<name>]` blocks. Unknown specs
+    are silently dropped here — `_expand_build_spec` will raise the
+    real error later when it tries to resolve them to nix attrs."""
+    out: list[str] = []
+    for spec in specs:
+        base = spec.split("@", 1)[0]
+        if _has_glob(base):
+            out.extend(
+                n for n in project.targets if fnmatch.fnmatchcase(n, base)
+            )
+        elif base in project.targets:
+            out.append(base)
+    return out
+
+
 def _expand_build_spec(project: Project, spec: str) -> list[str]:
     """Resolve one CLI build spec to a list of Nix attrs.
 
@@ -663,6 +691,14 @@ def build(
 
     if not attrs:
         return []
+
+    # Resolve lazy `[external_inputs.<name>]` entries now that we know
+    # which targets the user is actually building. Non-lazy inputs were
+    # validated at config-load. Pass `None` for whole-project builds so
+    # every consumer's lazy inputs get validated up front.
+    resolve_external_inputs(
+        project, _spec_target_names(project, specs) if specs else None,
+    )
 
     write_flake(project)
     output_dir = _output_dir(project)

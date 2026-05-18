@@ -603,6 +603,182 @@ class ExternalInputs(unittest.TestCase):
                 proj = config.load(root)
         self.assertEqual(proj.external_inputs["x"].sha256, {"include": "sha256-abc"})
 
+    def test_lazy_skips_env_var_check_at_load(self):
+        # `lazy = true` defers env-var + require_files validation; the
+        # project should load cleanly even with the env var unset.
+        body = """
+            [project]
+            name = "p"
+
+            [external_inputs.lazy_sdk]
+            buckets       = { include = "RIGX_TEST_LAZY_INC" }
+            require_files = ["zenoh.h@include"]
+            lazy          = true
+        """
+        with TempProject(body) as root:
+            with mock.patch.dict(os.environ, {}, clear=True):
+                proj = config.load(root)
+        ext = proj.external_inputs["lazy_sdk"]
+        self.assertTrue(ext.lazy)
+        self.assertEqual(ext.bucket_paths, {})
+
+    def test_lazy_resolves_when_consumer_requested(self):
+        # A target with `deps.external = ["lazy_sdk"]` is in the
+        # requested set, so the deferred check must fire.
+        body = """
+            [project]
+            name = "p"
+
+            [external_inputs.lazy_sdk]
+            buckets       = { include = "RIGX_TEST_LAZY_INC" }
+            require_files = []
+            lazy          = true
+
+            [targets.app]
+            kind          = "executable"
+            language      = "nim"
+            sources       = ["m.nim"]
+            deps.external = ["lazy_sdk"]
+        """
+        with TempProject(body) as root:
+            with mock.patch.dict(os.environ, {}, clear=True):
+                proj = config.load(root)
+                with self.assertRaisesRegex(ConfigError, "is not set"):
+                    config.resolve_external_inputs(proj, ["app"])
+
+    def test_lazy_skipped_when_consumer_not_requested(self):
+        # Only `other` is requested; `app` (the lazy consumer) is not
+        # in scope, so its lazy input stays unresolved without error.
+        body = """
+            [project]
+            name = "p"
+
+            [external_inputs.lazy_sdk]
+            buckets       = { include = "RIGX_TEST_LAZY_INC" }
+            require_files = []
+            lazy          = true
+
+            [targets.app]
+            kind          = "executable"
+            language      = "nim"
+            sources       = ["m.nim"]
+            deps.external = ["lazy_sdk"]
+
+            [targets.other]
+            kind     = "script"
+            script   = "echo hi"
+        """
+        with TempProject(body) as root:
+            with mock.patch.dict(os.environ, {}, clear=True):
+                proj = config.load(root)
+                config.resolve_external_inputs(proj, ["other"])
+        self.assertEqual(proj.external_inputs["lazy_sdk"].bucket_paths, {})
+
+    def test_lazy_resolves_through_internal_dep_closure(self):
+        # Requesting `app` should pull `lib` into scope; `lib` is what
+        # consumes the lazy input, so its env-var check must fire.
+        body = """
+            [project]
+            name = "p"
+
+            [external_inputs.lazy_sdk]
+            buckets       = { include = "RIGX_TEST_LAZY_INC" }
+            require_files = []
+            lazy          = true
+
+            [targets.lib]
+            kind          = "static_library"
+            language      = "cxx"
+            sources       = ["lib.cpp"]
+            deps.external = ["lazy_sdk"]
+
+            [targets.app]
+            kind          = "executable"
+            language      = "cxx"
+            sources       = ["m.cpp"]
+            deps.internal = ["lib"]
+        """
+        with TempProject(body) as root:
+            with mock.patch.dict(os.environ, {}, clear=True):
+                proj = config.load(root)
+                with self.assertRaisesRegex(ConfigError, "is not set"):
+                    config.resolve_external_inputs(proj, ["app"])
+
+    def test_lazy_resolves_full_validation_when_env_set(self):
+        host = self._tmp_host_files({"include/zenoh.h": ""})
+        body = """
+            [project]
+            name = "p"
+
+            [external_inputs.lazy_sdk]
+            buckets       = { include = "RIGX_TEST_LAZY_INC" }
+            require_files = ["zenoh.h@include"]
+            lazy          = true
+
+            [targets.app]
+            kind          = "executable"
+            language      = "nim"
+            sources       = ["m.nim"]
+            deps.external = ["lazy_sdk"]
+        """
+        with TempProject(body) as root:
+            with mock.patch.dict(
+                os.environ, {"RIGX_TEST_LAZY_INC": str(host / "include")},
+            ):
+                proj = config.load(root)
+                self.assertEqual(
+                    proj.external_inputs["lazy_sdk"].bucket_paths, {}
+                )
+                config.resolve_external_inputs(proj, ["app"])
+        self.assertEqual(
+            proj.external_inputs["lazy_sdk"].bucket_paths["include"],
+            str(host / "include"),
+        )
+
+    def test_lazy_resolve_is_idempotent(self):
+        host = self._tmp_host_files({"include/x.h": ""})
+        body = """
+            [project]
+            name = "p"
+
+            [external_inputs.lazy_sdk]
+            buckets       = { include = "RIGX_TEST_LAZY_INC" }
+            require_files = []
+            lazy          = true
+
+            [targets.app]
+            kind          = "executable"
+            language      = "nim"
+            sources       = ["m.nim"]
+            deps.external = ["lazy_sdk"]
+        """
+        with TempProject(body) as root:
+            with mock.patch.dict(
+                os.environ, {"RIGX_TEST_LAZY_INC": str(host / "include")},
+            ):
+                proj = config.load(root)
+                config.resolve_external_inputs(proj, ["app"])
+                # Second call must not re-WARN or re-fail; bucket_paths
+                # is already populated.
+                config.resolve_external_inputs(proj, ["app"])
+        self.assertEqual(
+            proj.external_inputs["lazy_sdk"].bucket_paths["include"],
+            str(host / "include"),
+        )
+
+    def test_lazy_rejects_non_bool(self):
+        body = """
+            [project]
+            name = "p"
+
+            [external_inputs.x]
+            buckets = { include = "ENV_X" }
+            lazy    = "yes"
+        """
+        with TempProject(body) as root:
+            with self.assertRaisesRegex(ConfigError, "'lazy' must be a bool"):
+                config.load(root)
+
     def test_scalar_sha256_rejects_multi_bucket(self):
         host = self._tmp_host_files({
             "include/x.h": "", "lib/x.so": "",
