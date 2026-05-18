@@ -1,9 +1,11 @@
 """Tests for rigx.toml parsing and validation."""
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from textwrap import dedent
+from unittest import mock
 
 from rigx import config
 from rigx.config import ConfigError
@@ -373,6 +375,256 @@ class ValidationErrors(unittest.TestCase):
         with TempProject(body) as root:
             with self.assertRaisesRegex(ConfigError, "install_script"):
                 config.load(root)
+
+
+class GeneratedSource(unittest.TestCase):
+    def test_parses_inputs_and_command(self):
+        body = """
+            [project]
+            name = "p"
+
+            [targets.gen]
+            kind    = "generated_source"
+            inputs  = ["schema.json"]
+            command = "tool $inputs -o $out/out.nim"
+            outputs = ["out.nim"]
+        """
+        with TempProject(body) as root:
+            (root / "schema.json").write_text("{}")
+            proj = config.load(root)
+        t = proj.targets["gen"]
+        self.assertEqual(t.kind, "generated_source")
+        self.assertEqual(t.inputs, ["schema.json"])
+        self.assertEqual(t.outputs, ["out.nim"])
+        self.assertIn("$inputs", t.command)
+
+    def test_missing_command_raises(self):
+        body = """
+            [project]
+            name = "p"
+
+            [targets.gen]
+            kind    = "generated_source"
+            outputs = ["x"]
+        """
+        with TempProject(body) as root:
+            with self.assertRaisesRegex(ConfigError, "requires 'command'"):
+                config.load(root)
+
+    def test_missing_outputs_raises(self):
+        body = """
+            [project]
+            name = "p"
+
+            [targets.gen]
+            kind    = "generated_source"
+            command = "true"
+        """
+        with TempProject(body) as root:
+            with self.assertRaisesRegex(ConfigError, "requires 'outputs'"):
+                config.load(root)
+
+    def test_source_interpolation_auto_qualifies_internal_dep(self):
+        # `sources = ["${gen}/foo.nim"]` should imply `deps.internal = ["gen"]`
+        # — the user wrote the producer's name in the interpolation, so the
+        # dep edge is implied. No need to restate it.
+        body = """
+            [project]
+            name = "p"
+
+            [targets.gen]
+            kind    = "generated_source"
+            command = "echo hi > $out/foo.nim"
+            outputs = ["foo.nim"]
+
+            [targets.app]
+            kind     = "executable"
+            language = "nim"
+            sources  = ["${gen}/foo.nim"]
+        """
+        with TempProject(body) as root:
+            proj = config.load(root)
+        self.assertIn("gen", proj.targets["app"].deps.internal)
+        # And the source entry passes through verbatim (no on-disk glob).
+        self.assertEqual(proj.targets["app"].sources, ["${gen}/foo.nim"])
+
+
+class ExternalInputs(unittest.TestCase):
+    def setUp(self):
+        # The unpinned-sha256 WARN line is informational; squelching it
+        # keeps test output focused on actual failures.
+        import sys
+        self._stderr = sys.stderr
+        sys.stderr = open(os.devnull, "w")
+        self.addCleanup(self._restore_stderr)
+
+    def _restore_stderr(self):
+        import sys
+        sys.stderr.close()
+        sys.stderr = self._stderr
+
+    def _tmp_host_files(self, files: dict[str, str]) -> Path:
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(d))
+        root = Path(d)
+        for rel, body in files.items():
+            p = root / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(body)
+        return root
+
+    def test_parses_and_resolves_env_vars(self):
+        host = self._tmp_host_files({
+            "include/zenoh.h": "",
+            "lib/libzenohc.so": "",
+        })
+        body = """
+            [project]
+            name = "p"
+
+            [external_inputs.zenoh-c]
+            buckets       = { include = "RIGX_TEST_ZENOH_INC", lib = "RIGX_TEST_ZENOH_LIB" }
+            require_files = ["zenoh.h@include", "libzenohc.so@lib"]
+        """
+        with TempProject(body) as root:
+            env = {
+                "RIGX_TEST_ZENOH_INC": str(host / "include"),
+                "RIGX_TEST_ZENOH_LIB": str(host / "lib"),
+            }
+            with mock.patch.dict(os.environ, env):
+                proj = config.load(root)
+        ext = proj.external_inputs["zenoh-c"]
+        self.assertEqual(ext.bucket_paths["include"], str(host / "include"))
+        self.assertEqual(ext.bucket_paths["lib"], str(host / "lib"))
+        self.assertEqual(
+            ext.require_files, ["zenoh.h@include", "libzenohc.so@lib"]
+        )
+
+    def test_arbitrary_bucket_names(self):
+        # Bucket names are user-defined — `firmware`, `share`, `bin` all work.
+        host = self._tmp_host_files({"firmware/blob.bin": ""})
+        body = """
+            [project]
+            name = "p"
+
+            [external_inputs.boot]
+            buckets       = { firmware = "RIGX_TEST_FW" }
+            require_files = ["blob.bin@firmware"]
+        """
+        with TempProject(body) as root:
+            with mock.patch.dict(
+                os.environ, {"RIGX_TEST_FW": str(host / "firmware")},
+            ):
+                proj = config.load(root)
+        self.assertEqual(
+            proj.external_inputs["boot"].bucket_paths["firmware"],
+            str(host / "firmware"),
+        )
+
+    def test_missing_env_var_raises(self):
+        body = """
+            [project]
+            name = "p"
+
+            [external_inputs.x]
+            buckets       = { include = "RIGX_TEST_DOES_NOT_EXIST" }
+            require_files = []
+        """
+        with TempProject(body) as root:
+            with mock.patch.dict(os.environ, {}, clear=True):
+                with self.assertRaisesRegex(ConfigError, "is not set"):
+                    config.load(root)
+
+    def test_missing_require_file_raises(self):
+        host = self._tmp_host_files({"include/other.h": ""})
+        body = """
+            [project]
+            name = "p"
+
+            [external_inputs.x]
+            buckets       = { include = "RIGX_TEST_INC" }
+            require_files = ["zenoh.h@include"]
+        """
+        with TempProject(body) as root:
+            with mock.patch.dict(
+                os.environ, {"RIGX_TEST_INC": str(host / "include")},
+            ):
+                with self.assertRaisesRegex(ConfigError, "not found at"):
+                    config.load(root)
+
+    def test_deps_external_must_be_declared(self):
+        body = """
+            [project]
+            name = "p"
+
+            [targets.t]
+            kind          = "executable"
+            language      = "nim"
+            sources       = ["m.nim"]
+            deps.external = ["missing"]
+        """
+        with TempProject(body) as root:
+            with self.assertRaisesRegex(
+                ConfigError, "deps.external 'missing' is not declared"
+            ):
+                config.load(root)
+
+    def test_unknown_bucket_in_require_files_rejects(self):
+        # `require_files = [...@include]` but no `include` bucket declared.
+        host = self._tmp_host_files({"lib/x.so": ""})
+        body = """
+            [project]
+            name = "p"
+
+            [external_inputs.x]
+            buckets       = { lib = "RIGX_TEST_LIB" }
+            require_files = ["x.so@include"]
+        """
+        with TempProject(body) as root:
+            with mock.patch.dict(os.environ, {"RIGX_TEST_LIB": str(host / "lib")}):
+                with self.assertRaisesRegex(
+                    ConfigError, "no such bucket is declared"
+                ):
+                    config.load(root)
+
+    def test_scalar_sha256_with_single_bucket(self):
+        host = self._tmp_host_files({"include/x.h": ""})
+        body = """
+            [project]
+            name = "p"
+
+            [external_inputs.x]
+            buckets       = { include = "RIGX_TEST_INC" }
+            require_files = ["x.h@include"]
+            sha256        = "sha256-abc"
+        """
+        with TempProject(body) as root:
+            with mock.patch.dict(os.environ, {"RIGX_TEST_INC": str(host / "include")}):
+                proj = config.load(root)
+        self.assertEqual(proj.external_inputs["x"].sha256, {"include": "sha256-abc"})
+
+    def test_scalar_sha256_rejects_multi_bucket(self):
+        host = self._tmp_host_files({
+            "include/x.h": "", "lib/x.so": "",
+        })
+        body = """
+            [project]
+            name = "p"
+
+            [external_inputs.x]
+            buckets = { include = "RIGX_TEST_INC", lib = "RIGX_TEST_LIB" }
+            sha256  = "sha256-abc"
+        """
+        with TempProject(body) as root:
+            env = {
+                "RIGX_TEST_INC": str(host / "include"),
+                "RIGX_TEST_LIB": str(host / "lib"),
+            }
+            with mock.patch.dict(os.environ, env):
+                with self.assertRaisesRegex(
+                    ConfigError, "scalar `sha256` only valid"
+                ):
+                    config.load(root)
 
 
 class VarsExpansion(unittest.TestCase):

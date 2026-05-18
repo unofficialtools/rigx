@@ -56,7 +56,41 @@ VALID_KINDS = {
     "test",
     "testbed",
     "capsule",
+    "generated_source",
 }
+
+# `kind = "generated_source"` runs a command at build time to produce one or
+# more output files (any extension — generated source code, protobuf
+# bindings, fcslc Nim modules, OpenAPI clients, generated headers,
+# proto-compiled libs, etc.). The result is a Nix store path downstream
+# targets reference via `${target}/<file>`. Cacheable, sandboxed,
+# composable across languages.
+
+# Bucket names allowed in `[external_inputs.<name>].buckets` — kept as a
+# permissive POSIX identifier pattern so users can declare whatever
+# layout matches their vendor blob (`include`, `lib`, `bin`, `share`,
+# `pkgconfig`, `firmware`, …). The bucket name is the substitution key
+# users write as `${<input>.<bucket>}`.
+_BUCKET_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+# Picks `${name}` out of strings — used to auto-derive deps.internal from
+# `sources = ["${gen}/foo.nim"]` style entries. Excludes dotted forms
+# (those are handled by the existing `rewrite_interp` machinery, which
+# walks the rec scope or local-deps).
+_INTERP_BARE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_\-]*)\}")
+
+
+def _scan_interpolated_refs(items: list[str]) -> list[str]:
+    """Return the set of bare `${name}` references that appear in `items`,
+    in first-seen order. Dotted forms (`${X.Y}`) are skipped — they
+    cover cross-flake and module refs and are validated elsewhere."""
+    seen: list[str] = []
+    for item in items:
+        for m in _INTERP_BARE.finditer(item):
+            ref = m.group(1)
+            if ref not in seen:
+                seen.append(ref)
+    return seen
 
 # Capsule backends.
 #
@@ -150,6 +184,48 @@ class TargetDeps:
     internal: list[str] = field(default_factory=list)
     nixpkgs: list[str] = field(default_factory=list)
     git: list[str] = field(default_factory=list)
+    # External, host-provided inputs declared at the project level via
+    # `[external_inputs.<name>]`. The dep edge brings the input's
+    # `${<name>.include}` / `${<name>.lib}` substitutions into scope for
+    # this target and gets the resolved paths into buildInputs.
+    external: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ExternalInput:
+    """A host-provided binary input wired into the build via env vars.
+
+    Use this for vendor SDKs, system libraries, generated firmware,
+    pre-built static assets, or anything whose location on disk varies
+    per-host but whose *content* should pin the build hash. The
+    `buckets` table maps a user-chosen bucket name (`include`, `lib`,
+    `bin`, `share`, `firmware`, …) to the env var that holds the
+    directory's host-side path. Each bucket becomes a
+    `${<name>.<bucket>}` substitution downstream targets can splice
+    into flags, sources, or scripts.
+
+    At eval time rigx reads each env var, verifies every `require_files`
+    entry (`<filename>@<bucket>`) exists on disk, and copies the
+    directories into the Nix store via `builtins.path`. The sandbox
+    sees only the in-store copy, so the build itself stays sandboxed;
+    the per-host path lives in the eval-time layer.
+
+    When `sha256` is set on a bucket, Nix pins the content hash and
+    the build fails loudly if the host blob changes. When unset, Nix
+    hashes whatever it finds and rigx prints a WARN — reproducible
+    across runs of the same host, but silently drifts if the host
+    blob is updated.
+    """
+    name: str
+    # `bucket-name → env-var-name`. Bucket names are free-form; what
+    # the user picks here is what they write in `${<name>.<bucket>}`.
+    buckets: dict[str, str] = field(default_factory=dict)
+    require_files: list[str] = field(default_factory=list)
+    # Optional `bucket-name → sha256` pinning. Buckets without an
+    # entry hash whatever's on disk and warn.
+    sha256: dict[str, str] = field(default_factory=dict)
+    # Resolved at config-load time: `bucket-name → host directory`.
+    bucket_paths: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -226,7 +302,17 @@ class Target:
     python_venv_extra: list[str] = field(default_factory=list)
     run: str | None = None                          # for kind = "run"
     args: list[str] = field(default_factory=list)   # for kind = "run"
-    outputs: list[str] = field(default_factory=list)  # for kind = "run"
+    outputs: list[str] = field(default_factory=list)  # for kind = "run" + "generated_source"
+    # `kind = "generated_source"` only. `inputs` lists project-relative
+    # source files passed to the generator; `command` is the shell line
+    # that produces files into `$out`. Inside `command`, `$inputs`
+    # expands to the space-joined input paths and `${dep}` interpolates
+    # rigx-built deps' store paths (same convention as `custom`/`run`).
+    # The generator's output store path is exposed to downstream targets
+    # as `${<this-target>}/<file>` — usable in any field that supports
+    # interpolation (sources, includes, flags, etc.).
+    inputs: list[str] = field(default_factory=list)
+    command: str = ""
     build_script: str | None = None                 # for kind = "custom"
     install_script: str | None = None               # for kind = "custom"
     native_build_inputs: list[str] = field(default_factory=list)  # nixpkgs attrs
@@ -329,6 +415,9 @@ class Project:
     # naturally suppresses build outputs / .venv / node_modules. Silently
     # no-ops when the project root isn't a git checkout.
     respect_gitignore: bool = True
+    # `[external_inputs.<name>]` tables — host-provided binary inputs
+    # resolved from env vars at config-load time. See `ExternalInput`.
+    external_inputs: dict[str, "ExternalInput"] = field(default_factory=dict)
 
     def find_target(self, qualified: str) -> tuple["Project", str] | None:
         """Resolve a possibly-qualified target name (e.g. 'frontend.app') to
@@ -493,9 +582,16 @@ def _expand_globs(
 
     `output_prefix` is prepended to every resolved path (literal or globbed).
     Used by `[modules]` so a module's `src/main.cpp` ends up as
-    `frontend/src/main.cpp` relative to the parent root."""
+    `frontend/src/main.cpp` relative to the parent root.
+
+    Entries that start with `${` are Nix-style interpolations (e.g. a
+    `generated_source` reference like `${gen}/foo.nim`) and pass through
+    untouched — no filesystem lookup, no prefix prepended."""
     out: list[str] = []
     for item in items:
+        if item.startswith("${"):
+            out.append(item)
+            continue
         if not any(c in item for c in "*?["):
             out.append(output_prefix + item)
             continue
@@ -652,7 +748,7 @@ def _build_target(
         )
 
     deps_conf = tconf.get("deps", {})
-    for unknown in deps_conf.keys() - {"internal", "nixpkgs", "git"}:
+    for unknown in deps_conf.keys() - {"internal", "nixpkgs", "git", "external"}:
         raise ConfigError(f"target {tname}: unknown deps key '{unknown}'")
     deps = TargetDeps(
         internal=_expand_list(
@@ -663,6 +759,9 @@ def _build_target(
         ),
         git=_expand_list(
             deps_conf.get("git", []), vars_table, f"target {tname}: deps.git"
+        ),
+        external=_expand_list(
+            deps_conf.get("external", []), vars_table, f"target {tname}: deps.external"
         ),
     )
     for g in deps.git:
@@ -791,6 +890,17 @@ def _build_target(
     )
     user = str(tconf.get("user", "") or "")
 
+    # `generated_source` inputs: globbed like sources, project-relative
+    # paths to the source files the command reads. `command` is a free-form
+    # shell line; same `${dep}` interpolation rules as `custom`/`run`.
+    inputs = _expand_globs(
+        _expand_list(tconf.get("inputs", []), vars_table, f"{tctx}.inputs"),
+        glob_root,
+        f"{tctx}.inputs",
+        output_prefix=path_prefix,
+    )
+    command = str(tconf.get("command", "") or "")
+
     return Target(
         name=tname,
         kind=kind,
@@ -832,6 +942,8 @@ def _build_target(
         nixos_modules=nixos_modules,
         volumes=volumes,
         user=user,
+        inputs=inputs,
+        command=command,
         variants=variants,
         namespace=namespace,
     )
@@ -1045,6 +1157,159 @@ def _merge_include_data(base: dict, new: dict, source: str) -> None:
             base[top_key] = top_val
 
 
+def _parse_external_inputs(
+    section, source_label: str,
+) -> dict[str, ExternalInput]:
+    """Parse `[external_inputs.<name>]` tables into ExternalInput dataclasses.
+
+    Each entry's `buckets` table maps a user-chosen bucket name to the
+    env var holding that bucket's host-side directory path. Bucket
+    names are free-form (`include`, `lib`, `bin`, `share`, `firmware`,
+    …) and become the substitution key in `${<name>.<bucket>}`.
+
+    Resolves env vars at parse time, verifies `require_files` exist on
+    disk, and records the resolved directory paths so the nix_gen
+    layer can splice them into `builtins.path` expressions. A missing
+    env var or missing file is a config error with a clear pointer at
+    what's wrong — better to fail fast at `rigx.toml`-load than to
+    produce a flake that explodes at eval."""
+    import os
+    import sys
+
+    if section is None or section == {}:
+        return {}
+    if not isinstance(section, dict):
+        raise ConfigError(
+            f"{source_label}[external_inputs]: must be a table of name -> table"
+        )
+    out: dict[str, ExternalInput] = {}
+    for ename, econf in section.items():
+        ectx = f"{source_label}external_inputs.{ename}"
+        if not isinstance(econf, dict):
+            raise ConfigError(
+                f"{ectx}: must be a table (got {type(econf).__name__})"
+            )
+        unknown = set(econf.keys()) - {"buckets", "require_files", "sha256"}
+        if unknown:
+            raise ConfigError(
+                f"{ectx}: unknown keys {sorted(unknown)} "
+                f"(allowed: buckets, require_files, sha256)"
+            )
+        buckets_raw = econf.get("buckets", {})
+        if not isinstance(buckets_raw, dict) or not buckets_raw:
+            raise ConfigError(
+                f"{ectx}: 'buckets' must be a non-empty table of "
+                f"<bucket-name> -> <env-var-name>"
+            )
+        buckets: dict[str, str] = {}
+        for bname, env_name in buckets_raw.items():
+            if not _BUCKET_NAME_RE.match(bname):
+                raise ConfigError(
+                    f"{ectx}.buckets.{bname}: bucket name must match "
+                    f"[A-Za-z_][A-Za-z0-9_]*"
+                )
+            if not isinstance(env_name, str) or not env_name:
+                raise ConfigError(
+                    f"{ectx}.buckets.{bname}: value must be a non-empty "
+                    f"env-var name string"
+                )
+            if not _ENV_NAME_RE.match(env_name):
+                raise ConfigError(
+                    f"{ectx}.buckets.{bname}: {env_name!r} is not a valid "
+                    f"POSIX env-var name"
+                )
+            buckets[bname] = env_name
+        require_files = econf.get("require_files", [])
+        if not isinstance(require_files, list) or not all(
+            isinstance(x, str) for x in require_files
+        ):
+            raise ConfigError(
+                f"{ectx}: require_files must be a list of "
+                f"'<filename>@<bucket>' strings"
+            )
+        sha_raw = econf.get("sha256", {})
+        # Accept either `sha256 = "…"` (only one bucket; applies to it) or
+        # `sha256 = { include = "…", lib = "…" }` (per-bucket). The string
+        # form keeps the simple case ergonomic.
+        sha256: dict[str, str] = {}
+        if isinstance(sha_raw, str) and sha_raw:
+            if len(buckets) != 1:
+                raise ConfigError(
+                    f"{ectx}: scalar `sha256` only valid when exactly one "
+                    f"bucket is declared (got {len(buckets)} buckets — use "
+                    f"`sha256 = {{ <bucket> = \"…\", … }}` instead)"
+                )
+            (only_bucket,) = buckets.keys()
+            sha256[only_bucket] = sha_raw
+        elif isinstance(sha_raw, dict):
+            for bname, hashval in sha_raw.items():
+                if bname not in buckets:
+                    raise ConfigError(
+                        f"{ectx}.sha256.{bname}: no matching bucket declared"
+                    )
+                if not isinstance(hashval, str) or not hashval:
+                    raise ConfigError(
+                        f"{ectx}.sha256.{bname}: must be a non-empty string"
+                    )
+                sha256[bname] = hashval
+        elif sha_raw:
+            raise ConfigError(
+                f"{ectx}: sha256 must be a string or a "
+                f"<bucket> -> <hash> table"
+            )
+
+        # Resolve env vars and verify each require_files entry.
+        bucket_paths: dict[str, str] = {}
+        for bname, env_name in buckets.items():
+            value = os.environ.get(env_name, "")
+            if not value:
+                raise ConfigError(
+                    f"{ectx}: env var {env_name!r} is not set — needed to "
+                    f"locate the {bname!r} bucket for external input "
+                    f"'{ename}'"
+                )
+            bucket_paths[bname] = value
+
+        for spec in require_files:
+            if "@" not in spec:
+                raise ConfigError(
+                    f"{ectx}: require_files entry {spec!r} must be of the "
+                    f"form '<filename>@<bucket>'"
+                )
+            filename, bucket = spec.rsplit("@", 1)
+            if bucket not in buckets:
+                raise ConfigError(
+                    f"{ectx}: require_files entry {spec!r} references "
+                    f"bucket {bucket!r}, but no such bucket is declared "
+                    f"(known buckets: {sorted(buckets)})"
+                )
+            full = Path(bucket_paths[bucket]) / filename
+            if not full.is_file():
+                raise ConfigError(
+                    f"{ectx}: require_files entry {spec!r} not found at "
+                    f"{full} (resolved from ${buckets[bucket]} = "
+                    f"{bucket_paths[bucket]!r})"
+                )
+        out[ename] = ExternalInput(
+            name=ename,
+            buckets=buckets,
+            require_files=list(require_files),
+            sha256=sha256,
+            bucket_paths=bucket_paths,
+        )
+        unpinned = [b for b in buckets if b not in sha256]
+        if unpinned:
+            print(
+                f"[rigx] WARN: external_inputs.{ename} bucket(s) "
+                f"{unpinned} have no `sha256` — rigx will hash whatever "
+                f"is at the host paths, so the build silently drifts if "
+                f"the blob changes. Set `sha256 = {{ <bucket> = \"…\" }}` "
+                f"to pin.",
+                file=sys.stderr,
+            )
+    return out
+
+
 def _load(root: Path, _visited: set[Path]) -> Project:
     if root in _visited:
         chain = " -> ".join(str(p) for p in [*_visited, root])
@@ -1092,6 +1357,10 @@ def _load(root: Path, _visited: set[Path]) -> Project:
     nixpkgs = data.get("nixpkgs", {})
     nixpkgs_ref = nixpkgs.get("ref", "nixos-24.11")
 
+    external_inputs = _parse_external_inputs(
+        data.get("external_inputs", {}), source_label=""
+    )
+
     # Phase 1: gather modules. Each module's TOML is read and validated for
     # the `no [project]` / `no [nixpkgs]` rules during enumeration.
     modules = list(_enumerate_modules(data, root))
@@ -1120,6 +1389,13 @@ def _load(root: Path, _visited: set[Path]) -> Project:
                 mod_root, git_deps, _visited, f"{label}: ",
             ),
             "dependencies.local", label,
+        )
+        _merge_into(
+            external_inputs,
+            _parse_external_inputs(
+                mod_data.get("external_inputs", {}), f"{label}: "
+            ),
+            "external_inputs", label,
         )
 
     # Phase 3: build targets. Parent's first (no namespace), then each module
@@ -1154,6 +1430,14 @@ def _load(root: Path, _visited: set[Path]) -> Project:
     # if it names (a) a target in this flake (parent or merged module), or
     # (b) a `<localdep>.<target>` cross-flake ref into a sibling project.
     for qname, target in targets.items():
+        # Auto-derive deps.internal from `${<name>}` interpolations in
+        # `sources`. Lets the user write a `generated_source` reference
+        # like `sources = ["${gen}/foo.nim"]` without also restating
+        # `deps.internal = ["gen"]` — the interpolation already names
+        # the producer, so the dep is implied.
+        for ref in _scan_interpolated_refs(target.sources):
+            if ref in targets and ref not in target.deps.internal:
+                target.deps.internal.append(ref)
         for dep in target.deps.internal:
             if dep in targets:
                 continue
@@ -1172,6 +1456,12 @@ def _load(root: Path, _visited: set[Path]) -> Project:
                 f"target {qname}: internal dep '{dep}' is not a defined target "
                 f"(neither a sibling target in this flake nor a known local-dep ref)"
             )
+        for ext in target.deps.external:
+            if ext not in external_inputs:
+                raise ConfigError(
+                    f"target {qname}: deps.external '{ext}' is not declared "
+                    f"in any [external_inputs.<name>] table"
+                )
         if target.kind == "custom":
             if not target.install_script:
                 raise ConfigError(
@@ -1193,6 +1483,20 @@ def _load(root: Path, _visited: set[Path]) -> Project:
                     f"target {tname}: kind='testbed' requires 'script' "
                     f"(an interactive host-side scenario; runs via "
                     f"`rigx run {tname}`)"
+                )
+        if target.kind == "generated_source":
+            if not target.command:
+                raise ConfigError(
+                    f"target {qname}: kind='generated_source' requires "
+                    f"'command' (shell line that writes files into $out; "
+                    f"use $inputs for the source list and ${{<dep>}} to "
+                    f"interpolate rigx-built deps)"
+                )
+            if not target.outputs:
+                raise ConfigError(
+                    f"target {qname}: kind='generated_source' requires "
+                    f"'outputs' (files the command writes into $out — "
+                    f"verified after the command runs)"
                 )
         if target.kind == "run":
             if not target.run:
@@ -1302,4 +1606,5 @@ def _load(root: Path, _visited: set[Path]) -> Project:
         excludes=list(proj_excludes_raw),
         respect_gitignore=respect_gitignore,
         rigx_min_version=rigx_min_version,
+        external_inputs=external_inputs,
     )

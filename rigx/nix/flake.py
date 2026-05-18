@@ -10,6 +10,7 @@ from rigx.nix.capsule_nixos import mk_nixos_capsule_derivation
 from rigx.nix.capsule_qemu import mk_qemu_capsule_derivation
 from rigx.nix.cross import stdenv_attr, toolchain_pkgs
 from rigx.nix.render import (
+    _external_bucket_var,
     indent,
     nix_id,
     nix_list,
@@ -46,6 +47,16 @@ def build_inputs(target: Target, project: Project) -> list[str]:
         exprs.append(f"inputs.{d}.packages.${{system}}.{attr}")
     for d in target.deps.internal:
         exprs.append(nix_id(d))
+    # External inputs land as path-typed buildInputs so any tool that walks
+    # the input chain (e.g. `nix-store --query --references`) sees them.
+    # The substitution machinery (`${name.<bucket>}`) is what actually
+    # drops paths into the build command line.
+    for d in target.deps.external:
+        ext = project.external_inputs.get(d)
+        if ext is None:
+            continue
+        for bname in ext.buckets:
+            exprs.append(_external_bucket_var(d, bname))
     if (
         target.run
         and (target.run in project.targets or is_cross_flake_ref(target.run, project))
@@ -181,6 +192,87 @@ def mk_custom_derivation(target: Target, project: Project) -> str:
     return "\n".join(lines)
 
 
+def _external_input_bindings(project: Project) -> list[str]:
+    """Emit one `let`-binding per declared `[external_inputs.<name>]`
+    bucket. The binding is a `builtins.path { ... }` that copies the
+    host-side directory into the Nix store at eval time — sandboxed
+    builds see only the in-store copy. When the bucket has a `sha256`
+    entry, Nix verifies the content hash and fails loudly on drift;
+    otherwise it hashes whatever it finds (the loader already WARNed)."""
+    lines: list[str] = []
+    for name, ext in project.external_inputs.items():
+        for bucket in ext.buckets:
+            host_path = ext.bucket_paths.get(bucket, "")
+            if not host_path:
+                continue
+            var = _external_bucket_var(name, bucket)
+            attrs = [
+                f"path = {nix_str(host_path)};",
+                f"name = {nix_str(f'{name}-{bucket}')};",
+            ]
+            bucket_sha = ext.sha256.get(bucket, "")
+            if bucket_sha:
+                attrs.append(f"sha256 = {nix_str(bucket_sha)};")
+            joined = " ".join(attrs)
+            lines.append(f"{var} = builtins.path {{ {joined} }};")
+    return lines
+
+
+def mk_generated_source_derivation(target: Target, project: Project) -> str:
+    """Pass-through derivation that runs a user command to produce files.
+
+    The command sees `$inputs` (space-joined input paths, relative to the
+    derivation's `$src`) and `$out` (the output store directory the command
+    should populate). Internal/external deps interpolate via `${dep}` /
+    `${dep.bucket}`. After the command runs, every entry in `outputs` is
+    verified to exist under `$out` — a missing one fails the build with a
+    clear pointer at what wasn't produced."""
+    if not target.command:
+        raise ValueError(
+            f"generated_source {target.qualified_name!r}: missing command"
+        )
+    inputs_exprs = build_inputs(target, project)
+    native = [f"pkgs.{p}" for p in target.native_build_inputs]
+    # Build the inputs assignment as a single bash-double-quoted string so
+    # `$inputs` (unquoted) word-splits across the input paths inside the
+    # user's command. Paths with spaces aren't supported here — every other
+    # `sources`-style field in rigx makes the same assumption.
+    quoted_inputs = " ".join(target.inputs)
+    cmd_body = rewrite_interp(target.command.strip("\n"), project)
+
+    lines = [
+        "pkgs.stdenv.mkDerivation {",
+        f"  pname = {nix_str(target.qualified_name)};",
+        f"  version = {nix_str(project.version)};",
+        "  inherit src;",
+        f"  buildInputs = {nix_list(inputs_exprs)};",
+    ]
+    if native:
+        lines.append(f"  nativeBuildInputs = {nix_list(native)};")
+    lines.extend([
+        "  dontConfigure = true;",
+        "  dontBuild = true;",
+        "  installPhase = ''",
+        "    runHook preInstall",
+        "    mkdir -p $out",
+        f'    inputs="{quoted_inputs}"',
+        f"    {cmd_body}",
+    ])
+    for out in target.outputs:
+        lines.append(
+            f"    test -e $out/{out} || "
+            f"{{ echo \"generated_source {target.qualified_name}: "
+            f"command did not produce expected output {out!r}\" >&2; "
+            f"exit 1; }}"
+        )
+    lines.extend([
+        "    runHook postInstall",
+        "  '';",
+        "}",
+    ])
+    return "\n".join(lines)
+
+
 def mk_capsule_derivation(target: Target, project: Project) -> str:
     """Dispatch a `kind = "capsule"` target to its backend-specific builder."""
     if target.backend == "lite":
@@ -206,6 +298,8 @@ def mk_derivation(
         return mk_custom_derivation(target, project)
     if target.kind == "capsule":
         return mk_capsule_derivation(target, project)
+    if target.kind == "generated_source":
+        return mk_generated_source_derivation(target, project)
 
     pname = (
         target.qualified_name
@@ -286,6 +380,12 @@ def mk_derivation(
     ]
     if native_inputs:
         lines.append(f"  nativeBuildInputs = {nix_list(native_inputs)};")
+    # Rewrite dotted interpolations (`${local-dep.t}`, `${ext-input.lib}`,
+    # `${module.t}`) into the underscore-form rec attrs the surrounding
+    # `rec { ... }` actually binds. Applied to the assembled phase string
+    # so per-language builders don't each have to remember to do it.
+    build_phase = rewrite_interp(build_phase, project)
+    install_phase = rewrite_interp(install_phase, project)
     lines.extend([
         "  dontConfigure = true;",
         "  buildPhase = ''",
@@ -479,6 +579,8 @@ def generate(project: Project) -> str:
         w('            "flake.nix" "flake.lock"')
         w('          ]);')
         w("      };")
+    for line in _external_input_bindings(project):
+        w(f"      {line}")
     w("    in {")
     w("      packages = forAll (system:")
     w("        let")

@@ -39,7 +39,8 @@ _INTERP_DOTTED = re.compile(
 def rewrite_interp(s: str, project: Project) -> str:
     """Rewrite `${X.Y}` to `${X_Y}` when the dotted ref names either:
     - a cross-flake (`[dependencies.local.X]`) target, or
-    - a `[modules]`-merged target (`X.Y` is a key in `project.targets`).
+    - a `[modules]`-merged target (`X.Y` is a key in `project.targets`), or
+    - an `[external_inputs.X]` bucket (any user-declared bucket name).
     Other dotted forms (e.g. `pkgs.foo`) are left alone."""
     def sub(m):
         qual = m.group(1)
@@ -47,8 +48,19 @@ def rewrite_interp(s: str, project: Project) -> str:
             return "${" + nix_id(qual) + "}"
         if qual in project.targets:
             return "${" + nix_id(qual) + "}"
+        head, _, tail = qual.partition(".")
+        ext = project.external_inputs.get(head)
+        if ext is not None and tail in ext.buckets:
+            return "${" + _external_bucket_var(head, tail) + "}"
         return m.group(0)
     return _INTERP_DOTTED.sub(sub, s)
+
+
+def _external_bucket_var(name: str, bucket: str) -> str:
+    """Nix let-binding identifier for `[external_inputs.<name>]`'s
+    `<bucket>` directory. Kept here so both the rewriter and the flake
+    emitter agree on the name."""
+    return f"ext_{nix_id(name)}_{bucket}"
 
 
 def nix_list(exprs: list[str]) -> str:

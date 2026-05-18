@@ -269,11 +269,16 @@ def compute_target_files(project: Project, target: Target) -> list[str]:
         # in this case; the empty-list return is a defensive default.
         return []
     base = compute_project_files(project)
-    if not target.sources:
+    if not target.sources and not target.inputs:
         return base
 
+    # Sources that start with `${...}` are Nix-interpolations into the rec
+    # scope (a `generated_source` reference like `${gen}/foo.nim`), not
+    # paths on disk. They contribute nothing to the on-disk src filter
+    # and need to be excluded from the baseline-validation check.
+    on_disk_sources = [s for s in target.sources if not s.startswith("${")]
     base_set = set(base)
-    missing = [s for s in target.sources if s not in base_set]
+    missing = [s for s in on_disk_sources if s not in base_set]
     if missing:
         raise ValueError(
             f"target {target.qualified_name!r}: sources are not in the "
@@ -281,8 +286,20 @@ def compute_target_files(project: Project, target: Target) -> list[str]:
             f"  Add a glob covering them to [project].sources, or remove "
             f"them from this target."
         )
+    # `generated_source` targets carry their source-file list under
+    # `inputs` (not `sources`), so the per-target src filter has to
+    # include them too — otherwise the derivation's $src is missing the
+    # files the generator command tries to read.
+    missing_inputs = [s for s in target.inputs if s not in base_set]
+    if missing_inputs:
+        raise ValueError(
+            f"target {target.qualified_name!r}: inputs are not in the "
+            f"[project].sources baseline: {missing_inputs}\n"
+            f"  Add a glob covering them to [project].sources, or remove "
+            f"them from this target."
+        )
 
-    keep: set[str] = set(target.sources)
+    keep: set[str] = set(on_disk_sources) | set(target.inputs)
     # Capsule `nixos_modules` are referenced via `(src + "/path")` in the
     # generated flake — they must land in the per-target src too.
     missing_modules = [

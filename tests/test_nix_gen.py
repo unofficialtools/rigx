@@ -5,6 +5,7 @@ from pathlib import Path
 
 from rigx import nix_gen
 from rigx.config import (
+    ExternalInput,
     GitDep,
     Project,
     Target,
@@ -103,7 +104,10 @@ class EffectiveFlags(unittest.TestCase):
         self.assertIn("-d:X=1", out)
 
 
-def _project(name="p", targets=None, git_deps=None, local_deps=None, root=None, description="") -> Project:
+def _project(
+    name="p", targets=None, git_deps=None, local_deps=None, root=None,
+    description="", external_inputs=None,
+) -> Project:
     return Project(
         name=name,
         version="0.1.0",
@@ -113,6 +117,7 @@ def _project(name="p", targets=None, git_deps=None, local_deps=None, root=None, 
         targets=targets or {},
         root=root or Path("/tmp"),
         local_deps=local_deps or {},
+        external_inputs=external_inputs or {},
     )
 
 
@@ -746,6 +751,135 @@ class CrossCompilation(unittest.TestCase):
         out = nix_gen.generate(_project(targets={"hello": t}))
         # Variant gets the cross stdenv; default does not.
         self.assertIn("pkgs.pkgsCross.aarch64-multiplatform.stdenv", out)
+
+
+class GenerateGeneratedSource(unittest.TestCase):
+    def test_basic_command_and_outputs(self):
+        gen = Target(
+            name="bindings",
+            kind="generated_source",
+            inputs=["schema.json"],
+            command="protoc $inputs --out=$out",
+            outputs=["bindings.py"],
+            deps=TargetDeps(nixpkgs=["protobuf"]),
+        )
+        out = nix_gen.generate(_project(targets={"bindings": gen}))
+        self.assertIn('pname = "bindings"', out)
+        self.assertIn("pkgs.protobuf", out)
+        self.assertIn('inputs="schema.json"', out)
+        self.assertIn("protoc $inputs --out=$out", out)
+        # Output existence is asserted as part of the install phase.
+        self.assertIn("test -e $out/bindings.py", out)
+
+    def test_downstream_source_interpolation_rewrites(self):
+        # Downstream's `sources = ["${gen}/foo.nim"]` survives codegen as
+        # `${gen}/foo.nim` (still a Nix interp into the rec scope).
+        gen = Target(
+            name="gen",
+            kind="generated_source",
+            command="echo > $out/foo.nim",
+            outputs=["foo.nim"],
+        )
+        downstream = Target(
+            name="app",
+            kind="executable",
+            language="nim",
+            sources=["${gen}/foo.nim"],
+            deps=TargetDeps(internal=["gen"]),
+        )
+        out = nix_gen.generate(_project(targets={"gen": gen, "app": downstream}))
+        # The downstream's build phase contains the interp — Nix expands
+        # ${gen} to the gen derivation's store path at eval time.
+        self.assertIn("${gen}/foo.nim", out)
+        # `gen` is a rec attr in the same packages set.
+        self.assertIn("gen = ", out)
+
+    def test_outputs_can_be_arbitrary_files(self):
+        # generated_source outputs aren't restricted to source code — any
+        # filename works (headers, binaries, configs, …).
+        gen = Target(
+            name="assets",
+            kind="generated_source",
+            command="cp foo.txt $out/data.bin && cp bar.txt $out/info.json",
+            outputs=["data.bin", "info.json"],
+        )
+        out = nix_gen.generate(_project(targets={"assets": gen}))
+        self.assertIn("test -e $out/data.bin", out)
+        self.assertIn("test -e $out/info.json", out)
+
+
+class GenerateExternalInputs(unittest.TestCase):
+    def test_emits_builtins_path_binding_per_bucket(self):
+        ext = ExternalInput(
+            name="zenoh-c",
+            buckets={"include": "INC_ENV", "lib": "LIB_ENV"},
+            bucket_paths={"include": "/opt/inc", "lib": "/opt/lib"},
+        )
+        proj = _project(external_inputs={"zenoh-c": ext})
+        out = nix_gen.generate(proj)
+        # One builtins.path per bucket, named after `<name>-<bucket>`.
+        self.assertIn("ext_zenoh-c_include = builtins.path", out)
+        self.assertIn("ext_zenoh-c_lib = builtins.path", out)
+        self.assertIn('path = "/opt/inc"', out)
+        self.assertIn('path = "/opt/lib"', out)
+        self.assertIn('name = "zenoh-c-include"', out)
+        self.assertIn('name = "zenoh-c-lib"', out)
+
+    def test_sha256_per_bucket_is_pinned(self):
+        ext = ExternalInput(
+            name="x",
+            buckets={"lib": "X_LIB"},
+            bucket_paths={"lib": "/opt/x"},
+            sha256={"lib": "sha256-abc"},
+        )
+        out = nix_gen.generate(_project(external_inputs={"x": ext}))
+        self.assertIn('sha256 = "sha256-abc"', out)
+
+    def test_interpolation_in_target_flags_rewrites_to_let_binding(self):
+        ext = ExternalInput(
+            name="zenoh-c",
+            buckets={"include": "INC_ENV", "lib": "LIB_ENV"},
+            bucket_paths={"include": "/opt/inc", "lib": "/opt/lib"},
+        )
+        t = Target(
+            name="app",
+            kind="executable",
+            language="nim",
+            sources=["m.nim"],
+            nim_flags=[
+                "--passC:-I${zenoh-c.include}",
+                "--passL:-L${zenoh-c.lib} -l:libzenohc.so",
+            ],
+            deps=TargetDeps(external=["zenoh-c"]),
+        )
+        proj = _project(
+            targets={"app": t}, external_inputs={"zenoh-c": ext},
+        )
+        out = nix_gen.generate(proj)
+        # Dotted interpolations got rewritten to the underscore form
+        # that names the let-binding.
+        self.assertIn("${ext_zenoh-c_include}", out)
+        self.assertIn("${ext_zenoh-c_lib}", out)
+        # The dotted form is no longer present in flags.
+        self.assertNotIn("${zenoh-c.include}", out)
+        self.assertNotIn("${zenoh-c.lib}", out)
+
+    def test_arbitrary_bucket_name_works(self):
+        ext = ExternalInput(
+            name="boot",
+            buckets={"firmware": "FW_ENV"},
+            bucket_paths={"firmware": "/opt/fw"},
+        )
+        t = Target(
+            name="image",
+            kind="custom",
+            install_script="cp ${boot.firmware}/blob.bin $out/",
+            deps=TargetDeps(external=["boot"]),
+        )
+        proj = _project(targets={"image": t}, external_inputs={"boot": ext})
+        out = nix_gen.generate(proj)
+        self.assertIn("ext_boot_firmware", out)
+        self.assertIn("${ext_boot_firmware}/blob.bin", out)
 
 
 class NixIdHelper(unittest.TestCase):
