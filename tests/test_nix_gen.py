@@ -7,6 +7,7 @@ from rigx import nix_gen
 from rigx.config import (
     ExternalInput,
     GitDep,
+    InstallSpec,
     Project,
     Target,
     TargetDeps,
@@ -106,7 +107,7 @@ class EffectiveFlags(unittest.TestCase):
 
 def _project(
     name="p", targets=None, git_deps=None, local_deps=None, root=None,
-    description="", external_inputs=None,
+    description="", external_inputs=None, install=None,
 ) -> Project:
     return Project(
         name=name,
@@ -118,6 +119,7 @@ def _project(
         root=root or Path("/tmp"),
         local_deps=local_deps or {},
         external_inputs=external_inputs or {},
+        install=install,
     )
 
 
@@ -130,6 +132,82 @@ class FlakeDescription(unittest.TestCase):
         out = nix_gen.generate(_project(description="A short summary"))
         self.assertIn('description = "A short summary"', out)
         self.assertNotIn('description = "rigx build for p"', out)
+
+
+class GenerateInstall(unittest.TestCase):
+    def test_no_install_omits_default_and_apps(self):
+        out = nix_gen.generate(_project(name="p"))
+        self.assertNotIn("buildPythonApplication", out)
+        self.assertNotIn("apps = forAll", out)
+        self.assertNotIn("installSrc", out)
+
+    def test_install_emits_default_package_and_app(self):
+        out = nix_gen.generate(
+            _project(name="rigx", install=InstallSpec(bin="rigx"))
+        )
+        # Default package built from pyproject via buildPythonApplication.
+        self.assertIn("rigx = pkgs.python3Packages.buildPythonApplication {", out)
+        self.assertIn("pyproject = true;", out)
+        self.assertIn("build-system = [ pkgs.python3Packages.setuptools ];", out)
+        self.assertIn("src = installSrc;", out)
+        self.assertIn('meta.mainProgram = "rigx";', out)
+        self.assertIn("default = rigx;", out)
+        # installSrc let-binding covers the whole tree.
+        self.assertIn('name = "rigx-install-src";', out)
+        # apps.default points at the bin and aliases the bin name.
+        self.assertIn("apps = forAll (system: {", out)
+        self.assertIn(
+            'program = "${self.packages.${system}.default}/bin/rigx";', out
+        )
+        self.assertIn("rigx = self.apps.${system}.default;", out)
+
+    def test_runtime_path_wraps_binaries_onto_path(self):
+        out = nix_gen.generate(
+            _project(
+                name="rigx",
+                install=InstallSpec(bin="rigx", runtime_path=["nix", "git"]),
+            )
+        )
+        self.assertIn(
+            'makeWrapperArgs = [ "--prefix" "PATH" ":" '
+            "(pkgs.lib.makeBinPath [ pkgs.nix pkgs.git ]) ];",
+            out,
+        )
+
+    def test_no_runtime_path_omits_wrapper_args(self):
+        out = nix_gen.generate(
+            _project(name="rigx", install=InstallSpec(bin="rigx"))
+        )
+        self.assertNotIn("makeWrapperArgs", out)
+
+    def test_custom_bin_and_python_packages(self):
+        out = nix_gen.generate(
+            _project(
+                name="tool",
+                install=InstallSpec(
+                    bin="mytool",
+                    build_system=["hatchling"],
+                    python_packages="python311Packages",
+                ),
+            )
+        )
+        self.assertIn(
+            "mytool = pkgs.python311Packages.buildPythonApplication {", out
+        )
+        self.assertIn("build-system = [ pkgs.python311Packages.hatchling ];", out)
+        self.assertIn("default = mytool;", out)
+        self.assertIn(
+            'program = "${self.packages.${system}.default}/bin/mytool";', out
+        )
+
+    def test_bin_named_default_skips_self_alias(self):
+        # When bin == "default" the `<bin> = self.apps…default` alias would be
+        # a no-op self-reference; it must be suppressed.
+        out = nix_gen.generate(
+            _project(name="p", install=InstallSpec(bin="default"))
+        )
+        self.assertIn("default = default;", out)
+        self.assertNotIn("default = self.apps.${system}.default;", out)
 
 
 class GenerateExecutable(unittest.TestCase):

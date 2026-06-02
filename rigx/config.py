@@ -372,6 +372,36 @@ class Target:
 
 
 @dataclass
+class InstallSpec:
+    """`[project.install]` — marks the project as installable as a Python
+    application. Drives the generated flake's `packages.default` /
+    `apps.default`: a `buildPythonApplication` built from the project's
+    `pyproject.toml`, so the project installs straight from its repo with
+    `nix profile install <flakeref>` (or `nix run <flakeref>`), no PyPI or
+    host `uv`/`pip` needed.
+
+    Fields:
+      * `bin` — the console-script name the build produces (from
+        `pyproject.toml`'s `[project.scripts]`). Defaults to the project
+        name. Used both as the `packages.<system>.<bin>` attr and the
+        `apps.default` program path (`…/bin/<bin>`).
+      * `build_system` — nixpkgs `python_packages` attrs for the PEP 517
+        build backend. Defaults to `["setuptools"]`.
+      * `runtime_path` — nixpkgs attrs wrapped onto the installed app's
+        `PATH` via `makeWrapperArgs`. rigx itself shells out to `nix`, so
+        its own install sets `runtime_path = ["nix"]` to guarantee the
+        binary is reachable.
+      * `python_packages` — the nixpkgs Python package-set attr to build
+        against (e.g. `python311Packages` to pin a version). Defaults to
+        `python3Packages`.
+    """
+    bin: str
+    build_system: list[str] = field(default_factory=lambda: ["setuptools"])
+    runtime_path: list[str] = field(default_factory=list)
+    python_packages: str = "python3Packages"
+
+
+@dataclass
 class Project:
     name: str
     version: str
@@ -406,6 +436,11 @@ class Project:
     # `[external_inputs.<name>]` tables — host-provided binary inputs
     # resolved from env vars at config-load time. See `ExternalInput`.
     external_inputs: dict[str, "ExternalInput"] = field(default_factory=dict)
+    # `[project.install]` — when set, the flake exposes a `packages.default`
+    # / `apps.default` that builds the project as a Python application, so it
+    # installs straight from its repo (`nix profile install <flakeref>`). See
+    # `InstallSpec`. None disables the default package/app outputs.
+    install: "InstallSpec | None" = None
 
     def find_target(self, qualified: str) -> tuple["Project", str] | None:
         """Resolve a possibly-qualified target name (e.g. 'frontend.app') to
@@ -1285,6 +1320,53 @@ def _parse_external_inputs(
     return out
 
 
+def _parse_install(raw, project_name: str) -> "InstallSpec | None":
+    """Parse `[project.install]` into an InstallSpec (or None when absent).
+    See `InstallSpec` for the field semantics."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ConfigError("[project.install] must be a table")
+    unknown = set(raw.keys()) - {
+        "bin", "build_system", "runtime_path", "python_packages",
+    }
+    if unknown:
+        raise ConfigError(
+            f"[project.install]: unknown keys {sorted(unknown)} "
+            f"(allowed: bin, build_system, runtime_path, python_packages)"
+        )
+    bin_name = str(raw.get("bin", project_name))
+    if not bin_name:
+        raise ConfigError("[project.install].bin must be a non-empty string")
+    build_system = raw.get("build_system", ["setuptools"])
+    if not isinstance(build_system, list) or not all(
+        isinstance(x, str) for x in build_system
+    ):
+        raise ConfigError(
+            "[project.install].build_system must be a list of strings "
+            "(nixpkgs python package attrs, e.g. [\"setuptools\"])"
+        )
+    runtime_path = raw.get("runtime_path", [])
+    if not isinstance(runtime_path, list) or not all(
+        isinstance(x, str) for x in runtime_path
+    ):
+        raise ConfigError(
+            "[project.install].runtime_path must be a list of strings "
+            "(nixpkgs attrs wrapped onto the app's PATH, e.g. [\"nix\"])"
+        )
+    python_packages = str(raw.get("python_packages", "python3Packages"))
+    if not python_packages:
+        raise ConfigError(
+            "[project.install].python_packages must be a non-empty string"
+        )
+    return InstallSpec(
+        bin=bin_name,
+        build_system=list(build_system),
+        runtime_path=list(runtime_path),
+        python_packages=python_packages,
+    )
+
+
 def _load(root: Path, _visited: set[Path]) -> Project:
     if root in _visited:
         chain = " -> ".join(str(p) for p in [*_visited, root])
@@ -1312,6 +1394,7 @@ def _load(root: Path, _visited: set[Path]) -> Project:
     name = proj["name"]
     version = proj.get("version", "0.0.0")
     description = str(proj.get("description", ""))
+    install = _parse_install(proj.get("install"), name)
 
     # Optional source-filter knobs. Globs are kept in raw form here — the
     # `rigx.sources` module expands them against the project tree at codegen
@@ -1554,10 +1637,22 @@ def _load(root: Path, _visited: set[Path]) -> Project:
                         f"(canonical: `$UID:$GID`)"
                     )
 
+    # `[project.install]` emits `packages.<system>.<bin>` (+ `default`).
+    # Reject a target whose attr name would collide with either.
+    if install is not None:
+        for reserved in (install.bin, "default"):
+            if reserved in targets:
+                raise ConfigError(
+                    f"[project.install] would emit a package attr "
+                    f"{reserved!r}, which collides with target {reserved!r}; "
+                    f"rename the target or set [project.install].bin"
+                )
+
     return Project(
         name=name,
         version=version,
         description=description,
+        install=install,
         nixpkgs_ref=nixpkgs_ref,
         git_deps=git_deps,
         local_deps=local_deps,

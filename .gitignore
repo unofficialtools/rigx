@@ -13,6 +13,11 @@ venv/
 
 # rigx-generated (in any subproject)
 **/flake.nix
+# …except this repo's own root flake.nix: rigx is installable from its flake
+# (`nix profile install github:unofficialtools/rigx/stable`), so the root
+# flake.nix must ship in the repo. It's codegen-owned — regenerate with
+# `rigx lock` and commit the result.
+!/flake.nix
 **/output/
 result
 nixpkgs-pkg/

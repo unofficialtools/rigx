@@ -1,6 +1,14 @@
 [project]
 name = "rigx"
-version = "0.1.0"
+version = "0.8.3"
+
+# Make rigx installable straight from this repo's flake:
+#   nix profile install github:unofficialtools/rigx/stable
+#   nix run     github:unofficialtools/rigx/stable -- --help
+# Builds rigx as a buildPythonApplication from pyproject.toml and wraps the
+# pinned `nix` onto its PATH (rigx shells out to `nix` at runtime).
+[project.install]
+runtime_path = ["nix"]
 
 [nixpkgs]
 ref = "nixos-24.11"
@@ -34,7 +42,16 @@ script       = """
 PYTHONPATH=. python3 -m rigx -C example-project build -j 4
 """
 
-# `rigx run publish` — builds sdist + wheel with uv, then uploads to PyPI.
+# `rigx run publish` — full release: run tests, tag the release, push, then
+# build sdist + wheel with uv and upload to PyPI. Aborts before tagging or
+# publishing if the test suite fails.
+#
+# Sequence:
+#   1. python3 -m unittest discover tests   (abort the release on failure)
+#   2. git tag v$VERSION                     (version read from pyproject.toml)
+#   3. git push origin master || true        (don't fail if nothing to push)
+#   4. git push --tags
+#   5. uv build && uv publish
 #
 # Token resolution (first match wins):
 #   1. UV_PUBLISH_TOKEN environment variable.
@@ -42,12 +59,32 @@ PYTHONPATH=. python3 -m rigx -C example-project build -j 4
 # (`uv publish` does NOT read ~/.pypirc on its own — that's a twine
 # convention. We extract it here for convenience.)
 #
-# Runs host-side via `nix shell` with the pinned nixpkgs `uv` — not inside
-# a sandbox — because publishing is a side-effecting network action.
+# Runs host-side via `nix shell` with the pinned nixpkgs `uv`/`git` — not
+# inside a sandbox — because publishing and pushing are side-effecting
+# network actions.
 [targets.publish]
 kind = "script"
-deps.nixpkgs = ["uv", "python3"]
+deps.nixpkgs = ["uv", "python3", "git"]
 script = """
+set -euo pipefail
+
+# 1. Run the test suite first — never tag or publish a broken release.
+PYTHONPATH=. python3 -m unittest discover tests
+
+# 2. Tag this release. Version comes from pyproject.toml (single source of
+#    truth for the published artifact).
+VERSION=$(sed -nE 's/^version = "(.*)"$/\\1/p' pyproject.toml | head -1)
+if [ -z "$VERSION" ]; then
+  echo "publish: could not read version from pyproject.toml" >&2
+  exit 1
+fi
+git tag "v$VERSION"
+
+# 3. Push the branch (tolerate "everything up-to-date"), then the new tag.
+(git push origin master || true)
+git push --tags
+
+# 4. Build and upload to PyPI.
 rm -rf dist
 uv build
 

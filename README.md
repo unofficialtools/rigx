@@ -206,52 +206,42 @@ What's different:
   (toolchains, `uv`, language-specific interpreters, …) comes from nixpkgs on
   demand and is pinned in `flake.lock`.
 
-Python is provided by whatever channel you use to install rigx (PyPI install
-methods manage it for you; nixpkgs brings it along automatically). For
-generating Python `uv.lock` files you can run `rigx pkg uv -- lock` — rigx
-pulls `uv` (or any other binary) from the project's pinned nixpkgs, no host
-install needed.
+Everything else — Python, `uv`, language toolchains — comes from nixpkgs, so
+Nix is the only thing you install on the host. rigx ships as a Nix flake and is
+itself installed straight from this repo (see below); its own Python runtime is
+pulled from nixpkgs. For generating Python `uv.lock` files you can run
+`rigx pkg uv -- lock` — rigx pulls `uv` (or any other binary) from the project's
+pinned nixpkgs, no host install needed.
 
 ## Installation
 
-### From PyPI
-
-Pick whichever matches your toolchain. Nix is **not** bundled — if it isn't
-already on your `PATH`, rigx prints install instructions the first time you run
-`rigx build`.
-
-**`uv tool install` (recommended — isolated, on your PATH):**
-```
-uv tool install rigx
-```
-Upgrade with `uv tool upgrade rigx`; remove with `uv tool uninstall rigx`.
-
-**`pipx` (same idea, pipx-managed venv):**
-```
-pipx install rigx
-```
-
-**`pip` in a virtualenv:**
-```
-python3 -m venv .venv
-. .venv/bin/activate
-pip install rigx
-```
-
-**Ephemeral (run once without installing):**
-```
-uv tool run rigx -C ./example-project build    # uv
-pipx run rigx -C ./example-project build       # pipx
-```
-
-On nixpkgs-Python systems you'll see an `externally-managed-environment` error
-from a bare `pip install` — use one of the isolated methods above instead.
-
-After installation, install Nix:
+First install Nix (the only host prerequisite):
 - macOS / Linux (official): `sh <(curl -L https://nixos.org/nix/install) --daemon`
 - macOS / Linux (Determinate Systems): `curl --proto '=https' --tlsv1.2 -sSf -L https://install.determinate.systems/nix | sh -s -- install`
 
-Restart your shell (or source `/nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh`), then confirm: `nix --version && rigx --help`.
+Restart your shell (or source `/nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh`).
+rigx enables flakes per-invocation, but if your Nix predates flakes-by-default
+add `experimental-features = nix-command flakes` to `~/.config/nix/nix.conf`.
+
+### From this repo (the `stable` tag)
+
+rigx installs directly from its flake — no PyPI, pip, or host `uv` required.
+The `stable` tag tracks the latest release commit.
+
+**`nix profile install` (recommended — isolated, on your `PATH`):**
+```
+nix profile install github:unofficialtools/rigx/stable
+```
+Upgrade with `nix profile upgrade rigx`; remove with `nix profile remove rigx`.
+Pin a specific release instead of `stable` with a version tag, e.g.
+`github:unofficialtools/rigx/v0.8.3`.
+
+**Ephemeral (run once without installing):**
+```
+nix run github:unofficialtools/rigx/stable -- -C ./example-project build
+```
+
+Confirm the install: `nix --version && rigx --help`.
 
 
 ## Usage
@@ -365,6 +355,38 @@ respect_gitignore = true         # default true; intersects with `git ls-files` 
 - Use `rigx ls-source <target>` to print the resolved file list and verify what's about to be hashed into a derivation.
 
 For data files alongside code: list the data directory in the target's `includes` field (its contents are bundled into `src` automatically), or omit `target.sources` so the target inherits the full project baseline.
+
+### `[project.install]` — make the project installable from its flake
+
+Add this table to expose a `packages.default` / `apps.default` in the generated
+flake, built from the project's `pyproject.toml`. The project then installs
+straight from its repo — no PyPI, `pip`, or host `uv` needed:
+
+```
+nix profile install github:you/yourproject          # or .../<tag>
+nix run             github:you/yourproject -- --help
+```
+
+```toml
+[project.install]
+bin             = "rigx"            # console-script name from [project.scripts]; default = project name
+build_system    = ["setuptools"]   # nixpkgs python package attrs for the PEP 517 backend; default ["setuptools"]
+runtime_path    = ["nix"]          # nixpkgs attrs wrapped onto the installed binary's PATH (makeWrapperArgs)
+python_packages = "python3Packages"  # nixpkgs python set to build against; e.g. "python311Packages" to pin
+```
+
+- Emits `packages.<system>.<bin>` plus a `default` alias, and an
+  `apps.<system>.default` whose program is `…/bin/<bin>`. `<bin>` must not
+  collide with a target name.
+- The package is a `buildPythonApplication` (`pyproject = true`) whose source
+  is the whole project tree, so `pyproject.toml` and your package directory are
+  always present regardless of any `[project].sources` filtering.
+- `runtime_path` is for tools the app shells out to at runtime. rigx itself
+  sets `runtime_path = ["nix"]` so the pinned `nix` is always on the installed
+  binary's `PATH`.
+- nixpkgs 24.11 ships setuptools 75.x — use the table form
+  `license = { text = "…" }` in `pyproject.toml` (the SPDX-string form needs
+  setuptools ≥ 77).
 
 ### `[nixpkgs]`
 

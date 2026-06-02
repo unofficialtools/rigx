@@ -71,6 +71,92 @@ class LoadMinimal(unittest.TestCase):
         self.assertEqual(proj.nixpkgs_ref, "nixos-unstable")
 
 
+class LoadInstall(unittest.TestCase):
+    def test_absent_install_is_none(self):
+        body = """
+            [project]
+            name = "p"
+        """
+        with TempProject(body) as root:
+            self.assertIsNone(config.load(root).install)
+
+    def test_install_defaults(self):
+        body = """
+            [project]
+            name = "mytool"
+
+            [project.install]
+        """
+        with TempProject(body) as root:
+            spec = config.load(root).install
+        self.assertIsNotNone(spec)
+        self.assertEqual(spec.bin, "mytool")  # defaults to project name
+        self.assertEqual(spec.build_system, ["setuptools"])
+        self.assertEqual(spec.runtime_path, [])
+        self.assertEqual(spec.python_packages, "python3Packages")
+
+    def test_install_overrides(self):
+        body = """
+            [project]
+            name = "p"
+
+            [project.install]
+            bin = "cli"
+            build_system = ["hatchling"]
+            runtime_path = ["nix", "git"]
+            python_packages = "python311Packages"
+        """
+        with TempProject(body) as root:
+            spec = config.load(root).install
+        self.assertEqual(spec.bin, "cli")
+        self.assertEqual(spec.build_system, ["hatchling"])
+        self.assertEqual(spec.runtime_path, ["nix", "git"])
+        self.assertEqual(spec.python_packages, "python311Packages")
+
+    def test_unknown_key_rejected(self):
+        body = """
+            [project]
+            name = "p"
+
+            [project.install]
+            entrypoint = "p.cli:main"
+        """
+        with TempProject(body) as root:
+            with self.assertRaises(ConfigError) as cm:
+                config.load(root)
+        self.assertIn("unknown keys", str(cm.exception))
+
+    def test_runtime_path_must_be_list_of_strings(self):
+        body = """
+            [project]
+            name = "p"
+
+            [project.install]
+            runtime_path = "nix"
+        """
+        with TempProject(body) as root:
+            with self.assertRaises(ConfigError) as cm:
+                config.load(root)
+        self.assertIn("runtime_path", str(cm.exception))
+
+    def test_bin_collision_with_target_rejected(self):
+        body = """
+            [project]
+            name = "p"
+
+            [project.install]
+            bin = "tool"
+
+            [targets.tool]
+            kind = "executable"
+            sources = ["m.cpp"]
+        """
+        with TempProject(body) as root:
+            with self.assertRaises(ConfigError) as cm:
+                config.load(root)
+        self.assertIn("collides with target", str(cm.exception))
+
+
 class LoadGitDeps(unittest.TestCase):
     def test_defaults_and_overrides(self):
         body = """

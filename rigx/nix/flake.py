@@ -463,6 +463,37 @@ def target_block(
     return "\n".join(lines)
 
 
+def install_package_lines(project: Project) -> list[str]:
+    """Render the `rec`-scope attrs for `[project.install]`: a
+    `buildPythonApplication` named after the install `bin`, plus a `default`
+    alias. Sources come from the `installSrc` let-binding (whole tree minus
+    build scratch). Empty when the project isn't installable."""
+    spec = project.install
+    if spec is None:
+        return []
+    pkgset = f"pkgs.{spec.python_packages}"
+    build_system = nix_list([f"{pkgset}.{b}" for b in spec.build_system])
+    lines = [
+        f"{nix_id(spec.bin)} = {pkgset}.buildPythonApplication {{",
+        f"  pname = {nix_str(spec.bin)};",
+        f"  version = {nix_str(project.version)};",
+        "  src = installSrc;",
+        "  pyproject = true;",
+        f"  build-system = {build_system};",
+        "  doCheck = false;",
+    ]
+    if spec.runtime_path:
+        binpath = " ".join(f"pkgs.{p}" for p in spec.runtime_path)
+        lines.append(
+            f'  makeWrapperArgs = [ "--prefix" "PATH" ":" '
+            f"(pkgs.lib.makeBinPath [ {binpath} ]) ];"
+        )
+    lines.append(f"  meta.mainProgram = {nix_str(spec.bin)};")
+    lines.append("};")
+    lines.append(f"default = {nix_id(spec.bin)};")
+    return lines
+
+
 def generate(project: Project) -> str:
     """Return the contents of flake.nix for the given project."""
     out: list[str] = []
@@ -524,6 +555,19 @@ def generate(project: Project) -> str:
         w("      };")
     for line in _external_input_bindings(project):
         w(f"      {line}")
+    if project.install is not None:
+        # The installable app is built from the whole project tree (it needs
+        # pyproject.toml + the package sources), independent of any per-target
+        # `[project].sources` filtering. Same scratch-dir blacklist as srcRoot.
+        w("      installSrc = builtins.path {")
+        w("        path = ./.;")
+        w(f"        name = {nix_str(f'{project.name}-install-src')};")
+        w("        filter = path: type:")
+        w("          let base = baseNameOf (toString path); in")
+        w('          !(builtins.elem base [')
+        w('            ".rigx" "output" ".git" "result"')
+        w('          ]);')
+        w("      };")
     w("    in {")
     w("      packages = forAll (system:")
     w("        let")
@@ -550,7 +594,25 @@ def generate(project: Project) -> str:
                 10,
             ))
 
+    for line in install_package_lines(project):
+        w(indent(line, 10))
+
     w("        });")
+
+    if project.install is not None:
+        bin_attr = nix_id(project.install.bin)
+        w("      apps = forAll (system: {")
+        w("        default = {")
+        w('          type = "app";')
+        w(
+            "          program = "
+            f'"${{self.packages.${{system}}.default}}/bin/{project.install.bin}";'
+        )
+        w("        };")
+        if bin_attr != "default":
+            w(f"        {bin_attr} = self.apps.${{system}}.default;")
+        w("      });")
+
     w("    };")
     w("}")
     return "\n".join(out) + "\n"
