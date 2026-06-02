@@ -1,6 +1,6 @@
 [project]
 name = "rigx"
-version = "0.8.3"
+version = "0.9.1"
 
 # Make rigx installable straight from this repo's flake:
 #   nix profile install github:unofficialtools/rigx/stable
@@ -49,9 +49,10 @@ PYTHONPATH=. python3 -m rigx -C example-project build -j 4
 # Sequence:
 #   1. python3 -m unittest discover tests   (abort the release on failure)
 #   2. git tag v$VERSION                     (version read from pyproject.toml)
-#   3. git push origin master || true        (don't fail if nothing to push)
-#   4. git push --tags
-#   5. uv build && uv publish
+#   3. git tag -f stable                     (move the rolling `stable` tag here)
+#   4. git push origin master || true        (don't fail if nothing to push)
+#   5. git push --force --tags               (force: `stable` moved)
+#   6. uv build && uv publish
 #
 # Token resolution (first match wins):
 #   1. UV_PUBLISH_TOKEN environment variable.
@@ -71,20 +72,39 @@ set -euo pipefail
 # 1. Run the test suite first — never tag or publish a broken release.
 PYTHONPATH=. python3 -m unittest discover tests
 
-# 2. Tag this release. Version comes from pyproject.toml (single source of
-#    truth for the published artifact).
+# 2. Resolve the release version from pyproject.toml (source of truth for the
+#    published artifact) and fail fast on the two common foot-guns.
 VERSION=$(sed -nE 's/^version = "(.*)"$/\\1/p' pyproject.toml | head -1)
 if [ -z "$VERSION" ]; then
   echo "publish: could not read version from pyproject.toml" >&2
   exit 1
 fi
+# rigx.toml drives the Nix derivation version; pyproject.toml the PyPI
+# artifact. They must agree, or you ship mismatched metadata.
+RIGX_VERSION=$(sed -nE 's/^version = "(.*)"$/\\1/p' rigx.toml | head -1)
+if [ "$RIGX_VERSION" != "$VERSION" ]; then
+  echo "publish: version mismatch — pyproject.toml=$VERSION, rigx.toml=$RIGX_VERSION." >&2
+  echo "  Bump both to the same version before releasing." >&2
+  exit 1
+fi
+# Release tags are immutable — refuse to reuse one. (`stable` moves; `vX.Y.Z`
+# does not.) Bump the version if you meant to cut a new release.
+if git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null; then
+  echo "publish: tag v$VERSION already exists — bump the version in pyproject.toml and rigx.toml." >&2
+  exit 1
+fi
 git tag "v$VERSION"
 
-# 3. Push the branch (tolerate "everything up-to-date"), then the new tag.
-(git push origin master || true)
-git push --tags
+# 3. Move the rolling `stable` tag to this release. `nix profile add
+#    github:unofficialtools/rigx/stable` tracks this tag.
+git tag -f stable
 
-# 4. Build and upload to PyPI.
+# 4. Push the branch (tolerate "everything up-to-date"), then the tags.
+#    --force is required because `stable` is an existing tag being moved.
+(git push origin master || true)
+git push --force --tags
+
+# 5. Build and upload to PyPI.
 rm -rf dist
 uv build
 
