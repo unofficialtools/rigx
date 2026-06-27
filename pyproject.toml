@@ -9,7 +9,7 @@ description = "A Nix-backed declarative build system"
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [{ name = "Massimo Di Pierro" }]
-license = { text = "BSD-2-Clause" }
+license = { text = "BSD-3-Clause" }
 keywords = [
     "nix",
     "build-system",

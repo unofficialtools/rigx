@@ -2,7 +2,14 @@
 
 <p align="center"><img src="rigx.png" alt="rigx logo" width="320"></p>
 
-[VIDEO TUTORIAL - CPP DEMO](https://vimeo.com/1187129074)
+[VIDEO TUTORIAL - CPP DEMO](https://vimeo.com/1187129074) · [TESTBED VIDEO EXAMPLE](https://www.youtube.com/watch?v=scHcUO_asbo)
+
+We wanted a modern build system for humans — one that is *even easier* than
+Make, using the intuitive, purely declarative syntax of TOML, yet *as powerful*
+as Bazel. And rather than make you assemble your own dependencies and
+toolchains, we wanted it to rely on a single, standard, ready-made catalog of
+them: [nixpkgs](https://github.com/NixOS/nixpkgs), the largest collection of
+packages in the Linux world. That is `rigx`.
 
 > **Status: experimental.** This is an early version
 > APIs, the `rigx.toml` schema, and CLI behavior may change without
@@ -21,9 +28,14 @@ pulled in on demand, kept cached, and never pollute the host. Every build
 and test runs in a sandbox; outputs are cached for speed and land in an
 `output/` folder so the rest of your tree stays clean.
 
-This works through the magic of a system called Nix, which is referenced
-multiple times in this document — but you do not have to know Nix to use
-rigx. Install Nix and `rigx` once and forget about them.
+This works through a system called Nix. If you've never used it: Nix is a
+package manager and build system rolled into one — think `apt`/`yum` plus a
+build sandbox, except every package is pinned to an exact version and every
+build runs in isolation, so you get the *same* result on every machine. Its
+package catalog is called **nixpkgs** — the equivalent of your distro's
+repositories, but version-locked. rigx drives Nix for you, so although Nix is
+mentioned throughout this document, you do not have to learn it. Install Nix
+and `rigx` once and forget about them.
 
 `rigx` also offers some advanced features: running tests concurrently,
 running integration tests outside the sandbox, packaging artifacts as
@@ -32,9 +44,9 @@ testbeds that comprise multiple capsules and support fault injection.
 
 While rigx itself is written in Python, the actual build system is not
 Python — it's Nix. rigx works by parsing `rigx.toml` and generating a
-file called `flake.nix` (you will not need to read or edit this file).
-A flake tells Nix how to derive each target from its sources inside its
-own sandbox.
+file called `flake.nix` (a Nix build description — you will not need to
+read or edit it). It tells Nix how to build each target from its sources
+inside its own sandbox.
 
 **Why do I care about reproducibility?** Because if you ship anything
 that runs on your machine, you expect it to run the same way everywhere
@@ -42,9 +54,9 @@ else — your CI, your colleague's laptop, your customer's server. Most
 "works on my machine" bugs are really "I depended on something I didn't
 declare" bugs; rigx makes that class of bug structurally impossible.
 
-**Do I need to run NixOS to use rigx?** No. Rigx runs everywhere Nix runs.
-This means any Linux distribution (and macOS);
-Nix a tool you install alongside your existing OS, not a replacement for it.
+**Do I need to run NixOS to use rigx?** No. rigx runs everywhere Nix runs —
+any Linux distribution (and macOS). Nix is a tool you install alongside your
+existing OS, not a replacement for it.
 
 **Why use rigx instead of Make?** Make is a recipe runner: you write
 the shell commands and manage every dependency — including the
@@ -52,25 +64,26 @@ toolchain — yourself. That makes "works on my machine" the default
 failure mode, and Make has no idea whether your `gcc` matches your
 colleague's. rigx is declarative (you describe *what* to build, not the
 recipe), the toolchain comes from a pinned `nixpkgs`, builds run in a
-sandbox that can't see whatever you happen to have installed, and
-outputs are content-addressed and cached across machines.
+sandbox that can't see whatever you happen to have installed, and every
+output is cached under a hash of its inputs — so identical inputs reuse the
+same build instead of recompiling, even across machines.
 
-**Why use rigx instead of Bazel?** Bazel is more powerful — fine-grained
-action caching, Starlark for custom rules, true remote build execution,
-designed for 10k-target monorepos at a large company. The cost is a
-steep learning curve, `BUILD` / `WORKSPACE` files written in Starlark,
-and a heavyweight setup. rigx gives you most of the same wins
-(reproducibility, sandboxing, content-addressed caching, remote
-builders, multi-language) through a single declarative TOML file with
-no scripting layer. For most projects that's enough; if you're running
+**Why use rigx instead of Bazel?** (Skip this if you don't use Bazel.)
+Bazel is more powerful — fine-grained action caching, a scripting language
+(Starlark) for custom rules, true remote build execution, designed for
+10k-target monorepos at a large company. The cost is a steep learning curve,
+`BUILD` / `WORKSPACE` files written in Starlark, and a heavyweight setup.
+rigx gives you most of the same wins (reproducibility, sandboxing,
+input-hashed caching, remote builders, multi-language) through a single
+declarative TOML file with no scripting layer. For most projects that's enough; if you're running
 a monorepo with thousands of fine-grained build actions and a team to
 maintain it, reach for Bazel. Unlike Bazel, with Rigx you do not need
 to maintain your own toolchains. Moreover, Rigx supports the unique
 concepts of capsules and testbeds which allow you to orchestrate
 and test distributed applications.
 
-**Why use rigx instead of Cargo?** For a pure Rust project, you
-shouldn't — Cargo is the standard: crates.io, semver resolution,
+**Why use rigx instead of Cargo?** (Skip this if you don't use Rust.)
+For a pure Rust project, you shouldn't — Cargo is the standard: crates.io, semver resolution,
 incremental per-crate compilation, `cargo test`/`bench`/`doc`, and the
 entire ecosystem assumes it. rigx's `rustc`-based `kind = "executable"`
 is for single-source Rust binaries; it has no crate graph and no
@@ -147,14 +160,214 @@ What's different:
 - `rigx.toml` is pure data — no Starlark, no Make macros. Sharing values
   across targets is `[vars]`; sharing across folders is `[modules]` or
   `[dependencies.local.*]` (see below).
-- **Remote and distributed builds**: Nix supports remote builders
-  (`nix.conf`'s `builders = ssh://…` dispatches whole derivations to other
-  machines over SSH — handy for cross-platform builds and crude
-  parallelism) and binary caches (cache.nixos.org, Cachix, attic, S3 —
-  the equivalent of Bazel's remote cache). There's no per-action RBE
-  scheduler like Bazel's; granularity is whole derivations, not
-  individual actions. With a shared cache pointed at by your team and
-  CI, that's usually plenty.
+- **Remote and shared builds**: a build can be sent over SSH to another
+  machine (handy for compiling ARM on an x86 box, or spreading work around),
+  and a *binary cache* lets your team and CI download prebuilt outputs
+  instead of recompiling — like a package mirror for your build artifacts
+  (`cache.nixos.org` is the public one; you can host your own with Cachix,
+  attic, or plain S3). Nix ships whole targets, not individual compiler
+  invocations, so there's no per-action remote-execution scheduler like
+  Bazel's — but with a shared cache for your team and CI, that's usually
+  plenty.
+
+## More simple examples
+
+Each example below is a self-contained `rigx.toml` snippet you can copy and
+build. Dependencies such as `fmt`, `sqlite`, `catch2`, or `pytest` are named
+as **nixpkgs** packages — nixpkgs is a large online catalog of ready-to-build
+software that rigx pins to an exact version on your behalf. You never install
+these on your machine: rigx fetches and caches each one the first time a
+target needs it, and they never pollute your system. (If you've never heard
+of Nix or nixpkgs, that's fine — you don't have to learn either to use rigx.)
+
+### A Go program that links a nixpkgs library
+
+Go usually gets its libraries from Go modules, but it can also call C
+libraries through cgo. List the C library under `deps.nixpkgs` and rigx makes
+its headers and linker available to the build automatically:
+
+```toml
+[project]
+name = "go-sqlite"
+
+[targets.kv]
+kind         = "executable"
+sources      = ["src/kv.go"]      # cgo: `import "C"`, `#cgo LDFLAGS: -lsqlite3`,
+                                  #      `#include <sqlite3.h>`
+deps.nixpkgs = ["sqlite"]          # sqlite headers + library, pinned from nixpkgs
+```
+
+```
+rigx build kv
+./output/kv/bin/kv
+```
+
+### A Nim program that links a nixpkgs library
+
+Nim compiles through the C compiler, so the same idea works: pull the C
+library from nixpkgs and point Nim's linker at it with `nim_flags`:
+
+```toml
+[project]
+name = "nim-zlib"
+
+[targets.squeeze]
+kind         = "executable"
+sources      = ["src/squeeze.nim"]   # calls zlib's compress2() via `{.importc.}`
+deps.nixpkgs = ["zlib"]
+nim_flags    = ["-d:release", "--passL:-lz"]
+```
+
+```
+rigx build squeeze
+./output/squeeze/bin/squeeze
+```
+
+### A Zig program
+
+Zig brings its own compiler (also pinned from nixpkgs — nothing to install)
+and is an excellent cross-compiler, which the next example builds on:
+
+```toml
+[project]
+name = "zig-hello"
+
+[targets.hello_zig]
+kind     = "executable"
+sources  = ["src/hello.zig"]
+zigflags = ["-O", "ReleaseFast"]
+```
+
+```
+rigx build hello_zig
+./output/hello_zig/bin/hello_zig
+```
+
+### Cross-compilation example
+
+Add `target = "<triple>"` and rigx routes the build through the matching
+cross toolchain — no extra setup, nothing to install. The same source builds
+for another CPU or operating system:
+
+```toml
+[project]
+name = "cross"
+
+# A C program built for 64-bit ARM Linux from any host.
+[targets.hello_arm]
+kind    = "executable"
+sources = ["src/hello.c"]
+target  = "aarch64-linux"
+cflags  = ["-O2"]
+
+# Zig cross-compiles natively; here the same .zig is built for Windows.
+[targets.hello_win]
+kind    = "executable"
+sources = ["src/hello.zig"]
+target  = "x86_64-windows"
+```
+
+```
+rigx build hello_arm        # an aarch64 Linux binary
+file ./output/hello_arm/bin/hello_arm
+rigx build hello_win        # a Windows .exe
+```
+
+Built-in target aliases include `aarch64-linux`, `armv7-linux`,
+`x86_64-linux-musl`, and `x86_64-windows`; see
+[Cross-compilation](#cross-compilation) below for the full list and
+per-language details.
+
+### A C++ test
+
+A `kind = "test"` target is discovered and run by `rigx test`. Here a small
+test binary is built against the Catch2 framework (pulled from nixpkgs,
+header-only) and then run. By default tests run in an isolated, cached
+environment, so an unchanged test passes instantly without re-running:
+
+```toml
+[project]
+name = "cpp-test"
+
+# The code under test.
+[targets.calc]
+kind           = "static_library"
+sources        = ["src/calc.cpp"]
+includes       = ["include"]
+public_headers = ["include"]
+cxxflags       = ["-std=c++17"]
+
+# The test binary. tests/calc_test.cpp starts with:
+#   #define CATCH_CONFIG_MAIN
+#   #include <catch2/catch.hpp>
+[targets.calc_test_bin]
+kind          = "executable"
+sources       = ["tests/calc_test.cpp"]
+includes      = ["include"]
+cxxflags      = ["-std=c++17"]
+deps.internal = ["calc"]
+deps.nixpkgs  = ["catch2"]          # header-only test framework from nixpkgs
+
+# ${calc_test_bin} resolves to the built binary; the test just runs it.
+[targets.calc_test]
+kind          = "test"
+deps.internal = ["calc_test_bin"]
+script        = "${calc_test_bin}/bin/calc_test_bin"
+```
+
+```
+rigx test calc_test
+```
+
+### pytest with uv
+
+Say this project *is* a local Python package — `mypkg` — and you want to run
+its pytest suite. The package and its test dependency are described by the
+project's `pyproject.toml`, and rigx drives `uv` (a fast Python package
+manager, pulled from nixpkgs — nothing to install) to install the package
+plus pytest into a managed venv and run the tests against it:
+
+```
+myproject/
+├── rigx.toml
+├── pyproject.toml        # defines the `mypkg` package; pytest as a test dep
+├── uv.lock               # generated once by `rigx pkg uv -- lock`
+├── src/mypkg/__init__.py # the code under test
+└── tests/test_mypkg.py   # `from mypkg import …`, then asserts
+```
+
+```toml
+# pyproject.toml (sketch) — a standard local package with a test dependency:
+#
+#   [project]
+#   name = "mypkg"
+#   version = "0.1.0"
+#   dependencies = []                 # mypkg's own runtime deps go here
+#   [dependency-groups]
+#   dev = ["pytest"]                  # test-only deps
+#   [build-system]
+#   requires = ["setuptools"]
+#   build-backend = "setuptools.build_meta"
+
+[project]
+name = "mypkg"
+
+# `uv run` installs the local `mypkg` package (from pyproject.toml) plus its
+# dev/pytest dependency into a managed venv, then runs pytest — which imports
+# `mypkg` and executes everything under tests/.
+[targets.pytest_suite]
+kind         = "test"
+sandbox      = false              # uv resolves packages over the network
+deps.nixpkgs = ["uv"]             # uv comes from the pinned nixpkgs
+script       = """
+uv run --frozen pytest -q
+"""
+```
+
+```
+rigx pkg uv -- lock        # once, to create uv.lock
+rigx test pytest_suite     # installs mypkg + pytest, runs the suite
+```
 
 ## Features
 
@@ -180,7 +393,7 @@ What's different:
   `[modules]` (merged into one flake) or `[dependencies.local.*]` (each
   subfolder is its own flake, parent depends on built artifacts).
 - **Code generation as ordinary builds**: a `kind = "custom"` target
-  whose `install_script` runs your generator (protoc, fcslc, OpenAPI,
+  whose `install_script` runs your generator (protoc, capnp, OpenAPI,
   …) and writes the result into `$out`. Downstream targets pick the
   files up by writing `${gen}/foo.ext` into `sources` / `includes` /
   `flags`; the dep edge is auto-derived from the interpolation, so no
@@ -542,10 +755,10 @@ firmware, generated assets) into the build via env vars, without
 sacrificing sandboxing or reproducibility.
 
 ```toml
-[external_inputs.zenoh-c-aarch64]
-buckets       = { include = "ZENOH_C_INCLUDE_AARCH64",
-                  lib     = "ZENOH_C_LIB_AARCH64" }
-require_files = ["zenoh.h@include", "libzenohc.so@lib"]
+[external_inputs.vendor-sdk]
+buckets       = { include = "VENDOR_SDK_INCLUDE",
+                  lib     = "VENDOR_SDK_LIB" }
+require_files = ["widget.h@include", "libwidget.so@lib"]
 # Optional: pin the content hash so the build fails loudly when the host
 # blob changes. Per-bucket form (since each bucket lives in a separate
 # directory). Set as `sha256 = "…"` (scalar) when only one bucket is
@@ -572,16 +785,15 @@ Targets opt in via `deps.external` and reference the resolved paths with
 `${<name>.<bucket>}`:
 
 ```toml
-[targets.lander-fcsl-zenoh-binary-arm64]
+[targets.widget_demo]
 kind          = "executable"
 language      = "nim"
-target        = "aarch64-linux"
-deps.external = ["zenoh-c-aarch64"]
-sources       = ["${lander-control-zenoh-nim}/lander_control_zenoh.nim"]
+deps.external = ["vendor-sdk"]
+sources       = ["src/widget_demo.nim"]
 nim_flags     = [
     "--threads:on", "-d:release",
-    "--passC:-I${zenoh-c-aarch64.include}",
-    "--passL:-L${zenoh-c-aarch64.lib} -l:libzenohc.so",
+    "--passC:-I${vendor-sdk.include}",
+    "--passL:-L${vendor-sdk.lib} -l:libwidget.so",
 ]
 ```
 
@@ -695,9 +907,10 @@ deps.nixpkgs  = ["fmt"]
   resolved language is used.
 - Output: `$out/bin/<name>` in the Nix store, symlinked to `output/<name>`.
 - Linking (C/C++ only): `static_library` internal deps are added to the link
-  line as `${dep}/lib/lib<dep>.a`. Nixpkgs deps go on `buildInputs` (so
-  `NIX_CFLAGS_COMPILE` / `NIX_LDFLAGS` pick them up); add `-l<name>` in
-  `ldflags` to link a shared lib by soname.
+  line automatically as `${dep}/lib/lib<dep>.a`. For a `deps.nixpkgs` library,
+  rigx puts its headers and `lib/` on the compiler's and linker's search paths
+  for you (much like `pkg-config` would) — you just add the usual `-l<name>`
+  in `ldflags` to link it.
 
 ```toml
 # Go (toolchain auto-pulled; no need to list it in deps.nixpkgs)
@@ -840,8 +1053,10 @@ python_venv_extra = ["vendor", "wheels/*.whl"]  # optional; vendored wheels / pa
   interpreter with the venv's `site-packages` prepended to `PYTHONPATH`,
   plus the entry script's directory.
 - Dependencies come from `pyproject.toml` + `uv.lock`, **not** from
-  `deps.nixpkgs`. `uv sync --frozen` runs inside a fixed-output derivation
-  (FOD) that has network access for PyPI.
+  `deps.nixpkgs`. `uv sync --frozen` runs inside a *fixed-output derivation*
+  (FOD) — a build step that's allowed to reach the network (here, PyPI)
+  precisely because its result is pinned in advance by a hash, so the build
+  still can't smuggle in anything unexpected.
 
 **Vendored wheels / path-deps via `python_venv_extra`.** By default the venv
 FOD only sees `pyproject.toml` + `uv.lock`. That keeps the FOD hash a
@@ -953,7 +1168,7 @@ tar -C $TMPDIR -czf $out/release.tar.gz release
 
 #### Code generation with `custom`
 
-Code-generation steps (protoc, capnp, OpenAPI, fcslc, ROS message
+Code-generation steps (protoc, capnp, OpenAPI, ROS message
 generation, …) are just `custom` targets whose `install_script` writes the
 generated files into `$out`. Downstream targets reference the produced
 files via `${<gen-target>}/<file>` in `sources` / `includes` / `flags`;
@@ -961,23 +1176,26 @@ the dep edge is auto-derived from the interpolation (the producer's name
 appears in the path), so no `deps.internal` restatement is needed.
 
 ```toml
-# Generate Nim bindings from a JSON schema using an in-tree compiler.
-[targets.lander-control-zenoh-nim]
+# Generate C++ from a .proto with `protoc`, pulled straight from nixpkgs.
+# The generated greeting.pb.cc / greeting.pb.h land in $out.
+[targets.proto_gen]
 kind           = "custom"
-deps.internal  = ["fcslc"]
-sources        = ["examples/lander/fc/lander_control_zenoh.json"]
+deps.nixpkgs   = ["protobuf"]
+sources        = ["proto/greeting.proto"]
 install_script = """
 mkdir -p $out
-${fcslc}/bin/fcslc examples/lander/fc/lander_control_zenoh.json \\
-  -o $out/lander_control_zenoh.nim
+protoc --cpp_out=$out -I proto proto/greeting.proto
 """
 
-# Downstream target picks the generated file up by name. The interpolation
-# implicitly adds `lander-control-zenoh-nim` to this target's deps.internal.
-[targets.lander-fcsl-zenoh-binary]
-kind     = "executable"
-language = "nim"
-sources  = ["${lander-control-zenoh-nim}/lander_control_zenoh.nim"]
+# Downstream target picks the generated files up by name. The interpolation
+# implicitly adds `proto_gen` to this target's deps.internal.
+[targets.greeter_pb]
+kind         = "executable"
+sources      = ["src/main.cpp", "${proto_gen}/greeting.pb.cc"]
+includes     = ["${proto_gen}"]
+cxxflags     = ["-std=c++17"]
+deps.nixpkgs = ["protobuf"]
+ldflags      = ["-lprotobuf"]
 ```
 
 Mechanics are exactly those of any other `custom` build — cacheable on
@@ -1031,14 +1249,14 @@ keys, …) are read from your shell environment — set them before invoking
 ### `testbed` — interactive multi-capsule scenario
 
 ```toml
-[targets.start_lander_demo]
+[targets.start_demo]
 kind         = "testbed"
 deps.nixpkgs = ["python3"]
 deps.internal = [
-    "telemetry_receiver", "telemetry_visualizer", "lander_simulator",
+    "api_server", "web_frontend", "cache",
 ]
 script = """
-python3 testbeds/lander_demo.py
+python3 testbeds/demo.py
 """
 ```
 
@@ -1225,7 +1443,7 @@ rigx new executable hello                 # cxx default; src/hello.cpp
 rigx new executable tool --language go    # src/tool.go
 rigx new static_library mylib             # src/mylib.cpp + include/mylib.h
 rigx new test smoke                       # kind=test stub; run via `rigx test`
-rigx new testbed lander                   # interactive scenario stub; `rigx run lander`
+rigx new testbed demo                     # interactive scenario stub; `rigx run demo`
 rigx new run gen --run my_tool            # kind=run, invokes my_tool
 ```
 
@@ -2208,7 +2426,7 @@ git / local-flake inputs first.
 
 ## License
 
-BSD 2-Clause License. See [`LICENSE.md`](LICENSE.md) for the full text.
+BSD 3-Clause License. See [`LICENSE.md`](LICENSE.md) for the full text.
 
 ## Credits
 
