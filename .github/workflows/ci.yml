@@ -15,6 +15,15 @@ jobs:
 
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@main
+        with:
+          # Authenticate Nix's GitHub API calls. Host-side targets resolve
+          # `nixpkgs/<branch>` via the flake registry, which queries
+          # api.github.com to turn the branch into a commit. Unauthenticated,
+          # that shares the runner IP's ~60/hr limit and 429s (gzip body ->
+          # "invalid literal" JSON parse error). The token raises it to
+          # 5000/hr. GITHUB_TOKEN is injected automatically by Actions.
+          extra-conf: |
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
 
       - name: Cache Nix store
         uses: DeterminateSystems/magic-nix-cache-action@main

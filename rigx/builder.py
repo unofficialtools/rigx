@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fnmatch
+import json
 import shutil
 import subprocess
 import sys
@@ -134,6 +135,51 @@ def _flake_ref(project: Project, attr: str | None = None) -> str:
     return f"{ref}#{attr}" if attr else ref
 
 
+def _locked_nixpkgs_flakeref(root_str: str) -> str | None:
+    """Resolve the project's nixpkgs input to a pinned, registry-free flake
+    reference from flake.lock, e.g. ``github:NixOS/nixpkgs/<rev>``.
+
+    Host-side targets (`nix shell`/`nix run`) otherwise resolve
+    ``nixpkgs/<branch>`` through the flake registry, which calls the GitHub
+    API to turn the branch into a commit on *every* invocation — both
+    non-reproducible (host-side tool versions float on branch HEAD,
+    independent of the locked sandboxed builds) and rate-limited: in CI the
+    unauthenticated call shares the runner IP's ~60/hr budget and 429s.
+    Pinning to the locked rev fetches the commit directly (no commits-API
+    call) and matches the nixpkgs the project's flake is locked to.
+
+    Returns None when there's no usable lock — fresh project, unreadable
+    lock, or a non-github input — so callers fall back to the registry ref.
+    Not cached: ``flake.lock`` may be rewritten within a run (e.g. by
+    ``rigx lock``), and a small JSON read per host-side target is cheap.
+    """
+    try:
+        data = json.loads((Path(root_str) / "flake.lock").read_text())
+        nodes = data["nodes"]
+        edge = nodes[data["root"]]["inputs"]["nixpkgs"]
+        # An input edge is a node name, or a follow-path list ending in one.
+        node_name = edge[-1] if isinstance(edge, list) else edge
+        locked = nodes[node_name]["locked"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    owner, repo, rev = locked.get("owner"), locked.get("repo"), locked.get("rev")
+    if locked.get("type") != "github" or not (owner and repo and rev):
+        return None
+    return f"github:{owner}/{repo}/{rev}"
+
+
+def _nixpkgs_pkg_ref(project: Project, pkg: str) -> str:
+    """A flake reference to `pkg` from the project's nixpkgs.
+
+    Prefers the locked commit (registry-free, reproducible, no GitHub API
+    call); falls back to the registry indirection ``nixpkgs/<ref>`` when no
+    usable lock is present."""
+    base = _locked_nixpkgs_flakeref(str(project.root.resolve()))
+    if base is None:
+        base = f"nixpkgs/{project.nixpkgs_ref}"
+    return f"{base}#{pkg}"
+
+
 def run_nixpkgs_tool(
     project: Project,
     attr: str,
@@ -151,7 +197,7 @@ def run_nixpkgs_tool(
         nix,
         *NIX_EXPERIMENTAL,
         "run",
-        f"nixpkgs/{project.nixpkgs_ref}#{attr}",
+        _nixpkgs_pkg_ref(project, attr),
         "--",
         *args,
     ]
@@ -262,10 +308,7 @@ def run_script_target(
     """
     assert target.script is not None
     nix = _nix_bin()
-    refs = [
-        f"nixpkgs/{project.nixpkgs_ref}#{pkg}"
-        for pkg in target.deps.nixpkgs
-    ]
+    refs = [_nixpkgs_pkg_ref(project, pkg) for pkg in target.deps.nixpkgs]
     cmd = [
         nix,
         *NIX_EXPERIMENTAL,
@@ -551,10 +594,7 @@ def _run_test_capture(project: Project, target) -> tuple[int, str]:
     parallel test output doesn't interleave on the parent terminal."""
     assert target.script is not None
     nix = _nix_bin()
-    refs = [
-        f"nixpkgs/{project.nixpkgs_ref}#{pkg}"
-        for pkg in target.deps.nixpkgs
-    ]
+    refs = [_nixpkgs_pkg_ref(project, pkg) for pkg in target.deps.nixpkgs]
     cmd = [
         nix, *NIX_EXPERIMENTAL, "shell", *refs, "--command",
         "bash", "-eo", "pipefail", "-c", target.script, target.name,
