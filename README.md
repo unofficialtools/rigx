@@ -677,6 +677,152 @@ flake = true                 # must be a flake in this version (default true)
 attr  = "default"            # attribute inside packages.${system} (default "default")
 ```
 
+A target then pulls the built package into its `buildInputs`:
+
+```toml
+[targets.app]
+kind        = "executable"
+sources     = ["src/main.c"]
+deps.git    = ["mylib"]      # adds inputs.mylib.packages.${system}.<attr>
+deps.nixpkgs = ["pkg-config"]
+```
+
+#### How `rev` becomes a Nix flake URL
+
+rigx turns each entry into a `git+` flake input. The shape of `rev` decides
+how it is pinned:
+
+| `rev` value                     | generated flake URL                          | meaning                  |
+| ------------------------------- | -------------------------------------------- | ------------------------ |
+| `"v1.0.0"` / `"main"` (default `"HEAD"`) | `git+<url>?ref=v1.0.0`               | a git **ref** (tag/branch) |
+| 40-char hex SHA                 | `git+<url>?rev=<sha>`                         | an exact **commit**      |
+
+The detection is purely syntactic — a 40-character all-hex string is treated
+as a commit SHA, anything else as a ref (see `git_input_url` in
+`rigx/nix/flake.py`). A short SHA (`abc1234`) is **not** recognized as a
+commit; it goes through as `ref=abc1234`, which git can usually still resolve
+but is not a reproducible pin. Use the full 40-character SHA when you want an
+immutable pin.
+
+#### Concrete examples
+
+```toml
+# Pin to an exact commit (most reproducible — recommended for releases)
+[dependencies.git.libfmt]
+url = "https://github.com/fmtlib/fmt"
+rev = "e69e5f977d458f2650bb346dadf2ad30c5320281"
+
+# Track a moving branch (re-pinned each time you run `rigx lock`)
+[dependencies.git.devlib]
+url = "https://github.com/example/devlib"
+rev = "main"
+
+# Consume a non-default package from the dependency's flake
+[dependencies.git.toolkit]
+url  = "https://github.com/example/toolkit"
+rev  = "v2.3.0"
+attr = "cli"                 # -> inputs.toolkit.packages.${system}.cli
+```
+
+#### Private repositories
+
+rigx does not handle authentication itself — it emits a flake input and lets
+Nix (and the git it shells out to) authenticate using your host credentials.
+Use a transport git can already authenticate:
+
+```toml
+# SSH — uses your ssh-agent / ~/.ssh keys
+[dependencies.git.internal]
+url = "ssh://git@github.com/your-org/internal-lib"
+rev = "v1.0.0"
+
+# HTTPS — uses your git credential helper / a token in the credential store
+[dependencies.git.internal]
+url = "https://github.com/your-org/internal-lib"
+rev = "v1.0.0"
+```
+
+Tips:
+- The `?ref=`/`?rev=` qualifier is appended by rigx, so put **only the repo
+  URL** in `url` — do not add your own `?` query string.
+- For CI, configure a git credential helper or an `access-tokens` entry in
+  `nix.conf` (e.g. `access-tokens = github.com=ghp_…`) so the fetch is
+  non-interactive. rigx passes nothing through itself.
+- If `nix` runs as the daemon, the **daemon's** credentials are what matter,
+  not your user's — a common cause of "works with `git clone`, fails under
+  `rigx build`".
+
+#### Submodules — not currently wired up
+
+The generated flake URL is `git+<url>?ref=…`/`?rev=…` and nothing else. rigx
+does **not** emit Nix's `?submodules=1` flag, and there is no toml field to
+request it, so a dependency's git submodules are **not** fetched. If you
+depend on a repo that needs its submodules, vendor them, switch to a flake
+that fetches them itself, or open an issue — supporting a
+`submodules = true` field is a small change to `git_input_url`.
+
+#### Transitive dependencies
+
+A git dependency that is itself a flake brings its **own** `inputs` along.
+Nix resolves that whole graph and records every node — direct and
+transitive — in this project's `flake.lock`. You only declare the direct
+edge; you don't list a dependency's dependencies.
+
+Caveat: rigx does not generate `inputs.<dep>.inputs.nixpkgs.follows =
+"nixpkgs"` overrides (there is no `follows` field). So if a git dependency
+pins its own `nixpkgs`, your build may evaluate **two** nixpkgs — yours and
+theirs. That is correct but heavier (more to download, larger closure). For a
+tightly-coupled set of repos, prefer `[dependencies.local.*]` or `[modules]`,
+which share the parent's pinned `[nixpkgs]`.
+
+#### `flake = false`
+
+Reserved. In this version a git dependency referenced via `deps.git` is
+consumed as `inputs.<name>.packages.${system}.<attr>`, which only exists for
+flake inputs — so leave `flake = true` (the default). A raw (non-flake)
+source tree input has no `packages` output and cannot be consumed this way
+yet.
+
+#### Locking, `flake.lock`, and narHash
+
+rigx never fetches git dependencies during config parsing — it generates a
+`flake.nix` whose `inputs` block lists every git dep, and Nix does the
+fetching and pinning. Run:
+
+```sh
+rigx lock        # regenerates flake.nix, then runs `nix flake lock`
+```
+
+This resolves every `ref`/`rev` to a concrete revision and writes
+`flake.lock`. **Commit `flake.lock`** — it is what makes a build reproducible
+on another machine: subsequent builds reuse the locked revisions instead of
+re-resolving `main` to whatever it points at today. Re-run `rigx lock` to
+deliberately advance the pins.
+
+Each locked input in `flake.lock` carries a `narHash`. A **NAR** is a "Nix
+ARchive" — Nix's own deterministic, reproducible serialization of a file
+tree (it normalizes timestamps, ordering, and permissions so the same content
+always serializes identically). The `narHash` is a SHA-256 over that
+serialization, i.e. a content hash of the fetched source tree. Nix verifies
+it on every build: if a tag is force-pushed or a server returns different
+bytes for the same revision, the hash mismatches and the build fails loudly
+instead of silently using changed code. A locked entry looks roughly like:
+
+```json
+"libfmt": {
+  "locked": {
+    "type": "git",
+    "url": "https://github.com/fmtlib/fmt",
+    "rev": "e69e5f977d458f2650bb346dadf2ad30c5320281",
+    "narHash": "sha256-Ab12…=="
+  },
+  "original": { "type": "git", "url": "https://github.com/fmtlib/fmt", "ref": "v1.0.0" }
+}
+```
+
+`original` is what you wrote in `rigx.toml`; `locked` (with `rev` + `narHash`)
+is the pin Nix resolved it to.
+
 ### `[dependencies.local.<name>]`
 
 Pull in a sibling rigx project as a **path flake input**. The sub-project
