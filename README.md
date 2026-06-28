@@ -11,10 +11,11 @@ toolchains, we wanted it to rely on a single, standard, ready-made catalog of
 them: [nixpkgs](https://github.com/NixOS/nixpkgs), the largest collection of
 packages in the Linux world. That is `rigx`.
 
-> **Status: experimental.** This is an early version
-> APIs, the `rigx.toml` schema, and CLI behavior may change without
-> notice. If you use it, please report issues, but don't rely on it
-> for production builds yet.
+> **Status: actively maintained.** The core build and test workflow has
+> been tested extensively in production by the [hirosim.com](https://hirosim.com)
+> project. Some of the more advanced features (such as capsules and
+> testbeds) are still experimental, and the `rigx.toml` schema and CLI
+> behavior may evolve. If you run into problems, please report issues.
 
 `rigx` is a build system (think Make or Bazel) for C, C++, Go, Rust, Zig,
 Nim, and Python — plus anything else you can script. It is designed to be
@@ -74,8 +75,10 @@ Bazel is more powerful — fine-grained action caching, a scripting language
 10k-target monorepos at a large company. The cost is a steep learning curve,
 `BUILD` / `WORKSPACE` files written in Starlark, and a heavyweight setup.
 rigx gives you most of the same wins (reproducibility, sandboxing,
-input-hashed caching, remote builders, multi-language) through a single
-declarative TOML file with no scripting layer. For most projects that's enough; if you're running
+input-hashed caching, multi-language) through a single
+declarative TOML file with no scripting layer. (Nix-level remote builders and
+shared caches also work with rigx builds when you configure them in Nix, but
+rigx doesn't provide or manage them itself.) For most projects that's enough; if you're running
 a monorepo with thousands of fine-grained build actions and a team to
 maintain it, reach for Bazel. Unlike Bazel, with Rigx you do not need
 to maintain your own toolchains. Moreover, Rigx supports the unique
@@ -160,15 +163,18 @@ What's different:
 - `rigx.toml` is pure data — no Starlark, no Make macros. Sharing values
   across targets is `[vars]`; sharing across folders is `[modules]` or
   `[dependencies.local.*]` (see below).
-- **Remote and shared builds**: a build can be sent over SSH to another
-  machine (handy for compiling ARM on an x86 box, or spreading work around),
-  and a *binary cache* lets your team and CI download prebuilt outputs
-  instead of recompiling — like a package mirror for your build artifacts
-  (`cache.nixos.org` is the public one; you can host your own with Cachix,
-  attic, or plain S3). Nix ships whole targets, not individual compiler
-  invocations, so there's no per-action remote-execution scheduler like
-  Bazel's — but with a shared cache for your team and CI, that's usually
-  plenty.
+- **Remote and shared builds (Nix-level, not a rigx feature)**: rigx itself
+  has no remote-execution or cache machinery — it just runs `nix build`. But
+  because rigx builds are ordinary Nix builds, they transparently pick up
+  whatever you configure *in Nix*: remote builders (so a build can be sent over
+  SSH to another machine — handy for compiling ARM on an x86 box) and a *binary
+  cache* (so your team and CI download prebuilt outputs instead of recompiling —
+  like a package mirror for your build artifacts; `cache.nixos.org` is the
+  public one, or host your own with Cachix, attic, or plain S3). Configuring
+  these is standard Nix setup (e.g. `nix.conf`), done independently of rigx.
+  Note that Nix ships whole targets, not individual compiler invocations, so
+  there's no per-action remote-execution scheduler like Bazel's — but with a
+  shared cache for your team and CI, that's usually plenty.
 
 ## More simple examples
 

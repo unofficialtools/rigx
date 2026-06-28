@@ -25,6 +25,9 @@ nixpkgs-pkg/
 # Nix
 .direnv/
 
+# Papers — kept out of version control for now (do not stage/commit)
+papers/
+
 # Editors / OS
 .vscode/
 .idea/
