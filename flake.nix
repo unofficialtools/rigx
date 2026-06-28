@@ -36,7 +36,7 @@
         in rec {
           unittests = pkgs.stdenv.mkDerivation {
             pname = "unittests";
-            version = "0.9.1";
+            version = "0.9.2";
             inherit src;
             buildInputs = [ pkgs.python3 ];
             dontConfigure = true;
@@ -52,7 +52,7 @@
           };
           rigx = pkgs.python3Packages.buildPythonApplication {
             pname = "rigx";
-            version = "0.9.1";
+            version = "0.9.2";
             src = installSrc;
             pyproject = true;
             build-system = [ pkgs.python3Packages.setuptools ];
