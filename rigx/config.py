@@ -623,7 +623,9 @@ def _expand_globs(
 
     `output_prefix` is prepended to every resolved path (literal or globbed).
     Used by `[modules]` so a module's `src/main.cpp` ends up as
-    `frontend/src/main.cpp` relative to the parent root.
+    `frontend/src/main.cpp` relative to the parent root. Absolute (or
+    `~`-anchored) literal entries pass through unprefixed — the prefix only
+    makes sense for project-relative paths (mirrors `_parse_volumes`).
 
     Entries that start with `${` are Nix-style interpolations (e.g. a
     reference into a `custom` target's `$out` like `${gen}/foo.nim`) and
@@ -634,7 +636,10 @@ def _expand_globs(
             out.append(item)
             continue
         if not any(c in item for c in "*?["):
-            out.append(output_prefix + item)
+            if item.startswith(("/", "~")):
+                out.append(item)
+            else:
+                out.append(output_prefix + item)
             continue
         # Path.glob only accepts relative patterns (an absolute one raises
         # NotImplementedError) — surface a clean error instead.
@@ -861,12 +866,14 @@ def _build_target(
         f"{tctx}.sources",
         output_prefix=path_prefix,
     )
+    # Absolute (or ~-anchored) paths pass through unprefixed, same as in
+    # `_expand_globs` / `_parse_volumes`.
     includes = [
-        path_prefix + i
+        i if i.startswith(("/", "~")) else path_prefix + i
         for i in _expand_list(tconf.get("includes", []), vars_table, f"{tctx}.includes")
     ]
     public_headers = [
-        path_prefix + p
+        p if p.startswith(("/", "~")) else path_prefix + p
         for p in _expand_list(
             tconf.get("public_headers", []), vars_table, f"{tctx}.public_headers"
         )

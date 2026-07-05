@@ -1367,6 +1367,35 @@ class Modules(unittest.TestCase):
         ):
             config.load(root)
 
+    def test_module_prefix_skips_absolute_paths(self):
+        # Absolute paths in sources/includes/public_headers must not get
+        # the module prefix prepended (`frontend//usr/include/foo`).
+        root = self._setup({
+            "rigx.toml": """
+                [project]
+                name = "p"
+
+                [modules]
+                include = ["frontend"]
+            """,
+            "frontend/rigx.toml": """
+                [targets.app]
+                kind = "executable"
+                sources = ["src/main.cpp", "/opt/sdk/extra.c"]
+                language = "c"
+                includes = ["inc", "/usr/include/foo"]
+                public_headers = ["/opt/sdk/api.h"]
+            """,
+            "frontend/src/main.cpp": "",
+        })
+        proj = config.load(root)
+        t = proj.targets["frontend.app"]
+        self.assertEqual(
+            t.sources, ["frontend/src/main.cpp", "/opt/sdk/extra.c"]
+        )
+        self.assertEqual(t.includes, ["frontend/inc", "/usr/include/foo"])
+        self.assertEqual(t.public_headers, ["/opt/sdk/api.h"])
+
     def test_mutually_including_modules_raise_clean_cycle_error(self):
         root = self._setup({
             "rigx.toml": """
