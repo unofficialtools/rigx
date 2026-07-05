@@ -170,6 +170,63 @@ class StartContract(unittest.TestCase):
         self.assertTrue(all(n.startswith("rigx-svc-") for n in names))
 
 
+class PreYieldCleanup(unittest.TestCase):
+    """`start()` writes a runtime-spec tempfile before launching the
+    runner. If the launch fails (nonzero exit, timeout) no Capsule is
+    yielded and the context-exit cleanup can't run — start() itself
+    must remove the tempfile."""
+
+    def test_spec_tempfile_removed_after_successful_exit(self):
+        runner_body = (
+            '#!/bin/sh\n'
+            'echo "$RIGX_RUNTIME_SPEC" > "$DUMP"\n'
+            'exit 0\n'
+        )
+        with fake_capsule("svc", runner_body=runner_body) as root:
+            dump = root / "spec-dump"
+            with mock.patch.dict(os.environ, {"DUMP": str(dump)}):
+                with capsule.start("svc", output_dir=root / "output"):
+                    spec_path = Path(dump.read_text().strip())
+                    self.assertTrue(spec_path.is_file())
+            self.assertFalse(spec_path.exists())
+
+    def test_runner_failure_cleans_up_spec_tempfile(self):
+        runner_body = (
+            '#!/bin/sh\n'
+            'echo "$RIGX_RUNTIME_SPEC" > "$DUMP"\n'
+            'exit 7\n'
+        )
+        with fake_capsule("svc", runner_body=runner_body) as root:
+            dump = root / "spec-dump"
+            with mock.patch.dict(os.environ, {"DUMP": str(dump)}):
+                with self.assertRaises(RuntimeError):
+                    with capsule.start("svc", output_dir=root / "output"):
+                        pass
+            spec_path = Path(dump.read_text().strip())
+            self.assertFalse(spec_path.exists())
+
+    def test_timeout_raises_clean_error_and_cleans_up_spec(self):
+        """A runner that outlives `timeout=` surfaces as RuntimeError
+        (not a raw subprocess.TimeoutExpired) and still cleans up the
+        spec tempfile."""
+        runner_body = (
+            '#!/bin/sh\n'
+            'echo "$RIGX_RUNTIME_SPEC" > "$DUMP"\n'
+            'sleep 5\n'
+        )
+        with fake_capsule("svc", runner_body=runner_body) as root:
+            dump = root / "spec-dump"
+            with mock.patch.dict(os.environ, {"DUMP": str(dump)}):
+                with self.assertRaises(RuntimeError) as ctx:
+                    with capsule.start(
+                        "svc", output_dir=root / "output", timeout=0.3
+                    ):
+                        pass
+            self.assertIn("did not finish", str(ctx.exception))
+            spec_path = Path(dump.read_text().strip())
+            self.assertFalse(spec_path.exists())
+
+
 class PublishTupleForm(unittest.TestCase):
     """`publish={cont: (addr, host)}` — the form `rigx.testbed`
     produces when capsules have distinct loopback addresses. Renders

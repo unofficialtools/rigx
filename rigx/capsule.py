@@ -325,6 +325,7 @@ def start(
     network: str | None = None,
     container_name: str | None = None,
     output_dir: Path | str | None = None,
+    timeout: float = 300.0,
 ) -> Iterator[Capsule]:
     """Start a built capsule as a detached container; stop on context exit.
 
@@ -363,6 +364,12 @@ def start(
             capsules reach each other by container name).
       container_name: stable container name. Default: `rigx-<name>-<uuid8>`.
       output_dir: project `output/` dir. Defaults to walking up from cwd.
+      timeout: seconds to wait for the lite/nixos runner to detach
+            (the runner `docker load`s the image, which can be slow
+            for large images — hence the generous 300s default).
+            Exceeding it raises RuntimeError. Not applied to qemu
+            (the runner stays in the foreground for the VM's whole
+            lifetime).
 
     Yields a `Capsule` handle. On context exit: `docker stop <name>` is
     invoked unconditionally; the `--rm` in the runner cleans up the
@@ -523,64 +530,76 @@ def start(
     proc: subprocess.Popen | None = None
     log_path: Path | None = None
 
-    if backend == "qemu":
-        # Pipe runner output through a temp file; the parent test
-        # process is doing other things (waiting on TCP, talking to
-        # peers) and shouldn't have to drain Popen pipes to keep qemu
-        # from blocking. The file gets cleaned up in stop().
-        log_handle = tempfile.NamedTemporaryFile(
-            mode="wb", delete=False,
-            prefix=f"rigx-qemu-{name}-",
-            suffix=".log",
-        )
-        log_path = Path(log_handle.name)
-        try:
-            proc = subprocess.Popen(
-                [str(runner)],
-                env=runner_env,
-                stdin=subprocess.DEVNULL,
-                stdout=log_handle,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
+    try:
+        if backend == "qemu":
+            # Pipe runner output through a temp file; the parent test
+            # process is doing other things (waiting on TCP, talking to
+            # peers) and shouldn't have to drain Popen pipes to keep qemu
+            # from blocking. The file gets cleaned up in stop().
+            log_handle = tempfile.NamedTemporaryFile(
+                mode="wb", delete=False,
+                prefix=f"rigx-qemu-{name}-",
+                suffix=".log",
             )
-        except Exception:
-            log_handle.close()
+            log_path = Path(log_handle.name)
             try:
-                log_path.unlink()
-            except OSError:
-                pass
-            raise
-        finally:
-            log_handle.close()
-        # If qemu died immediately (bad args, missing binary, image
-        # mismatch) fail fast with the captured output instead of
-        # silently letting the test sit on a `wait_for_port`.
-        time.sleep(0.05)
-        if proc.poll() is not None:
-            tail = ""
+                proc = subprocess.Popen(
+                    [str(runner)],
+                    env=runner_env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_handle,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+            finally:
+                log_handle.close()
+            # If qemu died immediately (bad args, missing binary, image
+            # mismatch) fail fast with the captured output instead of
+            # silently letting the test sit on a `wait_for_port`.
+            time.sleep(0.05)
+            if proc.poll() is not None:
+                tail = ""
+                try:
+                    tail = log_path.read_text(errors="replace")
+                except OSError:
+                    pass
+                raise RuntimeError(
+                    f"capsule {name!r}: runner exited immediately "
+                    f"(exit {proc.returncode})\n--- output ---\n{tail}"
+                )
+        else:
             try:
-                tail = log_path.read_text(errors="replace")
-            except OSError:
-                pass
-            raise RuntimeError(
-                f"capsule {name!r}: runner exited immediately "
-                f"(exit {proc.returncode})\n--- output ---\n{tail}"
-            )
-    else:
-        result = subprocess.run(
-            [str(runner)],
-            env=runner_env,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=60,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"capsule {name!r}: runner failed (exit {result.returncode})\n"
-                f"--- stdout ---\n{result.stdout}\n"
-                f"--- stderr ---\n{result.stderr}"
-            )
+                result = subprocess.run(
+                    [str(runner)],
+                    env=runner_env,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=timeout,
+                )
+            except subprocess.TimeoutExpired as e:
+                raise RuntimeError(
+                    f"capsule {name!r}: runner did not finish within "
+                    f"{timeout:.0f}s (a large image can make `docker load` "
+                    f"slow — pass start(..., timeout=…) to allow longer)"
+                ) from e
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"capsule {name!r}: runner failed (exit {result.returncode})\n"
+                    f"--- stdout ---\n{result.stdout}\n"
+                    f"--- stderr ---\n{result.stderr}"
+                )
+    except BaseException:
+        # Pre-yield failure: no Capsule was handed out, so the context-
+        # exit cleanup below never runs. Remove the tempfiles ourselves
+        # (best-effort) before propagating.
+        for tmp in (log_path, spec_path):
+            if tmp is not None:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+        raise
 
     cap = Capsule(
         name=name,
