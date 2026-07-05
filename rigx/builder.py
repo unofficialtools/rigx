@@ -779,6 +779,11 @@ def build(
 
 def clean(project: Project) -> None:
     output_dir = _output_dir(project)
+    if output_dir.is_symlink():
+        # output/ itself is a symlink — iterating through it would delete
+        # the *link target's* contents. Remove just the link.
+        output_dir.unlink()
+        return
     if output_dir.exists():
         # Remove symlinks and their contents (but not the Nix store paths themselves).
         for child in output_dir.iterdir():

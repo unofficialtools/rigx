@@ -260,6 +260,51 @@ class RunNamedScript(unittest.TestCase):
         self.assertEqual(len(cmd), i + 3)
 
 
+class CleanSymlinkedOutput(unittest.TestCase):
+    def test_symlinked_output_dir_is_unlinked_not_followed(self):
+        # clean() on a symlinked output/ used to follow the link, delete
+        # the target's contents, then crash on rmdir. It must remove only
+        # the link and leave the target untouched.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            real = root / "real-store"
+            real.mkdir()
+            (real / "keep.txt").write_text("precious")
+            (root / "proj").mkdir()
+            out = root / "proj" / "output"
+            out.symlink_to(real)
+            proj = Project(
+                name="p",
+                version="0.1.0",
+                nixpkgs_ref="nixos-24.11",
+                git_deps={},
+                targets={},
+                root=root / "proj",
+            )
+            builder.clean(proj)
+            self.assertFalse(out.is_symlink())
+            self.assertTrue((real / "keep.txt").is_file())
+
+    def test_regular_output_dir_still_removed(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out = root / "output"
+            (out / "sub").mkdir(parents=True)
+            (out / "sub" / "f.txt").write_text("x")
+            proj = Project(
+                name="p",
+                version="0.1.0",
+                nixpkgs_ref="nixos-24.11",
+                git_deps={},
+                targets={},
+                root=root,
+            )
+            builder.clean(proj)
+            self.assertFalse(out.exists())
+
+
 class BuildRejectsScript(unittest.TestCase):
     def test_build_points_at_rigx_run(self):
         proj = _project_with(
