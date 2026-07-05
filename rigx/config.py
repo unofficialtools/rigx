@@ -594,6 +594,10 @@ def _expand_list(items, vars: dict[str, list[str]], ctx: str) -> list[str]:
     'target hello: sources')."""
     if items is None:
         return []
+    if not isinstance(items, list):
+        # A scalar string would iterate per character below — reject it
+        # loudly instead.
+        raise ConfigError(f"{ctx}: must be a list of strings, got {items!r}")
     out: list[str] = []
     for item in items:
         if not isinstance(item, str):

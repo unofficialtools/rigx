@@ -468,6 +468,23 @@ class ValidationErrors(unittest.TestCase):
             ):
                 config.load(root)
 
+    def test_scalar_string_list_field_rejected(self):
+        # `args = "hello"` would otherwise iterate per character.
+        body = """
+            [project]
+            name = "p"
+            [targets.r]
+            kind = "run"
+            run = "tool"
+            args = "hello"
+            outputs = ["a"]
+        """
+        with TempProject(body) as root:
+            with self.assertRaisesRegex(
+                ConfigError, r"args: must be a list of strings"
+            ):
+                config.load(root)
+
     def test_custom_missing_install_script(self):
         body = """
             [project]
