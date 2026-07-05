@@ -7,10 +7,18 @@ import sys
 from pathlib import Path
 
 from rigx import config, scaffold
+from rigx.commands.helpers import find_project_root
 
 
 def cmd_new(args: argparse.Namespace) -> int:
-    root = Path(args.project) if args.project else Path.cwd()
+    if args.project:
+        root = Path(args.project)
+    else:
+        try:
+            root = find_project_root(Path.cwd())
+        except SystemExit:
+            # Keep the friendlier "create one first" message below.
+            root = Path.cwd()
     toml_path = root / "rigx.toml"
     if not toml_path.is_file():
         print(

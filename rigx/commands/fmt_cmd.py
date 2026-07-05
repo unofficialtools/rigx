@@ -7,10 +7,11 @@ import sys
 from pathlib import Path
 
 from rigx import fmt
+from rigx.commands.helpers import find_project_root
 
 
 def cmd_fmt(args: argparse.Namespace) -> int:
-    root = Path(args.project) if args.project else Path.cwd()
+    root = Path(args.project) if args.project else find_project_root(Path.cwd())
     toml_path = root / "rigx.toml"
     if not toml_path.is_file():
         print(f"rigx: no rigx.toml at {toml_path}", file=sys.stderr)

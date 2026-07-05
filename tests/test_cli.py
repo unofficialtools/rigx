@@ -311,6 +311,46 @@ class CmdNew(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("invalid TOML", err)
 
+    def test_finds_project_root_from_subdirectory(self):
+        # Without -C, cmd_new must search upward for rigx.toml like every
+        # other command, not assume cwd is the project root.
+        import os
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            (root / "rigx.toml").write_text('[project]\nname = "p"\n')
+            sub = root / "src" / "deep"
+            sub.mkdir(parents=True)
+            cwd = os.getcwd()
+            os.chdir(sub)
+            try:
+                out, err = io.StringIO(), io.StringIO()
+                with redirect_stdout(out), redirect_stderr(err):
+                    rc = cli.main(["new", "script", "task"])
+            finally:
+                os.chdir(cwd)
+            self.assertEqual(rc, 0, err.getvalue())
+            self.assertIn("[targets.task]", (root / "rigx.toml").read_text())
+
+
+class CmdFmt(unittest.TestCase):
+    def test_finds_project_root_from_subdirectory(self):
+        import os
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            (root / "rigx.toml").write_text('[project]\nname = "p"\n')
+            sub = root / "src"
+            sub.mkdir()
+            cwd = os.getcwd()
+            os.chdir(sub)
+            try:
+                out, err = io.StringIO(), io.StringIO()
+                with redirect_stdout(out), redirect_stderr(err):
+                    rc = cli.main(["fmt"])
+            finally:
+                os.chdir(cwd)
+            self.assertEqual(rc, 0, err.getvalue())
+            self.assertIn('name = "p"', out.getvalue())
+
 
 class FormatBytes(unittest.TestCase):
     def test_b(self):
