@@ -1087,6 +1087,36 @@ class CrossArchQemuHint(unittest.TestCase):
         out = builder._cross_arch_qemu_capsules(proj, ["plain_exe"])
         self.assertEqual(out, [])
 
+    def test_module_merged_capsule_resolved_from_nix_attr(self):
+        # Build failures carry Nix attrs (`frontend_cap`), not rigx names
+        # (`frontend.cap`); the hint used to never fire for module
+        # capsules because find_target only knows the dotted spelling.
+        proj = _project_with(**{
+            "frontend.cap": Target(
+                name="cap", namespace="frontend", kind="capsule",
+                backend="qemu", target="aarch64-linux",
+                entrypoint="/bin/true",
+            ),
+        })
+        out = builder._cross_arch_qemu_capsules(proj, ["frontend_cap"])
+        self.assertEqual(out, [("frontend_cap", "aarch64-linux")])
+
+    def test_variant_capsule_resolved_from_nix_attr(self):
+        proj = _project_with(**{
+            "cap": Target(
+                name="cap", kind="capsule", backend="qemu",
+                target="aarch64-linux", entrypoint="/bin/true",
+                variants={"arm": Variant(name="arm")},
+            ),
+        })
+        out = builder._cross_arch_qemu_capsules(proj, ["cap-arm"])
+        self.assertEqual(out, [("cap-arm", "aarch64-linux")])
+
+    def test_unknown_attr_still_skipped(self):
+        proj = self._proj()
+        out = builder._cross_arch_qemu_capsules(proj, ["no_such_attr"])
+        self.assertEqual(out, [])
+
     def test_hint_text_is_distro_agnostic(self):
         hint = builder._cross_arch_hint([("arm_cap", "aarch64-linux")])
         # Names the *what* (binfmt + nix.conf), not the *how* (apt/pacman).

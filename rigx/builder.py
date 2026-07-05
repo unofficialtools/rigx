@@ -475,19 +475,39 @@ def _cross_arch_qemu_capsules(
     `kind = "capsule"`, `backend = "qemu"` target whose `target` field
     differs from the empty default — i.e. wants a VM whose arch is not
     the host's. Building those needs binfmt + nix `extra-platforms` on
-    the host."""
+    the host.
+
+    `names` come from build failures, so they are Nix ATTRS (dots
+    sanitized to `_`, possibly `-<variant>` suffixed) — reverse-map them
+    onto rigx target names before looking anything up; a plain rigx name
+    is its own attr, so both spellings resolve."""
     out: list[tuple[str, str]] = []
     for name in names:
-        resolved = project.find_target(name)
-        if resolved is None:
-            continue
-        owner, dep_name = resolved
-        t = owner.targets.get(dep_name)
+        t = _target_for_attr(project, name)
         if t is None:
-            continue
+            resolved = project.find_target(name)
+            if resolved is None:
+                continue
+            owner, dep_name = resolved
+            t = owner.targets.get(dep_name)
+            if t is None:
+                continue
         if t.kind == "capsule" and t.backend == "qemu" and t.target:
             out.append((name, t.target))
     return out
+
+
+def _target_for_attr(project: Project, attr: str):
+    """Find the target whose Nix build attr is `attr` — the sanitized
+    key (`frontend_cap` for `frontend.cap`) or one of its variant attrs
+    (`frontend_cap-arm`). Returns None when nothing matches."""
+    for tname, t in project.targets.items():
+        base = _nix_id(tname)
+        if attr == base:
+            return t
+        if any(attr == f"{base}-{v}" for v in t.variant_names()):
+            return t
+    return None
 
 
 def _cross_arch_hint(cross_arch: list[tuple[str, str]]) -> str:
