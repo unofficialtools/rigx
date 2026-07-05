@@ -636,6 +636,13 @@ def _expand_globs(
         if not any(c in item for c in "*?["):
             out.append(output_prefix + item)
             continue
+        # Path.glob only accepts relative patterns (an absolute one raises
+        # NotImplementedError) — surface a clean error instead.
+        if item.startswith("/"):
+            raise ConfigError(
+                f"{ctx}: glob pattern {item!r} is absolute — "
+                f"glob patterns must be project-relative"
+            )
         # Path.glob handles `**` natively. Sort for deterministic Nix derivation
         # hashes and stable build commands.
         matches = sorted(

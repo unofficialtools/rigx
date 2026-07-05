@@ -572,6 +572,18 @@ class ValidationErrors(unittest.TestCase):
             ):
                 config.load(root)
 
+    def test_absolute_glob_pattern_rejected(self):
+        body = """
+            [project]
+            name = "p"
+            [targets.x]
+            kind = "executable"
+            sources = ["/opt/sdk/*.c"]
+        """
+        with TempProject(body) as root:
+            with self.assertRaisesRegex(ConfigError, "must be project-relative"):
+                config.load(root)
+
     def test_custom_missing_install_script(self):
         body = """
             [project]
