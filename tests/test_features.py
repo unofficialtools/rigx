@@ -4,6 +4,7 @@ that don't require a Nix runtime."""
 
 import json
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from textwrap import dedent
@@ -32,6 +33,38 @@ class Fmt(unittest.TestCase):
         once = fmt.format_toml(src)
         twice = fmt.format_toml(once)
         self.assertEqual(once, twice)
+
+    def test_nasty_string_values_round_trip(self):
+        # Multi-line strings used to be emitted verbatim inside """…"""
+        # with no escaping: backslashes (sed \1), embedded triple
+        # quotes, and trailing backslash/quote produced non-reparseable
+        # or corrupted TOML.
+        nasty = [
+            'sed -e "s/\\(a\\)/\\1/"\nsecond line',
+            'a """ b\nc',
+            "line1\nline2\\",
+            'line1\nline2"',
+            '"""\n"""',
+            "\nleading newline",
+            "tab\there\nand more",
+            'single line with \\1 and "quotes"',
+        ]
+        for value in nasty:
+            emitted = fmt._emit_scalar(value)
+            parsed = tomllib.loads(f"x = {emitted}")["x"]
+            self.assertEqual(parsed, value)
+
+    def test_multiline_script_round_trip(self):
+        # End-to-end: a script target containing sed backreferences
+        # survives fmt (the known `rigx fmt` corruption bug).
+        src = (
+            '[targets.t]\n'
+            'kind = "script"\n'
+            'script = "echo hi\\nsed -e \'s/\\\\(a\\\\)/\\\\1/\'"\n'
+        )
+        out = fmt.format_toml(src)
+        self.assertEqual(tomllib.loads(out), tomllib.loads(src))
+        self.assertEqual(fmt.format_toml(out), out)
 
     def test_canonical_section_order(self):
         # Sections come out in TOP_LEVEL_ORDER regardless of source order.

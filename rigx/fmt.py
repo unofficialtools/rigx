@@ -66,6 +66,31 @@ _TARGET_FIELD_ORDER = [
 ]
 
 
+def _escape_basic(v: str, *, multiline: bool = False) -> str:
+    """Escape a string per TOML basic-string rules. Backslashes and
+    quotes are always escaped so the value can never terminate the
+    string early or introduce a stray escape (sed-style `\\1`, embedded
+    `\"\"\"`, trailing backslash/quote are all safe). In multiline mode
+    literal newlines are kept for readability."""
+    out: list[str] = []
+    for ch in v:
+        if ch == "\\":
+            out.append("\\\\")
+        elif ch == '"':
+            out.append('\\"')
+        elif ch == "\n":
+            out.append("\n" if multiline else "\\n")
+        elif ch == "\t":
+            out.append("\t")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ord(ch) < 0x20 or ch == "\x7f":
+            out.append(f"\\u{ord(ch):04X}")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
 def _emit_scalar(v) -> str:
     if isinstance(v, bool):
         return "true" if v else "false"
@@ -73,10 +98,10 @@ def _emit_scalar(v) -> str:
         return repr(v)
     if isinstance(v, str):
         if "\n" in v:
-            return '"""\n' + v + '"""'
-        # Use double-quoted form; escape backslashes and quotes.
-        escaped = v.replace("\\", "\\\\").replace('"', '\\"')
-        return f'"{escaped}"'
+            # Multi-line basic string; TOML trims the newline right
+            # after the opening delimiter.
+            return '"""\n' + _escape_basic(v, multiline=True) + '"""'
+        return f'"{_escape_basic(v)}"'
     raise ValueError(f"cannot emit scalar: {v!r}")
 
 
