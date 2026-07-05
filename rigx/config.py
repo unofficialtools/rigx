@@ -737,9 +737,7 @@ def _parse_volumes(
     return out
 
 
-def _infer_language(
-    sources: list[str], explicit: str, kind: str, ctx: str
-) -> str:
+def _infer_language(sources: list[str], explicit: str, ctx: str) -> str:
     """Resolve a target's `language` field.
 
     With `explicit` set: validates it's one of the known languages.
@@ -923,7 +921,7 @@ def _build_target(
     language = ""
     if kind in KIND_LANGUAGES:
         language = _infer_language(
-            sources, str(tconf.get("language", "")), kind, tctx,
+            sources, str(tconf.get("language", "")), tctx,
         )
         if language not in KIND_LANGUAGES[kind]:
             raise ConfigError(
