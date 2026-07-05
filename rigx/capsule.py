@@ -455,7 +455,22 @@ def start(
                 parts.append(_fmt(spec, cont, "udp"))
         runner_env["RIGX_PUBLISH"] = ",".join(parts)
     if env:
-        runner_env["RIGX_ENV"] = ",".join(f"{k}={v}" for k, v in env.items())
+        for k, v in env.items():
+            if "\n" in k or "\n" in v:
+                raise ValueError(
+                    f"env[{k!r}]: newlines are not supported in capsule "
+                    f"env vars (the runner contract is line-oriented)"
+                )
+        # Legacy comma-separated encoding, kept for runners built by an
+        # older rigx. A comma-containing value can't be represented in
+        # it (the runner splits on commas), so such entries ride the
+        # JSON runtime spec only — new runners give the spec precedence.
+        legacy = [
+            f"{k}={v}" for k, v in env.items()
+            if "," not in k and "," not in v
+        ]
+        if legacy:
+            runner_env["RIGX_ENV"] = ",".join(legacy)
 
     vols = _normalize_volumes(volumes)
     if vols:
@@ -481,12 +496,12 @@ def start(
 
     # JSON runtime spec — primary contract since 0.7. Carries env,
     # publish, publish_udp, volumes, network, name as structured data so
-    # values with commas, newlines, or shell metacharacters round-trip
-    # cleanly. The legacy `RIGX_PUBLISH` / `RIGX_ENV` / `RIGX_VOLUMES`
-    # vars set above are kept as a fallback: a runner without jq, or an
-    # older runner that doesn't read RIGX_RUNTIME_SPEC, still works. New
-    # runners ALSO consume the legacy vars as overrides (the loader uses
-    # `${VAR:-jq_value}`), so anything set before this block wins.
+    # values with commas or shell metacharacters round-trip cleanly. The
+    # legacy `RIGX_PUBLISH` / `RIGX_ENV` / `RIGX_VOLUMES` vars set above
+    # are kept as a fallback: a runner without jq, or an older runner
+    # that doesn't read RIGX_RUNTIME_SPEC, still works. New runners give
+    # the spec precedence — fields present in it override the legacy
+    # vars.
     spec: dict = {"name": container_name}
     if network:
         spec["network"] = network

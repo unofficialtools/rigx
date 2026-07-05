@@ -128,12 +128,18 @@ def _emit_runtime_spec_loader(label: str) -> str:
         "user": str,
         "keep_state": bool }
 
-    The legacy comma-separated env-var contract is preserved as a
-    fallback — if `RIGX_RUNTIME_SPEC` is unset, no overrides happen and
-    the existing RIGX_PUBLISH / RIGX_ENV / RIGX_VOLUMES variables apply
-    as they did before.
+    The spec is authoritative: any field present in it OVERRIDES the
+    corresponding inherited RIGX_* env var (orchestrators set both; the
+    legacy vars only exist so runners built by an older rigx keep
+    working). Env entries are surfaced as the `_RIGX_SPEC_ENV` bash
+    array — one `KEY=VALUE` element each — so values containing commas
+    survive intact; values must not contain newlines (the orchestrator
+    rejects those up front). If `RIGX_RUNTIME_SPEC` is unset, no
+    overrides happen and the legacy comma-separated RIGX_PUBLISH /
+    RIGX_ENV / RIGX_VOLUMES variables apply as they did before.
     """
     return f"""\
+_RIGX_SPEC_ENV=()
 if [ -n "${{RIGX_RUNTIME_SPEC:-}}" ]; then
     if ! [ -r "$RIGX_RUNTIME_SPEC" ]; then
         echo "{label}: RIGX_RUNTIME_SPEC ($RIGX_RUNTIME_SPEC) is not readable" >&2
@@ -141,16 +147,21 @@ if [ -n "${{RIGX_RUNTIME_SPEC:-}}" ]; then
     fi
     if command -v jq >/dev/null 2>&1; then
         _rigx_jq() {{ jq -r "$@" "$RIGX_RUNTIME_SPEC" 2>/dev/null || true; }}
-        _v=$(_rigx_jq '.name // empty');           [ -n "$_v" ] && RIGX_NAME="${{RIGX_NAME:-$_v}}"
-        _v=$(_rigx_jq '.network // empty');        [ -n "$_v" ] && RIGX_NETWORK="${{RIGX_NETWORK:-$_v}}"
-        _v=$(_rigx_jq '.user // empty');           [ -n "$_v" ] && RIGX_USER="${{RIGX_USER:-$_v}}"
-        _v=$(_rigx_jq 'if .detach then "1" else empty end');     [ -n "$_v" ] && RIGX_DETACH="${{RIGX_DETACH:-$_v}}"
-        _v=$(_rigx_jq 'if .keep_state then "1" else empty end'); [ -n "$_v" ] && RIGX_KEEP_STATE="${{RIGX_KEEP_STATE:-$_v}}"
-        _v=$(_rigx_jq '(.publish // []) | join(",")');     [ -n "$_v" ] && RIGX_PUBLISH="${{RIGX_PUBLISH:-$_v}}"
-        _v=$(_rigx_jq '(.publish_udp // []) | join(",")'); [ -n "$_v" ] && RIGX_PUBLISH_UDP="${{RIGX_PUBLISH_UDP:-$_v}}"
-        _v=$(_rigx_jq '(.volumes // []) | join(",")');     [ -n "$_v" ] && RIGX_VOLUMES="${{RIGX_VOLUMES:-$_v}}"
-        _v=$(_rigx_jq '.env // {{}} | to_entries | map("\\(.key)=\\(.value)") | join(",")')
-        [ -n "$_v" ] && RIGX_ENV="${{RIGX_ENV:-$_v}}"
+        _v=$(_rigx_jq '.name // empty');           [ -n "$_v" ] && RIGX_NAME="$_v"
+        _v=$(_rigx_jq '.network // empty');        [ -n "$_v" ] && RIGX_NETWORK="$_v"
+        _v=$(_rigx_jq '.user // empty');           [ -n "$_v" ] && RIGX_USER="$_v"
+        _v=$(_rigx_jq 'if .detach then "1" else empty end');     [ -n "$_v" ] && RIGX_DETACH="$_v"
+        _v=$(_rigx_jq 'if .keep_state then "1" else empty end'); [ -n "$_v" ] && RIGX_KEEP_STATE="$_v"
+        _v=$(_rigx_jq '(.publish // []) | join(",")');     [ -n "$_v" ] && RIGX_PUBLISH="$_v"
+        _v=$(_rigx_jq '(.publish_udp // []) | join(",")'); [ -n "$_v" ] && RIGX_PUBLISH_UDP="$_v"
+        _v=$(_rigx_jq '(.volumes // []) | join(",")');     [ -n "$_v" ] && RIGX_VOLUMES="$_v"
+        _v=$(_rigx_jq '.env // {{}} | to_entries | map("\\(.key)=\\(.value)") | .[]')
+        if [ -n "$_v" ]; then
+            RIGX_ENV=""
+            while IFS= read -r _e; do
+                [ -n "$_e" ] && _RIGX_SPEC_ENV+=("$_e")
+            done <<< "$_v"
+        fi
     else
         echo "{label}: RIGX_RUNTIME_SPEC set but jq is not on PATH; ignoring (legacy RIGX_* vars still apply)" >&2
     fi
@@ -245,7 +256,9 @@ if [ -n "${{RIGX_PUBLISH_UDP:-}}" ]; then
     for p in "${{PUBS[@]}}"; do RUN_FLAGS+=(-p "$p/udp"); done
 fi
 
-if [ -n "${{RIGX_ENV:-}}" ]; then
+if [ ${{#_RIGX_SPEC_ENV[@]}} -gt 0 ]; then
+    for e in "${{_RIGX_SPEC_ENV[@]}}"; do RUN_FLAGS+=(-e "$e"); done
+elif [ -n "${{RIGX_ENV:-}}" ]; then
     IFS=',' read -ra EVS <<< "$RIGX_ENV"
     for e in "${{EVS[@]}}"; do RUN_FLAGS+=(-e "$e"); done
 fi
@@ -325,7 +338,9 @@ if [ -n "${{RIGX_PUBLISH_UDP:-}}" ]; then
     for p in "${{PUBS[@]}}"; do RUN_FLAGS+=(-p "$p/udp"); done
 fi
 
-if [ -n "${{RIGX_ENV:-}}" ]; then
+if [ ${{#_RIGX_SPEC_ENV[@]}} -gt 0 ]; then
+    for e in "${{_RIGX_SPEC_ENV[@]}}"; do RUN_FLAGS+=(-e "$e"); done
+elif [ -n "${{RIGX_ENV:-}}" ]; then
     IFS=',' read -ra EVS <<< "$RIGX_ENV"
     for e in "${{EVS[@]}}"; do RUN_FLAGS+=(-e "$e"); done
 fi

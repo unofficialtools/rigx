@@ -170,6 +170,67 @@ class StartContract(unittest.TestCase):
         self.assertTrue(all(n.startswith("rigx-svc-") for n in names))
 
 
+class StartEnvEncoding(unittest.TestCase):
+    """Env vars with commas can't ride the legacy comma-split RIGX_ENV
+    var — they travel via the JSON runtime spec only (new runners give
+    the spec precedence). Newlines are rejected outright."""
+
+    _RUNNER = (
+        '#!/bin/sh\n'
+        'env | grep "^RIGX_ENV=" > "$DUMP" || true\n'
+        'cat "$RIGX_RUNTIME_SPEC" > "$SPEC_DUMP"\n'
+        'exit 0\n'
+    )
+
+    def test_comma_value_rides_spec_only(self):
+        with fake_capsule("svc", runner_body=self._RUNNER) as root:
+            dump = root / "env-dump"
+            spec_dump = root / "spec-dump"
+            with mock.patch.dict(
+                os.environ, {"DUMP": str(dump), "SPEC_DUMP": str(spec_dump)}
+            ):
+                with capsule.start(
+                    "svc",
+                    env={"OPTS": "a,b", "FOO": "bar"},
+                    output_dir=root / "output",
+                ):
+                    pass
+            env_line = dump.read_text().strip()
+            spec = json.loads(spec_dump.read_text())
+        # Legacy var carries only the comma-free entry (an old runner
+        # would split "OPTS=a,b" into `-e OPTS=a -e b`)...
+        self.assertEqual(env_line, "RIGX_ENV=FOO=bar")
+        # ...while the spec carries every entry, intact.
+        self.assertEqual(spec["env"], {"OPTS": "a,b", "FOO": "bar"})
+
+    def test_all_comma_values_leave_legacy_var_unset(self):
+        with fake_capsule("svc", runner_body=self._RUNNER) as root:
+            dump = root / "env-dump"
+            spec_dump = root / "spec-dump"
+            with mock.patch.dict(
+                os.environ, {"DUMP": str(dump), "SPEC_DUMP": str(spec_dump)}
+            ):
+                with capsule.start(
+                    "svc",
+                    env={"OPTS": "a,b"},
+                    output_dir=root / "output",
+                ):
+                    pass
+            self.assertEqual(dump.read_text().strip(), "")
+            spec = json.loads(spec_dump.read_text())
+        self.assertEqual(spec["env"], {"OPTS": "a,b"})
+
+    def test_newline_in_env_value_rejected(self):
+        with fake_capsule("svc") as root:
+            with self.assertRaisesRegex(ValueError, "newlines"):
+                with capsule.start(
+                    "svc",
+                    env={"K": "a\nb"},
+                    output_dir=root / "output",
+                ):
+                    pass
+
+
 class PreYieldCleanup(unittest.TestCase):
     """`start()` writes a runtime-spec tempfile before launching the
     runner. If the launch fails (nonzero exit, timeout) no Capsule is
