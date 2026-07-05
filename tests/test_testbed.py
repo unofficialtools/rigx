@@ -290,6 +290,41 @@ class LifecycleRobustness(unittest.TestCase):
             self.assertTrue(net._running)
             self.assertEqual(len(net._listeners), 2)
 
+    def test_exit_closes_inflight_tcp_connections(self):
+        """`_stop()` must terminate proxied connections that are still
+        open — otherwise the pump threads sit in recv() forever and the
+        sockets leak across tests. The client should observe EOF (or a
+        reset) promptly after the testbed exits."""
+        net = testbed.Network()
+        listen_port, dst_port = _two_capsules(net)
+        with echo_server(dst_port):
+            net.__enter__()
+            client = socket.create_connection(
+                ("127.0.0.1", listen_port), timeout=2.0
+            )
+            try:
+                client.sendall(b"ping")
+                self.assertEqual(client.recv(4096), b"ping")
+                # Connection is established and idle: the proxy tracks
+                # its two sockets (client-side + upstream).
+                with net._conns_lock:
+                    self.assertEqual(len(net._conns), 2)
+                net.__exit__(None, None, None)
+                client.settimeout(1.0)
+                try:
+                    data = client.recv(4096)
+                except socket.timeout:
+                    self.fail(
+                        "proxied connection not closed by testbed teardown"
+                    )
+                except OSError:
+                    data = b""  # reset is fine too — connection is dead
+                self.assertEqual(data, b"")
+            finally:
+                client.close()
+        with net._conns_lock:
+            self.assertEqual(net._conns, set())
+
     def test_network_can_be_reentered_after_exit(self):
         """Exiting and re-entering the same Network must serve traffic
         again — `_stop()` latches `_stopping`, which `_start()` has to

@@ -310,6 +310,12 @@ class Network:
         self._links: dict[tuple[str, str, int, str], _Link] = {}
         self._listeners: list[socket.socket] = []
         self._threads: list[threading.Thread] = []
+        # In-flight TCP connection sockets (client + upstream per
+        # proxied connection). Tracked so `_stop()` can close them —
+        # otherwise the pump threads block in recv() forever and the
+        # fds leak across tests.
+        self._conns: set[socket.socket] = set()
+        self._conns_lock = threading.Lock()
         self._running = False
         self._stopping = False
         # Shared volumes — registered up-front via `shared_volume()`,
@@ -799,6 +805,22 @@ class Network:
                 sock.close()
             except OSError:
                 pass
+        # Terminate in-flight TCP connections so pump threads blocked
+        # in recv() wake up and release their fds. Snapshot under the
+        # lock, close outside it — a pump/proxy thread takes the same
+        # lock on its own exit path and must not deadlock against us.
+        with self._conns_lock:
+            conns = list(self._conns)
+            self._conns.clear()
+        for sock in conns:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
         for t in self._threads:
             t.join(timeout=1.0)
         self._listeners.clear()
@@ -867,6 +889,19 @@ class Network:
             client.close()
             return
 
+        # Register both sockets so `_stop()` can terminate the
+        # connection. If teardown already started, don't race it —
+        # close and bail instead of starting pumps `_stop` won't see.
+        with self._conns_lock:
+            registered = not self._stopping
+            if registered:
+                self._conns.add(client)
+                self._conns.add(upstream)
+        if not registered:
+            client.close()
+            upstream.close()
+            return
+
         def pump(src: socket.socket, dst: socket.socket, label: str) -> None:
             try:
                 while True:
@@ -902,6 +937,9 @@ class Network:
         t2.join()
         client.close()
         upstream.close()
+        with self._conns_lock:
+            self._conns.discard(client)
+            self._conns.discard(upstream)
 
     # --- UDP forwarder --------------------------------------------------
     #
