@@ -477,6 +477,17 @@ class ConfigError(ValueError):
     pass
 
 
+def _read_toml(path: Path) -> dict:
+    """Parse a TOML file, converting syntax errors into a ConfigError that
+    names the file — every command surfaces ConfigError cleanly, whereas a
+    raw tomllib.TOMLDecodeError is a traceback."""
+    with path.open("rb") as f:
+        try:
+            return tomllib.load(f)
+        except tomllib.TOMLDecodeError as e:
+            raise ConfigError(f"{path}: invalid TOML: {e}") from e
+
+
 _VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)")
 
 
@@ -557,8 +568,7 @@ def _load_vars(
             raise ConfigError(f"[vars].extends cycle: {chain}")
         if not ext_path.is_file():
             raise ConfigError(f"[vars].extends: file not found: {ext_path}")
-        with ext_path.open("rb") as f:
-            ext_data = tomllib.load(f)
+        ext_data = _read_toml(ext_path)
         ext_vars = _load_vars(ext_data, ext_path.parent, _visited | {ext_path})
         for k, v in ext_vars.items():
             if k in out:
@@ -1041,8 +1051,7 @@ def _enumerate_modules(
             raise ConfigError(f"module {ns}: include cycle: {chain}")
         if not (mod_root / "rigx.toml").is_file():
             raise ConfigError(f"module {ns}: no rigx.toml at {mod_root}")
-        with (mod_root / "rigx.toml").open("rb") as f:
-            mod_data = tomllib.load(f)
+        mod_data = _read_toml(mod_root / "rigx.toml")
         if "project" in mod_data:
             raise ConfigError(
                 f"module {ns}: must not contain [project] (parent owns identity)"
@@ -1178,8 +1187,7 @@ def _load_includes(
         if inc_path in _visited:
             chain = " -> ".join(str(p) for p in [*_visited, inc_path])
             raise ConfigError(f"include cycle: {chain}")
-        with inc_path.open("rb") as f:
-            inc_data = tomllib.load(f)
+        inc_data = _read_toml(inc_path)
         if "project" in inc_data:
             raise ConfigError(
                 f"include {inc_path}: must not contain [project] "
@@ -1446,8 +1454,7 @@ def _load(root: Path, _visited: set[Path]) -> Project:
     toml_path = root / "rigx.toml"
     if not toml_path.is_file():
         raise ConfigError(f"no rigx.toml found at {toml_path}")
-    with toml_path.open("rb") as f:
-        data = tomllib.load(f)
+    data = _read_toml(toml_path)
 
     # Inline top-level `include = [...]` files before any other parsing so
     # downstream code sees the merged dict transparently.

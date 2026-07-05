@@ -584,6 +584,17 @@ class ValidationErrors(unittest.TestCase):
             with self.assertRaisesRegex(ConfigError, "must be project-relative"):
                 config.load(root)
 
+    def test_toml_syntax_error_raises_config_error(self):
+        # A TOML syntax error must surface as ConfigError (which every
+        # command handles), not a raw tomllib traceback.
+        body = """
+            [project
+            name = "p"
+        """
+        with TempProject(body) as root:
+            with self.assertRaisesRegex(ConfigError, "invalid TOML"):
+                config.load(root)
+
     def test_custom_missing_install_script(self):
         body = """
             [project]
