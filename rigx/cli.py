@@ -201,15 +201,29 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _subcommand_index(argv: list[str]) -> int | None:
+    """Index of the actual subcommand token: the first token that is
+    neither a global flag nor a global flag's value (`-C`/`--project`
+    take a value). Returns None when argv holds no subcommand."""
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok in ("-C", "--project"):
+            i += 2  # skip the flag and its value
+            continue
+        if tok.startswith("-") and tok != "-":
+            # -V/--version/-h/--help, or inline forms -Cdir / --project=dir.
+            i += 1
+            continue
+        return i
+    return None
+
+
 def _split_pkg_passthrough(argv: list[str]) -> tuple[list[str], list[str]] | None:
     """If `rigx pkg <attr> …` is invoked, split off the trailing args for
     forwarding to the nixpkgs binary."""
-    try:
-        i = argv.index("pkg")
-    except ValueError:
-        return None
-    prev = argv[i - 1] if i > 0 else ""
-    if prev in {"-C", "--project"}:
+    i = _subcommand_index(argv)
+    if i is None or argv[i] != "pkg":
         return None
     if i + 1 >= len(argv):
         return None  # `rigx pkg` with no attr — let argparse error normally.
@@ -222,13 +236,8 @@ def _split_pkg_passthrough(argv: list[str]) -> tuple[list[str], list[str]] | Non
 
 def _split_run_passthrough(argv: list[str]) -> tuple[list[str], list[str]] | None:
     """If `rigx run TARGET -- …` is invoked, split off the post-`--` tail."""
-    try:
-        i = argv.index("run")
-    except ValueError:
-        return None
-    prev = argv[i - 1] if i > 0 else ""
-    value_taking_opts = {"-C", "--project"}
-    if prev in value_taking_opts:
+    i = _subcommand_index(argv)
+    if i is None or argv[i] != "run":
         return None
     try:
         j = argv.index("--", i + 1)

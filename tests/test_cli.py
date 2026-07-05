@@ -44,6 +44,12 @@ class SplitRunPassthrough(unittest.TestCase):
             cli._split_run_passthrough(["-C", "run", "build", "--", "x"])
         )
 
+    def test_run_as_positional_of_other_subcommand_is_ignored(self):
+        # `rigx build run -- x` — "run" is a target name, not the subcommand.
+        self.assertIsNone(
+            cli._split_run_passthrough(["build", "run", "--", "x"])
+        )
+
 
 class SplitPkgPassthrough(unittest.TestCase):
     def test_no_pkg_subcommand(self):
@@ -81,6 +87,20 @@ class SplitPkgPassthrough(unittest.TestCase):
         self.assertIsNone(
             cli._split_pkg_passthrough(["-C", "pkg", "build"])
         )
+
+    def test_pkg_as_positional_of_other_subcommand_is_ignored(self):
+        # `rigx build pkg app lib` — "pkg" is a target name; splitting here
+        # would silently drop "lib" from the build.
+        self.assertIsNone(
+            cli._split_pkg_passthrough(["build", "pkg", "app", "lib"])
+        )
+
+    def test_pkg_with_inline_project_flag(self):
+        pre, args = cli._split_pkg_passthrough(
+            ["--project=./proj", "pkg", "jq", "--", ".foo"]
+        )
+        self.assertEqual(pre, ["--project=./proj", "pkg", "jq"])
+        self.assertEqual(args, [".foo"])
 
 
 class MainKeyboardInterrupt(unittest.TestCase):
