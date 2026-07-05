@@ -310,14 +310,23 @@ def run_script_target(
     command line) are forwarded as `$1`, `$2`, … inside the script.
     """
     assert target.script is not None
-    nix = _nix_bin()
+    cmd = _script_cmd(project, target, extra_args)
+    result = subprocess.run(cmd, cwd=project.root, check=False)
+    return result.returncode
+
+
+def _script_cmd(
+    project: Project, target, extra_args: list[str] | None = None
+) -> list[str]:
+    """Build the host-side command line for a script-style target.
+
+    With `deps.nixpkgs` entries, the script runs under `nix shell` so the
+    tools are on PATH. With no entries, `nix shell` would get zero
+    installables and default to `.` — demanding a `default` package the
+    project probably doesn't define — so bash runs directly instead (same
+    cwd/env; the only difference is not entering a nix shell)."""
     refs = [_nixpkgs_pkg_ref(project, pkg) for pkg in target.deps.nixpkgs]
-    cmd = [
-        nix,
-        *NIX_EXPERIMENTAL,
-        "shell",
-        *refs,
-        "--command",
+    bash_cmd = [
         "bash",
         "-eo",
         "pipefail",
@@ -326,8 +335,10 @@ def run_script_target(
         target.name,
         *(extra_args or []),
     ]
-    result = subprocess.run(cmd, cwd=project.root, check=False)
-    return result.returncode
+    if not refs:
+        return bash_cmd
+    nix = _nix_bin()
+    return [nix, *NIX_EXPERIMENTAL, "shell", *refs, "--command", *bash_cmd]
 
 
 def run_named_script(
@@ -599,12 +610,7 @@ def _run_test_capture(project: Project, target) -> tuple[int, str]:
     """Like `run_script_target` but captures stdout+stderr together so
     parallel test output doesn't interleave on the parent terminal."""
     assert target.script is not None
-    nix = _nix_bin()
-    refs = [_nixpkgs_pkg_ref(project, pkg) for pkg in target.deps.nixpkgs]
-    cmd = [
-        nix, *NIX_EXPERIMENTAL, "shell", *refs, "--command",
-        "bash", "-eo", "pipefail", "-c", target.script, target.name,
-    ]
+    cmd = _script_cmd(project, target)
     result = subprocess.run(
         cmd, cwd=project.root, check=False,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,

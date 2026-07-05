@@ -260,6 +260,71 @@ class RunNamedScript(unittest.TestCase):
         self.assertEqual(len(cmd), i + 3)
 
 
+class ScriptCmdNixShellSkip(unittest.TestCase):
+    """Script targets with an empty `deps.nixpkgs` run bash directly —
+    `nix shell` with zero installables defaults to `.` and demands
+    `packages.<system>.default`, a confusing failure (or a silent build
+    of the install package)."""
+
+    def test_no_nixpkgs_deps_runs_bash_directly(self):
+        proj = _project_with(
+            deploy=Target(name="deploy", kind="script", script="true"),
+        )
+        with mock.patch("rigx.builder._nix_bin", return_value="/usr/bin/nix"), \
+             mock.patch("rigx.builder.subprocess.run") as run:
+            run.return_value = mock.Mock(returncode=0)
+            builder.run_script_target(proj, proj.targets["deploy"], ["x"])
+        cmd = run.call_args.args[0]
+        self.assertNotIn("shell", cmd)
+        self.assertNotIn("/usr/bin/nix", cmd)
+        # Same bash invocation shape as the nix-shell path, same cwd.
+        self.assertEqual(cmd, ["bash", "-eo", "pipefail", "-c", "true", "deploy", "x"])
+        self.assertEqual(run.call_args.kwargs["cwd"], proj.root)
+
+    def test_no_nixpkgs_deps_does_not_require_nix(self):
+        # Without tools to fetch, the script must run even on a host
+        # where nix isn't installed at all.
+        proj = _project_with(
+            deploy=Target(name="deploy", kind="script", script="true"),
+        )
+        with mock.patch("rigx.builder.shutil.which", return_value=None), \
+             mock.patch("rigx.builder.subprocess.run") as run:
+            run.return_value = mock.Mock(returncode=0)
+            rc = builder.run_script_target(proj, proj.targets["deploy"])
+        self.assertEqual(rc, 0)
+
+    def test_nixpkgs_deps_still_use_nix_shell(self):
+        from rigx.config import TargetDeps
+        proj = _project_with(
+            deploy=Target(
+                name="deploy", kind="script", script="true",
+                deps=TargetDeps(nixpkgs=["uv"]),
+            ),
+        )
+        with mock.patch("rigx.builder._nix_bin", return_value="/usr/bin/nix"), \
+             mock.patch("rigx.builder.subprocess.run") as run:
+            run.return_value = mock.Mock(returncode=0)
+            builder.run_script_target(proj, proj.targets["deploy"])
+        cmd = run.call_args.args[0]
+        self.assertEqual(cmd[0], "/usr/bin/nix")
+        self.assertIn("shell", cmd)
+        self.assertTrue(any(ref.endswith("#uv") for ref in cmd))
+
+    def test_capture_variant_matches(self):
+        # _run_test_capture shares the command builder — an empty
+        # deps.nixpkgs host test also skips `nix shell`.
+        proj = _project_with(
+            t=Target(name="t", kind="test", sandbox=False, script="true"),
+        )
+        with mock.patch("rigx.builder._nix_bin", return_value="/usr/bin/nix"), \
+             mock.patch("rigx.builder.subprocess.run") as run:
+            run.return_value = mock.Mock(returncode=0, stdout="")
+            builder._run_test_capture(proj, proj.targets["t"])
+        cmd = run.call_args.args[0]
+        self.assertEqual(cmd, ["bash", "-eo", "pipefail", "-c", "true", "t"])
+        self.assertEqual(run.call_args.kwargs["cwd"], proj.root)
+
+
 class WriteFlakeIdempotent(unittest.TestCase):
     def test_unchanged_content_does_not_rewrite_file(self):
         # write_flake used to rewrite flake.nix unconditionally, bumping
