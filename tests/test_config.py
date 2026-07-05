@@ -485,6 +485,93 @@ class ValidationErrors(unittest.TestCase):
             ):
                 config.load(root)
 
+    def test_target_entry_not_a_table(self):
+        body = """
+            [project]
+            name = "p"
+            [targets]
+            x = "executable"
+        """
+        with TempProject(body) as root:
+            with self.assertRaisesRegex(ConfigError, "target x: must be a table"):
+                config.load(root)
+
+    def test_deps_not_a_table(self):
+        body = """
+            [project]
+            name = "p"
+            [targets.x]
+            kind = "executable"
+            sources = ["a.cpp"]
+            deps = ["zlib"]
+        """
+        with TempProject(body) as root:
+            with self.assertRaisesRegex(ConfigError, "deps must be a table"):
+                config.load(root)
+
+    def test_variants_not_a_table(self):
+        body = """
+            [project]
+            name = "p"
+            [targets.x]
+            kind = "executable"
+            sources = ["a.cpp"]
+            variants = ["debug"]
+        """
+        with TempProject(body) as root:
+            with self.assertRaisesRegex(ConfigError, "variants must be a table"):
+                config.load(root)
+
+    def test_variant_entry_not_a_table(self):
+        body = """
+            [project]
+            name = "p"
+            [targets.x]
+            kind = "executable"
+            sources = ["a.cpp"]
+            [targets.x.variants]
+            debug = "-g"
+        """
+        with TempProject(body) as root:
+            with self.assertRaisesRegex(
+                ConfigError, r"variants\.debug: must be a table"
+            ):
+                config.load(root)
+
+    def test_nixpkgs_not_a_table(self):
+        # `nixpkgs = "…"` at the top level parses as a string where a
+        # table is expected.
+        body = 'nixpkgs = "nixos-24.11"\n[project]\nname = "p"\n'
+        with TempProject(body) as root:
+            with self.assertRaisesRegex(ConfigError, r"\[nixpkgs\] must be a table"):
+                config.load(root)
+
+    def test_git_dep_entry_not_a_table(self):
+        body = """
+            [project]
+            name = "p"
+            [dependencies.git]
+            fmt = "https://example.com/fmt"
+        """
+        with TempProject(body) as root:
+            with self.assertRaisesRegex(
+                ConfigError, r"dependencies\.git\.fmt: must be a table"
+            ):
+                config.load(root)
+
+    def test_local_dep_entry_not_a_table(self):
+        body = """
+            [project]
+            name = "p"
+            [dependencies.local]
+            sub = "./sub"
+        """
+        with TempProject(body) as root:
+            with self.assertRaisesRegex(
+                ConfigError, r"dependencies\.local\.sub: must be a table"
+            ):
+                config.load(root)
+
     def test_custom_missing_install_script(self):
         body = """
             [project]

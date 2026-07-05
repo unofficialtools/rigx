@@ -782,6 +782,10 @@ def _build_target(
     path so module-relative paths stay valid relative to the parent root.
     `namespace` populates `target.namespace`; same-namespace `deps.internal`
     refs are auto-qualified (`greet` → `frontend.greet`)."""
+    if not isinstance(tconf, dict):
+        raise ConfigError(
+            f"target {tname}: must be a table (got {type(tconf).__name__})"
+        )
     kind = tconf.get("kind")
     if kind not in VALID_KINDS:
         raise ConfigError(
@@ -789,6 +793,8 @@ def _build_target(
         )
 
     deps_conf = tconf.get("deps", {})
+    if not isinstance(deps_conf, dict):
+        raise ConfigError(f"target {tname}: deps must be a table")
     for unknown in deps_conf.keys() - {"internal", "nixpkgs", "git", "external"}:
         raise ConfigError(f"target {tname}: unknown deps key '{unknown}'")
     deps = TargetDeps(
@@ -820,8 +826,13 @@ def _build_target(
         ]
 
     variants: dict[str, Variant] = {}
-    for vname, vconf in tconf.get("variants", {}).items():
+    variants_conf = tconf.get("variants", {})
+    if not isinstance(variants_conf, dict):
+        raise ConfigError(f"target {tname}: variants must be a table")
+    for vname, vconf in variants_conf.items():
         vctx = f"target {tname}: variants.{vname}"
+        if not isinstance(vconf, dict):
+            raise ConfigError(f"{vctx}: must be a table")
         variants[vname] = Variant(
             name=vname,
             cxxflags=_expand_list(vconf.get("cxxflags", []), vars_table, f"{vctx}.cxxflags"),
@@ -1029,6 +1040,10 @@ def load(root: Path) -> Project:
 def _parse_git_deps(section: dict, source_label: str) -> dict[str, GitDep]:
     out: dict[str, GitDep] = {}
     for gname, gconf in section.items():
+        if not isinstance(gconf, dict):
+            raise ConfigError(
+                f"{source_label}dependencies.git.{gname}: must be a table"
+            )
         if "url" not in gconf:
             raise ConfigError(f"{source_label}dependencies.git.{gname}: missing 'url'")
         out[gname] = GitDep(
@@ -1050,6 +1065,10 @@ def _parse_local_deps(
 ) -> dict[str, LocalDep]:
     out: dict[str, LocalDep] = {}
     for lname, lconf in section.items():
+        if not isinstance(lconf, dict):
+            raise ConfigError(
+                f"{source_label}dependencies.local.{lname}: must be a table"
+            )
         if "path" not in lconf:
             raise ConfigError(
                 f"{source_label}dependencies.local.{lname}: missing 'path'"
@@ -1440,6 +1459,8 @@ def _load(root: Path, _visited: set[Path]) -> Project:
     respect_gitignore = bool(proj.get("respect_gitignore", True))
 
     nixpkgs = data.get("nixpkgs", {})
+    if not isinstance(nixpkgs, dict):
+        raise ConfigError("[nixpkgs] must be a table")
     nixpkgs_ref = nixpkgs.get("ref", "nixos-24.11")
 
     external_inputs = _parse_external_inputs(
