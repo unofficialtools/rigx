@@ -396,6 +396,38 @@ class CmdFmt(unittest.TestCase):
             self.assertIn('name = "p"', out.getvalue())
 
 
+class CmdRunExitCode(unittest.TestCase):
+    def _proj(self):
+        from rigx.config import Project, Target
+        return Project(
+            name="p",
+            version="0.1.0",
+            nixpkgs_ref="nixos-24.11",
+            git_deps={},
+            targets={
+                "deploy": Target(name="deploy", kind="script", script="exit 7"),
+            },
+            root=Path("/tmp/fake"),
+        )
+
+    def test_forwards_script_exit_code(self):
+        # The script exited 7 — `rigx run` must exit 7, not a generic 1.
+        err = io.StringIO()
+        with mock.patch("rigx.cli._load", return_value=self._proj()), \
+             mock.patch("rigx.builder.run_script_target", return_value=7), \
+             redirect_stdout(io.StringIO()), redirect_stderr(err):
+            rc = cli.main(["run", "deploy"])
+        self.assertEqual(rc, 7)
+        self.assertIn("exit 7", err.getvalue())
+
+    def test_other_build_errors_still_exit_1(self):
+        err = io.StringIO()
+        with mock.patch("rigx.cli._load", return_value=self._proj()), \
+             redirect_stdout(io.StringIO()), redirect_stderr(err):
+            rc = cli.main(["run", "missing"])
+        self.assertEqual(rc, 1)
+
+
 class FormatBytes(unittest.TestCase):
     def test_b(self):
         self.assertEqual(cli._format_bytes(0), "0 B")

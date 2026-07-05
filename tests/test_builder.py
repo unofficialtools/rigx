@@ -235,6 +235,17 @@ class RunNamedScript(unittest.TestCase):
         # Script body sits at -c's value; target name is $0; user args follow.
         self.assertEqual(cmd[i + 1 : i + 5], ['echo "$@"', "deploy", "--dry-run", "prod"])
 
+    def test_failure_carries_child_exit_code(self):
+        # `rigx run` forwards the script's real exit code; the BuildError
+        # must carry it instead of collapsing everything to 1.
+        proj = _project_with(
+            deploy=Target(name="deploy", kind="script", script="exit 7"),
+        )
+        with mock.patch("rigx.builder.run_script_target", return_value=7):
+            with self.assertRaises(BuildError) as ctx:
+                builder.run_named_script(proj, "deploy")
+        self.assertEqual(ctx.exception.exit_code, 7)
+
     def test_no_extra_args_means_no_positional_after_target_name(self):
         proj = _project_with(
             deploy=Target(name="deploy", kind="script", script="true"),

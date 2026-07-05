@@ -349,7 +349,10 @@ def run_named_script(
     print(f"[rigx] running {name}")
     rc = run_script_target(project, target, extra_args)
     if rc != 0:
-        raise BuildError(f"{target.kind} target {name!r} failed (exit {rc})")
+        err = BuildError(f"{target.kind} target {name!r} failed (exit {rc})")
+        # Let `rigx run` forward the child's real exit code (like `rigx pkg`).
+        err.exit_code = rc
+        raise err
 
 
 def run_tests(
