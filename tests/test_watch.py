@@ -44,6 +44,26 @@ class ScanAll(unittest.TestCase):
         newer = self._write("src/b.cpp", mtime=2_000_000.0)
         self.assertEqual(watch._scan_all(self.root), newer.stat().st_mtime)
 
+    def test_survives_file_vanishing_mid_scan(self):
+        # An editor temp file can disappear between the is_file() check
+        # and the stat() call; the scan must skip it, not crash.
+        from unittest import mock
+        self._write("src/a.cpp", mtime=1_000_000.0)
+        ghost = self._write("src/.a.cpp.swp", mtime=2_000_000.0)
+        real_stat = Path.stat
+        calls = {"n": 0}
+
+        def flaky_stat(path_self, **kw):
+            if path_self.name == ghost.name:
+                calls["n"] += 1
+                if calls["n"] >= 2:  # first call is is_file()'s
+                    raise FileNotFoundError(str(path_self))
+            return real_stat(path_self, **kw)
+
+        with mock.patch.object(Path, "stat", flaky_stat):
+            latest = watch._scan_all(self.root)
+        self.assertEqual(latest, (self.root / "src/a.cpp").stat().st_mtime)
+
 
 if __name__ == "__main__":
     unittest.main()

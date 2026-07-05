@@ -128,7 +128,11 @@ def _scan_all(root: Path) -> float:
         if path.name in skip_files:
             continue
         if path.is_file():
-            m = path.stat().st_mtime
+            try:
+                m = path.stat().st_mtime
+            except OSError:
+                # Editor temp files can vanish between rglob and stat.
+                continue
             if m > latest:
                 latest = m
     return latest
