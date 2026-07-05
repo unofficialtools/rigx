@@ -260,6 +260,34 @@ class RunNamedScript(unittest.TestCase):
         self.assertEqual(len(cmd), i + 3)
 
 
+class WriteFlakeIdempotent(unittest.TestCase):
+    def test_unchanged_content_does_not_rewrite_file(self):
+        # write_flake used to rewrite flake.nix unconditionally, bumping
+        # its mtime on every build — the root cause of the `rigx watch
+        # --watch-all` infinite rebuild loop.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = Project(
+                name="p",
+                version="0.1.0",
+                nixpkgs_ref="nixos-24.11",
+                git_deps={},
+                targets={},
+                root=Path(tmp),
+            )
+            with mock.patch("rigx.builder.nix_gen.generate", return_value="content-1"), \
+                 mock.patch("rigx.builder._hint_commit_generated"):
+                path = builder.write_flake(proj)
+                first = path.stat().st_mtime_ns
+                builder.write_flake(proj)
+                self.assertEqual(path.stat().st_mtime_ns, first)
+            # New content must still be written out.
+            with mock.patch("rigx.builder.nix_gen.generate", return_value="content-2"), \
+                 mock.patch("rigx.builder._hint_commit_generated"):
+                builder.write_flake(proj)
+            self.assertEqual(path.read_text(), "content-2")
+
+
 class CleanSymlinkedOutput(unittest.TestCase):
     def test_symlinked_output_dir_is_unlinked_not_followed(self):
         # clean() on a symlinked output/ used to follow the link, delete

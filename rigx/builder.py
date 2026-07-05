@@ -78,8 +78,11 @@ def write_flake(project: Project) -> Path:
         not flake_path.is_file()
         or flake_path.read_text() != new_content
     )
-    flake_path.write_text(new_content)
     if changed:
+        # Only touch the file when the content differs — an unconditional
+        # write bumps the mtime on every build and made `rigx watch
+        # --watch-all` rebuild in an infinite loop with zero user edits.
+        flake_path.write_text(new_content)
         _hint_commit_generated(project, ["flake.nix"])
     return flake_path
 

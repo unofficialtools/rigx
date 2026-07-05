@@ -114,6 +114,26 @@ def _declared_input_files(project, targets: list[str] | None) -> set[Path]:
     return files
 
 
+def _scan_all(root: Path) -> float:
+    """Latest mtime under `root` for the --watch-all mode, skipping
+    VCS/output dirs. flake.nix and flake.lock are rigx-managed — every
+    build (re)generates them, so watching them would trigger an
+    infinite rebuild loop with zero user edits."""
+    latest = 0.0
+    skip = {".git", "output", "result", ".rigx"}
+    skip_files = {"flake.lock", "flake.nix"}
+    for path in root.rglob("*"):
+        if any(part in skip for part in path.relative_to(root).parts):
+            continue
+        if path.name in skip_files:
+            continue
+        if path.is_file():
+            m = path.stat().st_mtime
+            if m > latest:
+                latest = m
+    return latest
+
+
 def cmd_watch(args: argparse.Namespace) -> int:
     """Re-build target(s) whenever a source file changes. Polls every 0.5s.
 
@@ -133,19 +153,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
     if watch_all:
         def scan() -> float:
-            latest = 0.0
-            skip = {".git", "output", "result", ".rigx"}
-            skip_files = {"flake.lock"}
-            for path in project.root.rglob("*"):
-                if any(part in skip for part in path.relative_to(project.root).parts):
-                    continue
-                if path.name in skip_files:
-                    continue
-                if path.is_file():
-                    m = path.stat().st_mtime
-                    if m > latest:
-                        latest = m
-            return latest
+            return _scan_all(project.root)
     else:
         # Resolve the file set up-front. If TOML changes, we'll
         # re-resolve at next iteration so newly-declared inputs start
