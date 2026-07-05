@@ -7,6 +7,7 @@ friction for first-time users, not to ship a full project skeleton."""
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 
@@ -14,6 +15,13 @@ from dataclasses import dataclass
 class Scaffold:
     toml_block: str
     files: dict[str, str]   # relative path -> file body
+
+
+def _ident(name: str) -> str:
+    """Turn a target name into a valid C/Rust identifier for code stubs.
+    Hyphens are legal in rigx target names but not in identifiers; paths
+    and TOML keep the real name."""
+    return re.sub(r"[^0-9A-Za-z_]", "_", name)
 
 
 def _executable(name: str, language: str) -> Scaffold:
@@ -78,7 +86,7 @@ def _static_library(name: str, language: str) -> Scaffold:
         src = f"src/{name}.rs"
         body = (
             "#[no_mangle]\n"
-            f"pub extern \"C\" fn {name}_hello() {{ println!(\"hi\"); }}\n"
+            f"pub extern \"C\" fn {_ident(name)}_hello() {{ println!(\"hi\"); }}\n"
         )
         block = (
             f'\n[targets.{name}]\n'
@@ -91,10 +99,10 @@ def _static_library(name: str, language: str) -> Scaffold:
     hdr = f"include/{name}.h"
     body = (
         f'#include "{name}.h"\n\n'
-        f"void {name}_hello() {{}}\n"
+        f"void {_ident(name)}_hello() {{}}\n"
     )
     header = (
-        f"#pragma once\nvoid {name}_hello();\n"
+        f"#pragma once\nvoid {_ident(name)}_hello();\n"
     )
     flag_field = "cxxflags" if language == "cxx" else "cflags"
     flag_default = '["-std=c++17", "-Wall"]' if language == "cxx" else '["-Wall"]'

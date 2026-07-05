@@ -239,6 +239,19 @@ class Scaffold(unittest.TestCase):
         s = scaffold.scaffold("run", "gen", None, "my_tool")
         self.assertIn('run     = "my_tool"', s.toml_block)
 
+    def test_hyphenated_name_yields_valid_c_identifiers(self):
+        # Hyphens are legal in rigx target names but not in C identifiers;
+        # the stub must sanitize them (paths and TOML keep the real name).
+        s = scaffold.scaffold("static_library", "my-lib", "c", None)
+        self.assertIn("void my_lib_hello", s.files["src/my-lib.c"])
+        self.assertIn("void my_lib_hello();", s.files["include/my-lib.h"])
+        self.assertNotIn("my-lib_hello", s.files["src/my-lib.c"])
+        self.assertIn("[targets.my-lib]", s.toml_block)
+
+    def test_hyphenated_name_yields_valid_rust_identifier(self):
+        s = scaffold.scaffold("static_library", "my-lib", "rust", None)
+        self.assertIn("fn my_lib_hello", s.files["src/my-lib.rs"])
+
 
 class VarsExtends(unittest.TestCase):
     def _write(self, root: Path, files: dict[str, str]) -> None:
