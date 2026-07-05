@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -21,6 +22,11 @@ from pathlib import Path
 
 from rigx.config import Target
 from rigx.nix import capsule_common
+
+# The rendered runners use `#!/usr/bin/env bash`, but the Nix build
+# sandbox has no /usr/bin/env — resolve bash from PATH and invoke
+# every script through it explicitly.
+_BASH = shutil.which("bash") or "/bin/bash"
 
 
 # Implements only the jq filters `_emit_runtime_spec_loader` uses; any
@@ -63,9 +69,9 @@ else:
     sys.exit(f"fake jq: unsupported filter {filt!r} — update the test")
 '''
 
-_FAKE_DOCKER = """\
-#!/usr/bin/env bash
-cmd="${1:-}"; shift || true
+_FAKE_DOCKER = f"""\
+#!{_BASH}
+cmd="${{1:-}}"; shift || true
 case "$cmd" in
     load) cat > /dev/null ;;
     run)  printf '%s\\n' "$@" > "$DOCKER_DUMP" ;;
@@ -111,7 +117,7 @@ class RunnerExecBase(unittest.TestCase):
         (bin_dir / "fake_jq.py").write_text(_FAKE_JQ_PY)
         jq = bin_dir / "jq"
         jq.write_text(
-            f'#!/usr/bin/env bash\n'
+            f'#!{_BASH}\n'
             f'exec "{sys.executable}" "{bin_dir}/fake_jq.py" "$@"\n'
         )
         jq.chmod(0o755)
@@ -132,7 +138,7 @@ class RunnerExecBase(unittest.TestCase):
             env["RIGX_RUNTIME_SPEC"] = str(spec_path)
         env.update(extra_env or {})
         r = subprocess.run(
-            [str(runner)], env=env, capture_output=True, text=True,
+            [_BASH, str(runner)], env=env, capture_output=True, text=True,
         )
         self.assertEqual(r.returncode, 0, msg=r.stderr)
         return dump.read_text().splitlines()
@@ -253,7 +259,7 @@ class PublishAppliedOnce(RunnerExecBase):
         vm_bin.mkdir(parents=True)
         vm = vm_bin / "run-svc-vm"
         vm.write_text(
-            '#!/usr/bin/env bash\n'
+            f'#!{_BASH}\n'
             'printf \'%s\' "${QEMU_NET_OPTS:-}" > "$QEMU_DUMP"\n'
             'exit 0\n'
         )
@@ -267,7 +273,7 @@ class PublishAppliedOnce(RunnerExecBase):
         (bin_dir / "fake_jq.py").write_text(_FAKE_JQ_PY)
         jq = bin_dir / "jq"
         jq.write_text(
-            f'#!/usr/bin/env bash\n'
+            f'#!{_BASH}\n'
             f'exec "{sys.executable}" "{bin_dir}/fake_jq.py" "$@"\n'
         )
         jq.chmod(0o755)
@@ -284,7 +290,7 @@ class PublishAppliedOnce(RunnerExecBase):
             env["RIGX_RUNTIME_SPEC"] = str(spec_path)
         env.update(extra_env or {})
         r = subprocess.run(
-            [str(runner)], env=env, capture_output=True, text=True,
+            [_BASH, str(runner)], env=env, capture_output=True, text=True,
         )
         self.assertEqual(r.returncode, 0, msg=r.stderr)
         return dump.read_text()

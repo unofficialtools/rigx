@@ -1,6 +1,6 @@
 [project]
 name = "rigx"
-version = "0.10.0"
+version = "0.10.1"
 
 # Make rigx installable straight from this repo's flake:
 #   nix profile install github:unofficialtools/rigx/stable
@@ -102,7 +102,7 @@ git tag -f stable
 # 4. Push the branch (tolerate "everything up-to-date"), then the tags.
 #    --force is required because `stable` is an existing tag being moved.
 (git push origin master || true)
-git push --force --tags
+(git push --force --tags || true)
 
 # 5. Build and upload to PyPI.
 rm -rf dist
