@@ -81,14 +81,34 @@ def _glob_to_regex(pattern: str) -> re.Pattern[str]:
             out.append("[^/]")
             i += 1
         elif c == "[":
-            try:
-                k = pattern.index("]", i + 1)
-                cls = pattern[i:k + 1]
-                out.append(cls)
-                i = k + 1
-            except ValueError:
+            # Scan the class body: a leading `!` (or `^`, the common POSIX
+            # extension) negates it, and a `]` right after the (optional)
+            # negation marker is a literal member, not the closing bracket.
+            j = i + 1
+            if j < n and pattern[j] in "!^":
+                j += 1
+            if j < n and pattern[j] == "]":
+                j += 1
+            k = pattern.find("]", j)
+            if k < 0:
                 out.append("\\[")
                 i += 1
+            else:
+                stuff = pattern[i + 1:k]
+                negate = stuff[:1] in ("!", "^")
+                if negate:
+                    stuff = stuff[1:]
+                # Escape regex metacharacters that survive inside a class;
+                # `]` occurs at most once (first member) by construction.
+                stuff = stuff.replace("\\", "\\\\").replace("]", "\\]")
+                if negate:
+                    # Glob negation is `!`, regex negation is `^`. The
+                    # `(?!/)` keeps a negated class from swallowing a path
+                    # separator — classes match within one component only.
+                    out.append(f"(?!/)[^{stuff}]")
+                else:
+                    out.append(f"[{stuff}]")
+                i = k + 1
         elif c == "/":
             out.append("/")
             i += 1

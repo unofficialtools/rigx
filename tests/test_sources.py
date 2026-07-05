@@ -72,6 +72,34 @@ class GlobToRegex(unittest.TestCase):
         self.assertMatches("file[abc].txt", "fileb.txt")
         self.assertDoesNotMatch("file[abc].txt", "filed.txt")
 
+    def test_bracket_class_negation_bang(self):
+        # Glob `[!...]` negates the class (fnmatch semantics); the `!` must
+        # not be copied into the regex as a literal member.
+        self.assertMatches("file[!a].txt", "fileb.txt")
+        self.assertDoesNotMatch("file[!a].txt", "filea.txt")
+        # A negated class still matches within one path component only.
+        self.assertDoesNotMatch("file[!a].txt", "file/.txt")
+
+    def test_bracket_class_negation_caret(self):
+        # POSIX shells also accept `[^...]` as negation.
+        self.assertMatches("file[^a].txt", "fileb.txt")
+        self.assertDoesNotMatch("file[^a].txt", "filea.txt")
+
+    def test_bracket_class_range(self):
+        self.assertMatches("file[a-c].txt", "fileb.txt")
+        self.assertDoesNotMatch("file[a-c].txt", "filed.txt")
+
+    def test_bracket_class_literal_closing_bracket(self):
+        # `]` right after `[` (or `[!`) is a literal member, not the closer.
+        self.assertMatches("file[]].txt", "file].txt")
+        self.assertDoesNotMatch("file[]].txt", "filea.txt")
+        self.assertMatches("file[!]].txt", "filea.txt")
+        self.assertDoesNotMatch("file[!]].txt", "file].txt")
+
+    def test_bracket_unterminated_is_literal(self):
+        self.assertMatches("file[ab.txt", "file[ab.txt")
+        self.assertDoesNotMatch("file[ab.txt", "filea.txt")
+
     def test_dot_is_literal(self):
         self.assertMatches("foo.txt", "foo.txt")
         self.assertDoesNotMatch("foo.txt", "fooXtxt")
