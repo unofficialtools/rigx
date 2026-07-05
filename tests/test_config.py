@@ -1325,6 +1325,48 @@ class Modules(unittest.TestCase):
         sub = proj.local_deps["sub"].sub_project
         self.assertEqual(proj.find_target("sub.mod.t"), (sub, "mod.t"))
 
+    def test_module_python_project_prefix_preserves_dot_slash(self):
+        root = self._setup({
+            "rigx.toml": """
+                [project]
+                name = "p"
+
+                [modules]
+                include = ["frontend"]
+            """,
+            "frontend/rigx.toml": """
+                [targets.svc]
+                kind = "python_script"
+                python_project = "./srv"
+            """,
+        })
+        proj = config.load(root)
+        self.assertEqual(
+            proj.targets["frontend.svc"].python_project, "frontend/srv"
+        )
+
+    def test_module_python_project_escaping_module_dir_rejected(self):
+        # `lstrip("./")` used to mangle "../shared" into "shared"; paths
+        # escaping the module dir are unrepresentable under the prefix.
+        root = self._setup({
+            "rigx.toml": """
+                [project]
+                name = "p"
+
+                [modules]
+                include = ["frontend"]
+            """,
+            "frontend/rigx.toml": """
+                [targets.svc]
+                kind = "python_script"
+                python_project = "../shared"
+            """,
+        })
+        with self.assertRaisesRegex(
+            ConfigError, "must stay inside the module directory"
+        ):
+            config.load(root)
+
     def test_mutually_including_modules_raise_clean_cycle_error(self):
         root = self._setup({
             "rigx.toml": """

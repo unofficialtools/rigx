@@ -875,8 +875,19 @@ def _build_target(
     python_project = raw_python_project
     if path_prefix and python_project not in (".", ""):
         # python_project is a path relative to the declaring rigx.toml; rewrite
-        # so it stays valid from the parent's root.
-        python_project = path_prefix.rstrip("/") + "/" + python_project.lstrip("./")
+        # so it stays valid from the parent's root. Paths escaping the module
+        # dir can't be expressed under the prefix — reject rather than mangle.
+        if python_project.startswith("/") or python_project == ".." or (
+            python_project.startswith("../")
+        ):
+            raise ConfigError(
+                f"{tctx}: python_project {raw_python_project!r} must stay "
+                f"inside the module directory when merged via [modules] "
+                f"(absolute and ../ paths are unsupported)"
+            )
+        python_project = (
+            path_prefix.rstrip("/") + "/" + python_project.removeprefix("./")
+        )
     elif path_prefix and python_project in (".", ""):
         python_project = path_prefix.rstrip("/")
 
