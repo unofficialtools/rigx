@@ -223,9 +223,17 @@ def format_toml(source: str) -> str:
     output produces the same bytes."""
     data = tomllib.loads(source)
     sections: list[str] = []
-    seen: set[str] = set()
+    # Top-level scalars (rare, but legal TOML) render as a leading
+    # key = value block; rewriting them as [key] headers would silently
+    # delete the value.
+    scalars = [(k, v) for k, v in data.items() if not isinstance(v, dict)]
+    seen: set[str] = {k for k, _ in scalars}
+    if scalars:
+        sections.append(
+            _emit_kv_block(sorted(scalars, key=lambda kv: kv[0]))
+        )
     for key in _TOP_LEVEL_ORDER:
-        if key in data:
+        if key in data and key not in seen:
             sections.append(_emit_section(key, data[key]))
             seen.add(key)
     for key in sorted(data.keys()):

@@ -66,6 +66,23 @@ class Fmt(unittest.TestCase):
         self.assertEqual(tomllib.loads(out), tomllib.loads(src))
         self.assertEqual(fmt.format_toml(out), out)
 
+    def test_top_level_scalars_preserved(self):
+        # A top-level non-table value used to be rewritten as a bare
+        # [version] header, silently deleting the value.
+        src = dedent("""
+            version = "1.0"
+            count = 3
+
+            [project]
+            name = "p"
+        """).lstrip()
+        out = fmt.format_toml(src)
+        self.assertEqual(tomllib.loads(out), tomllib.loads(src))
+        # Scalars come before any table section.
+        self.assertLess(out.index('version = "1.0"'), out.index("[project]"))
+        self.assertNotIn("[version]", out)
+        self.assertEqual(fmt.format_toml(out), out)
+
     def test_canonical_section_order(self):
         # Sections come out in TOP_LEVEL_ORDER regardless of source order.
         src = dedent("""
