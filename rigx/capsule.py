@@ -378,10 +378,17 @@ def start(
     output = Path(output_dir) if output_dir else _find_output_dir()
     capsule_dir = (output / name).resolve()
     if not capsule_dir.is_dir():
-        raise RuntimeError(
-            f"capsule {name!r} not built (no {capsule_dir}); "
-            f"try `rigx build {name}`"
-        )
+        # Module-merged targets build to an out-link named after the
+        # sanitized Nix attr (`frontend.web` → `output/frontend_web`),
+        # so accept the qualified rigx name too.
+        alt = (output / name.replace(".", "_")).resolve()
+        if alt.is_dir():
+            capsule_dir = alt
+        else:
+            raise RuntimeError(
+                f"capsule {name!r} not built (no {capsule_dir}); "
+                f"try `rigx build {name}`"
+            )
 
     manifest_path = capsule_dir / "manifest.json"
     if not manifest_path.is_file():
@@ -410,9 +417,25 @@ def start(
 
     runner = capsule_dir / "bin" / f"run-{name}"
     if not runner.is_file():
-        raise RuntimeError(
-            f"capsule {name!r}: runner not found at {runner}"
-        )
+        # The runner is named after the target's SHORT name (`run-web`
+        # for the module-merged `frontend.web`) — derive it from the
+        # manifest's qualified name, falling back to the single `run-*`
+        # script in bin/ (covers a start() call by sanitized attr).
+        short = str(manifest.get("name") or name).rsplit(".", 1)[-1]
+        candidate = capsule_dir / "bin" / f"run-{short}"
+        if candidate.is_file():
+            runner = candidate
+        else:
+            matches = [
+                p for p in sorted((capsule_dir / "bin").glob("run-*"))
+                if p.is_file()
+            ]
+            if len(matches) == 1:
+                runner = matches[0]
+            else:
+                raise RuntimeError(
+                    f"capsule {name!r}: runner not found at {runner}"
+                )
 
     if container_name is None:
         container_name = f"rigx-{name}-{uuid.uuid4().hex[:8]}"

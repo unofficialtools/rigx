@@ -170,6 +170,55 @@ class StartContract(unittest.TestCase):
         self.assertTrue(all(n.startswith("rigx-svc-") for n in names))
 
 
+class ModuleNamespacedStart(unittest.TestCase):
+    """Module-merged capsules build to an out-link named after the
+    sanitized Nix attr (`frontend.web` → `output/frontend_web`) while
+    the runner inside is named after the SHORT target name
+    (`bin/run-web`). start() must accept both the qualified rigx name
+    and the sanitized attr, and locate the runner via the manifest."""
+
+    @contextmanager
+    def _module_capsule(self):
+        """Fake built module capsule laid out the way the builder
+        leaves it: dir = sanitized attr, runner = short name,
+        manifest name = qualified rigx name."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "rigx.toml").write_text("[project]\nname = 'p'\n")
+            out_dir = root / "output" / "frontend_web"
+            (out_dir / "bin").mkdir(parents=True)
+            runner = out_dir / "bin" / "run-web"
+            runner.write_text("#!/bin/sh\nexit 0\n")
+            runner.chmod(
+                runner.stat().st_mode
+                | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH
+            )
+            (out_dir / "manifest.json").write_text(json.dumps({
+                "name": "frontend.web", "backend": "lite",
+                "hostname": "web", "ports": [],
+                "image": {"kind": "oci-tarball-host-store"},
+            }))
+            yield root
+
+    def test_start_by_qualified_rigx_name(self):
+        with self._module_capsule() as root:
+            with capsule.start(
+                "frontend.web", output_dir=root / "output"
+            ) as cap:
+                self.assertEqual(cap.name, "frontend.web")
+                self.assertEqual(
+                    cap.capsule_dir,
+                    (root / "output" / "frontend_web").resolve(),
+                )
+
+    def test_start_by_sanitized_attr(self):
+        with self._module_capsule() as root:
+            with capsule.start(
+                "frontend_web", output_dir=root / "output"
+            ) as cap:
+                self.assertEqual(cap.manifest["name"], "frontend.web")
+
+
 class StartEnvEncoding(unittest.TestCase):
     """Env vars with commas can't ride the legacy comma-split RIGX_ENV
     var — they travel via the JSON runtime spec only (new runners give
