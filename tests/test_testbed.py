@@ -121,6 +121,35 @@ class HappyPath(unittest.TestCase):
         self.assertEqual(set(sim_b["env"].keys()), {"FC_5001_ADDR"})
 
 
+    def test_env_var_names_sanitized_for_posix(self):
+        """Capsule names with '-' or '.' (my-svc, mod.svc) would emit
+        env var names invalid under POSIX (MY-SVC_..., MOD.SVC_...)
+        that shells silently drop. Non-[A-Z0-9_] chars map to '_'."""
+        net = testbed.Network()
+        net.declare("sim")
+        net.declare("my-svc", listens_on=[5001])
+        net.declare("mod.svc", listens_on=[5002])
+        net.link("sim", "my-svc", to_port=5001)
+        net.link("sim", "mod.svc", to_port=5002)
+        env = net.bindings("sim")["env"]
+        self.assertEqual(
+            set(env), {"MY_SVC_5001_ADDR", "MOD_SVC_5002_ADDR"}
+        )
+
+    def test_env_var_collision_after_sanitization_raises(self):
+        """'fc' and 'FC' are distinct capsules but produce the same env
+        var — silent overwrite would point one link at the wrong proxy."""
+        net = testbed.Network()
+        net.declare("sim")
+        net.declare("fc", listens_on=[5001])
+        net.declare("FC", listens_on=[5001])
+        net.link("sim", "fc", to_port=5001)
+        net.link("sim", "FC", to_port=5001)
+        with self.assertRaises(ValueError) as ctx:
+            net.bindings("sim")
+        self.assertIn("FC_5001_ADDR", str(ctx.exception))
+
+
 class FaultRules(unittest.TestCase):
     def test_blocked_drops_everything(self):
         net = testbed.Network()

@@ -42,6 +42,7 @@ from __future__ import annotations
 import ipaddress
 import os
 import random
+import re
 import shutil
 import socket
 import sys
@@ -598,13 +599,26 @@ class Network:
             for cont, host in cap.udp_port_map.items()
         }
         env: dict[str, str] = {}
+        env_sources: dict[str, str] = {}
         for (src, dst, port, proto), link in self._links.items():
             if src != capsule:
                 continue
             suffix = "" if proto == "tcp" else f"_{proto.upper()}"
-            env[f"{dst.upper()}_{port}{suffix}_ADDR"] = (
-                f"{link.listen_addr}:{link.listen_port}"
-            )
+            # POSIX env names can't carry '-' or '.' (my-svc, mod.svc)
+            # — sanitize to [A-Z0-9_]. Distinct capsules may collapse
+            # to the same var after sanitization ('fc' vs 'FC'); that's
+            # an error, not a silent overwrite.
+            dst_id = re.sub(r"[^A-Z0-9_]", "_", dst.upper())
+            var = f"{dst_id}_{port}{suffix}_ADDR"
+            if var in env:
+                raise ValueError(
+                    f"capsule {capsule!r}: env var {var} for the link to "
+                    f"{dst!r} collides with the link to "
+                    f"{env_sources[var]!r} after sanitization; rename "
+                    f"one of the capsules"
+                )
+            env_sources[var] = dst
+            env[var] = f"{link.listen_addr}:{link.listen_port}"
 
         volumes: dict[Path | str, str | tuple[str, str]] = {}
         for handle, container, mode in cap.volumes:
