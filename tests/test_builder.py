@@ -698,14 +698,15 @@ class BuildPerAttrIsolation(unittest.TestCase):
             },
         )
 
-    def _run_build(self, jobs=None, attrs=("a", "b", "c"), exit_codes=None):
+    def _run_build(self, jobs=None, attrs=("a", "b", "c"), exit_codes=None,
+                   tracked=False):
         proj = self._proj()
         # subprocess.run gets called once per attr; default = all succeed.
         codes = exit_codes or [0] * len(attrs)
         results_iter = iter(mock.Mock(returncode=rc) for rc in codes)
         with mock.patch("rigx.builder.write_flake"), \
              mock.patch("rigx.builder._nix_bin", return_value="/usr/bin/nix"), \
-             mock.patch("rigx.builder._flake_is_tracked", return_value=False), \
+             mock.patch("rigx.builder._flake_is_tracked", return_value=tracked), \
              mock.patch(
                  "rigx.builder.subprocess.run",
                  side_effect=lambda *a, **kw: next(results_iter),
@@ -738,6 +739,22 @@ class BuildPerAttrIsolation(unittest.TestCase):
         self.assertIn("1/3 target(s) failed", msg)
         self.assertIn("b (exit 1)", msg)
         self.assertIn("2 succeeded", msg)
+
+    def test_failure_with_tracked_flake_hints_at_git_add(self):
+        # The `.` flake ref evaluates the git tree, so an un-added new
+        # source file is invisible to the build — the failure message
+        # must point at `git add` as the likely cause.
+        _, _, err = self._run_build(exit_codes=[0, 1, 0], tracked=True)
+        self.assertIsNotNone(err)
+        self.assertIn("only see git-tracked files", str(err))
+        self.assertIn("`git add`", str(err))
+
+    def test_failure_with_path_ref_has_no_git_hint(self):
+        # path:<root> refs see the whole working tree — the hint would
+        # be misleading.
+        _, _, err = self._run_build(exit_codes=[0, 1, 0], tracked=False)
+        self.assertIsNotNone(err)
+        self.assertNotIn("git-tracked", str(err))
 
     def test_jobs_dispatches_via_thread_pool(self):
         # With -j > 1, the same number of calls are made (one per attr);

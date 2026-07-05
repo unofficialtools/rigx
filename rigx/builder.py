@@ -818,6 +818,16 @@ def build(
         cross_arch = _cross_arch_qemu_capsules(project, [a for a, _ in failures])
         if cross_arch:
             msg += _cross_arch_hint(cross_arch)
+        # With the `.` ref (flake.nix in the git index), Nix evaluates the
+        # git tree — a freshly created source file that isn't `git add`ed
+        # is invisible to the build and fails with a baffling
+        # missing-file error. Point at the likely cause.
+        if _flake_is_tracked(str(project.root.resolve())):
+            msg += (
+                "\n\nnote: flake builds only see git-tracked files — if "
+                "you added new files, `git add` them so the build can "
+                "see them."
+            )
         raise BuildError(msg)
 
     return results
