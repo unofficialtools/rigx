@@ -521,15 +521,16 @@ def start(
         )
 
     # Surface a project root for the runner so relative host paths in
-    # TOML/RIGX_VOLUMES resolve. Falls back to walking up from
-    # `output_dir`'s parent (the same dir we already walked up from to
-    # find `rigx.toml`).
+    # TOML/RIGX_VOLUMES resolve. Falls back to `output_dir`'s parent
+    # (the same dir we already walked up from to find `rigx.toml`).
+    # Always set explicitly: a stale RIGX_PROJECT_ROOT inherited from
+    # the calling environment (e.g. an outer rigx invocation on a
+    # different project) must not beat the resolved root and silently
+    # repoint relative volume mounts.
     if project_root is not None:
         runner_env["RIGX_PROJECT_ROOT"] = str(Path(project_root).resolve())
     else:
-        runner_env.setdefault(
-            "RIGX_PROJECT_ROOT", str(output.parent.resolve())
-        )
+        runner_env["RIGX_PROJECT_ROOT"] = str(output.parent.resolve())
 
     # JSON runtime spec — primary contract since 0.7. Carries env,
     # publish, publish_udp, volumes, network, name as structured data so

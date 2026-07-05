@@ -170,6 +170,50 @@ class StartContract(unittest.TestCase):
         self.assertTrue(all(n.startswith("rigx-svc-") for n in names))
 
 
+class ProjectRootResolution(unittest.TestCase):
+    def test_derived_root_beats_stale_inherited_env_var(self):
+        """A RIGX_PROJECT_ROOT inherited from the calling environment
+        (e.g. an outer rigx invocation on a different project) must not
+        beat the root start() derives from the output dir — a stale
+        value would silently repoint relative volume mounts."""
+        runner_body = (
+            '#!/bin/sh\n'
+            'env | grep "^RIGX_PROJECT_ROOT=" > "$DUMP"\n'
+            'exit 0\n'
+        )
+        with fake_capsule("svc", runner_body=runner_body) as root:
+            dump = root / "root-dump"
+            with mock.patch.dict(os.environ, {
+                "DUMP": str(dump),
+                "RIGX_PROJECT_ROOT": "/stale/other-project",
+            }):
+                with capsule.start("svc", output_dir=root / "output"):
+                    pass
+            line = dump.read_text().strip()
+        self.assertEqual(line.split("=", 1)[1], str(root.resolve()))
+
+    def test_explicit_project_root_kwarg_still_wins(self):
+        runner_body = (
+            '#!/bin/sh\n'
+            'env | grep "^RIGX_PROJECT_ROOT=" > "$DUMP"\n'
+            'exit 0\n'
+        )
+        with fake_capsule("svc", runner_body=runner_body) as root:
+            dump = root / "root-dump"
+            pinned = root / "pinned"
+            pinned.mkdir()
+            with mock.patch.dict(os.environ, {
+                "DUMP": str(dump),
+                "RIGX_PROJECT_ROOT": "/stale/other-project",
+            }):
+                with capsule.start(
+                    "svc", project_root=pinned, output_dir=root / "output"
+                ):
+                    pass
+            line = dump.read_text().strip()
+        self.assertEqual(line.split("=", 1)[1], str(pinned.resolve()))
+
+
 class ModuleNamespacedStart(unittest.TestCase):
     """Module-merged capsules build to an out-link named after the
     sanitized Nix attr (`frontend.web` → `output/frontend_web`) while
