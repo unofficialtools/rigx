@@ -12,8 +12,12 @@ on a per-file basis."""
 
 from __future__ import annotations
 
+import re
 import tomllib
 from pathlib import Path
+
+# TOML bare-key charset. Anything else must be emitted as a quoted key.
+_BARE_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 # Top-level section order. Anything not listed lands in the catch-all
 # `*_OTHER` group, sorted alphabetically.
@@ -105,12 +109,21 @@ def _emit_scalar(v) -> str:
     raise ValueError(f"cannot emit scalar: {v!r}")
 
 
+def _emit_key(k: str) -> str:
+    """Render a TOML key: bare when possible, quoted (and escaped)
+    otherwise — keys with dots or spaces would otherwise be silently
+    restructured into nested tables or emit invalid TOML."""
+    if _BARE_KEY_RE.match(k):
+        return k
+    return f'"{_escape_basic(k)}"'
+
+
 def _emit_value(v) -> str:
     if isinstance(v, list):
         return "[" + ", ".join(_emit_value(x) for x in v) + "]"
     if isinstance(v, dict):
         # Inline table.
-        items = [f"{k} = {_emit_value(x)}" for k, x in v.items()]
+        items = [f"{_emit_key(k)} = {_emit_value(x)}" for k, x in v.items()]
         return "{ " + ", ".join(items) + " }"
     return _emit_scalar(v)
 
@@ -143,7 +156,9 @@ def _is_subsection(v) -> bool:
 def _emit_kv_block(
     items: list[tuple[str, object]], indent: str = ""
 ) -> str:
-    """Emit `key = value` lines with `=` aligned within the block."""
+    """Emit `key = value` lines with `=` aligned within the block.
+    Keys must already be rendered (via `_emit_key` / `_emit_dotted_keys`)
+    — dotted composites like `deps.git` must not be re-quoted here."""
     if not items:
         return ""
     width = max(len(k) for k, _ in items)
@@ -160,9 +175,9 @@ def _emit_dotted_keys(prefix: str, d: dict) -> list[tuple[str, object]]:
     for k, v in d.items():
         if isinstance(v, dict) and not _is_subsection(v) and v:
             for kk, vv in v.items():
-                out.append((f"{k}.{kk}", vv))
+                out.append((f"{_emit_key(k)}.{_emit_key(kk)}", vv))
         else:
-            out.append((k, v))
+            out.append((_emit_key(k), v))
     return out
 
 
@@ -170,7 +185,7 @@ def _emit_target(name: str, t: dict) -> str:
     """Render one [targets.<name>] table, including any nested
     [targets.<name>.variants.<v>] sub-tables underneath."""
     chunks: list[str] = []
-    chunks.append(f"[targets.{name}]")
+    chunks.append(f"[targets.{_emit_key(name)}]")
     # Variants are nested sub-tables — separate them out.
     own = {k: v for k, v in t.items() if k != "variants"}
     body = _emit_dotted_keys("", own)
@@ -179,7 +194,9 @@ def _emit_target(name: str, t: dict) -> str:
         chunks.append(_emit_kv_block(body))
     for vname, vconf in (t.get("variants") or {}).items():
         chunks.append("")
-        chunks.append(f"[targets.{name}.variants.{vname}]")
+        chunks.append(
+            f"[targets.{_emit_key(name)}.variants.{_emit_key(vname)}]"
+        )
         v_items = _emit_dotted_keys("", vconf)
         v_items = _ordered_items(dict(v_items), _TARGET_FIELD_ORDER)
         if v_items:
@@ -198,7 +215,9 @@ def _emit_section(key: str, value: object) -> str:
         # sub-table) must be preserved as key = value, not dropped.
         chunks: list[str] = []
         scalar_items = [
-            (k, v) for k, v in value.items() if not isinstance(v, dict)
+            (_emit_key(k), v)
+            for k, v in value.items()
+            if not isinstance(v, dict)
         ]
         sub_keys = sorted(
             k for k, v in value.items() if isinstance(v, dict)
@@ -211,31 +230,45 @@ def _emit_section(key: str, value: object) -> str:
         for sub_key in sub_keys:
             sub = value[sub_key]
             scalar_confs = [
-                (n, c) for n, c in sub.items() if not isinstance(c, dict)
+                (_emit_key(n), c)
+                for n, c in sub.items()
+                if not isinstance(c, dict)
             ]
             table_confs = [
                 (n, c) for n, c in sub.items() if isinstance(c, dict)
             ]
             if scalar_confs or not table_confs:
-                chunks.append(f"[dependencies.{sub_key}]")
+                chunks.append(f"[dependencies.{_emit_key(sub_key)}]")
                 if scalar_confs:
                     chunks.append(_emit_kv_block(scalar_confs))
                 chunks.append("")
             for name, conf in table_confs:
-                chunks.append(f"[dependencies.{sub_key}.{name}]")
+                chunks.append(
+                    f"[dependencies.{_emit_key(sub_key)}.{_emit_key(name)}]"
+                )
                 if conf:
-                    chunks.append(_emit_kv_block(list(conf.items())))
+                    chunks.append(
+                        _emit_kv_block(
+                            [(_emit_key(k), v) for k, v in conf.items()]
+                        )
+                    )
                 chunks.append("")
         return "\n".join(chunks).rstrip()
     if key == "modules" and isinstance(value, dict):
         chunks = ["[modules]"]
         if value:
-            chunks.append(_emit_kv_block(list(value.items())))
+            chunks.append(
+                _emit_kv_block(
+                    [(_emit_key(k), v) for k, v in value.items()]
+                )
+            )
         return "\n".join(chunks)
     # Plain table → [key] header followed by aligned k = v block.
-    chunks = [f"[{key}]"]
+    chunks = [f"[{_emit_key(key)}]"]
     if isinstance(value, dict):
-        chunks.append(_emit_kv_block(list(value.items())))
+        chunks.append(
+            _emit_kv_block([(_emit_key(k), v) for k, v in value.items()])
+        )
     return "\n".join(chunks).rstrip()
 
 
@@ -252,7 +285,12 @@ def format_toml(source: str) -> str:
     seen: set[str] = {k for k, _ in scalars}
     if scalars:
         sections.append(
-            _emit_kv_block(sorted(scalars, key=lambda kv: kv[0]))
+            _emit_kv_block(
+                [
+                    (_emit_key(k), v)
+                    for k, v in sorted(scalars, key=lambda kv: kv[0])
+                ]
+            )
         )
     for key in _TOP_LEVEL_ORDER:
         if key in data and key not in seen:

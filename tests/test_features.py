@@ -104,6 +104,34 @@ class Fmt(unittest.TestCase):
         self.assertEqual(tomllib.loads(out), tomllib.loads(src))
         self.assertEqual(fmt.format_toml(out), out)
 
+    def test_non_bare_keys_quoted(self):
+        # Keys with dots were silently restructured into nested tables
+        # (`"a.b"` under env became env.a.b) and keys with spaces
+        # emitted invalid TOML.
+        src = dedent("""
+            [project]
+            name = "p"
+            "spaced key" = "v"
+
+            [targets.app]
+            kind = "script"
+            script = "true"
+            env = { "a.b" = "1", "has space" = "2", PLAIN = "3" }
+
+            [targets."dot.ted"]
+            kind = "script"
+            script = "true"
+
+            [targets."dot.ted".variants."v.1"]
+            script = "false"
+
+            [modules]
+            "mod.one" = "path/one"
+        """).lstrip()
+        out = fmt.format_toml(src)
+        self.assertEqual(tomllib.loads(out), tomllib.loads(src))
+        self.assertEqual(fmt.format_toml(out), out)
+
     def test_canonical_section_order(self):
         # Sections come out in TOP_LEVEL_ORDER regardless of source order.
         src = dedent("""
