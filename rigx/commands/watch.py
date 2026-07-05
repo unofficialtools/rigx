@@ -135,12 +135,20 @@ def _refresh_project(project, last_toml_mtime: float):
         return project, tm
 
 
-def _scan_all(root: Path) -> float:
-    """Latest mtime under `root` for the --watch-all mode, skipping
-    VCS/output dirs. flake.nix and flake.lock are rigx-managed — every
-    build (re)generates them, so watching them would trigger an
-    infinite rebuild loop with zero user edits."""
+# Change signature: (max mtime, set of files seen). Comparing signatures —
+# not just the max mtime — makes additions, deletions and renames trigger a
+# rebuild even when they don't advance the newest mtime (deleting a file
+# never does; `mv`/restoring an old file preserves its mtime).
+Signature = tuple[float, frozenset[Path]]
+
+
+def _scan_all(root: Path) -> Signature:
+    """Scan signature of everything under `root` for the --watch-all
+    mode, skipping VCS/output dirs. flake.nix and flake.lock are
+    rigx-managed — every build (re)generates them, so watching them
+    would trigger an infinite rebuild loop with zero user edits."""
     latest = 0.0
+    seen: set[Path] = set()
     skip = {".git", "output", "result", ".rigx"}
     skip_files = {"flake.lock", "flake.nix"}
     for path in root.rglob("*"):
@@ -154,9 +162,25 @@ def _scan_all(root: Path) -> float:
             except OSError:
                 # Editor temp files can vanish between rglob and stat.
                 continue
+            seen.add(path)
             if m > latest:
                 latest = m
-    return latest
+    return latest, frozenset(seen)
+
+
+def _scan_tracked(files: set[Path]) -> Signature:
+    """Scan signature of an explicit file set (narrow mode)."""
+    latest = 0.0
+    seen: set[Path] = set()
+    for path in files:
+        try:
+            m = path.stat().st_mtime
+        except OSError:
+            continue
+        seen.add(path)
+        if m > latest:
+            latest = m
+    return latest, frozenset(seen)
 
 
 def cmd_watch(args: argparse.Namespace) -> int:
@@ -180,35 +204,23 @@ def cmd_watch(args: argparse.Namespace) -> int:
     last_toml_mtime = toml_path.stat().st_mtime if toml_path.is_file() else 0.0
 
     if watch_all:
-        def scan() -> float:
+        def scan() -> Signature:
             # Reload after a rigx.toml edit so rebuilds use the new config.
             nonlocal project, last_toml_mtime
             project, last_toml_mtime = _refresh_project(project, last_toml_mtime)
             return _scan_all(project.root)
     else:
-        # Resolve the file set up-front. If TOML changes, we'll
-        # re-resolve at next iteration so newly-declared inputs start
-        # being watched without a `rigx watch` restart.
-        tracked = _declared_input_files(project, targets)
-
-        def scan() -> float:
-            # If rigx.toml changed, reload the project + tracked set so
-            # newly added sources etc. start being watched AND rebuilds
-            # use the new config (not the stale in-memory project).
-            nonlocal project, tracked, last_toml_mtime
-            new_proj, last_toml_mtime = _refresh_project(project, last_toml_mtime)
-            if new_proj is not project:
-                project = new_proj
-                tracked = _declared_input_files(project, targets)
-            latest = 0.0
-            for path in list(tracked):
-                try:
-                    m = path.stat().st_mtime
-                except OSError:
-                    continue
-                if m > latest:
-                    latest = m
-            return latest
+        def scan() -> Signature:
+            # If rigx.toml changed, reload the project so rebuilds use
+            # the new config (not the stale in-memory project).
+            nonlocal project, last_toml_mtime
+            project, last_toml_mtime = _refresh_project(project, last_toml_mtime)
+            # Re-resolve the tracked set every scan (same cost class as
+            # watch-all's rglob) so files newly matching a target's globs
+            # or include dirs start being watched, and deletions drop
+            # out of the signature and trigger a rebuild.
+            tracked = _declared_input_files(project, targets)
+            return _scan_tracked(tracked)
 
     last = scan()
     try:
@@ -223,7 +235,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
         while True:
             time.sleep(0.5)
             now = scan()
-            if now > last:
+            if now != last:
                 last = now
                 print("[rigx] change detected, rebuilding…")
                 try:

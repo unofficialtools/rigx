@@ -30,19 +30,23 @@ class ScanAll(unittest.TestCase):
         src = self._write("src/main.cpp", mtime=1_000_000.0)
         self._write("flake.nix")     # fresh mtime (now)
         self._write("flake.lock")    # fresh mtime (now)
-        latest = watch._scan_all(self.root)
+        latest, seen = watch._scan_all(self.root)
         self.assertEqual(latest, src.stat().st_mtime)
+        self.assertEqual(seen, frozenset({src}))
 
     def test_skips_generated_dirs(self):
         src = self._write("src/main.cpp", mtime=1_000_000.0)
         self._write("output/foo/bin", mtime=2_000_000.0)
         self._write(".rigx/cache", mtime=2_000_000.0)
-        self.assertEqual(watch._scan_all(self.root), src.stat().st_mtime)
+        latest, seen = watch._scan_all(self.root)
+        self.assertEqual(latest, src.stat().st_mtime)
+        self.assertEqual(seen, frozenset({src}))
 
     def test_sees_ordinary_files(self):
         self._write("src/a.cpp", mtime=1_000_000.0)
         newer = self._write("src/b.cpp", mtime=2_000_000.0)
-        self.assertEqual(watch._scan_all(self.root), newer.stat().st_mtime)
+        latest, _seen = watch._scan_all(self.root)
+        self.assertEqual(latest, newer.stat().st_mtime)
 
     def test_survives_file_vanishing_mid_scan(self):
         # An editor temp file can disappear between the is_file() check
@@ -61,8 +65,63 @@ class ScanAll(unittest.TestCase):
             return real_stat(path_self, **kw)
 
         with mock.patch.object(Path, "stat", flaky_stat):
-            latest = watch._scan_all(self.root)
+            latest, _seen = watch._scan_all(self.root)
         self.assertEqual(latest, (self.root / "src/a.cpp").stat().st_mtime)
+
+    def test_added_file_with_old_mtime_changes_signature(self):
+        # Restoring/moving in a file preserves its (old) mtime — the
+        # max-mtime alone would miss it; the path set must not.
+        self._write("src/a.cpp", mtime=2_000_000.0)
+        before = watch._scan_all(self.root)
+        self._write("src/b.cpp", mtime=1_000_000.0)
+        after = watch._scan_all(self.root)
+        self.assertNotEqual(before, after)
+
+    def test_deleted_file_changes_signature(self):
+        self._write("src/a.cpp", mtime=2_000_000.0)
+        b = self._write("src/b.cpp", mtime=1_000_000.0)
+        before = watch._scan_all(self.root)
+        b.unlink()
+        after = watch._scan_all(self.root)
+        self.assertNotEqual(before, after)
+
+    def test_renamed_file_changes_signature(self):
+        a = self._write("src/a.cpp", mtime=1_000_000.0)
+        before = watch._scan_all(self.root)
+        a.rename(self.root / "src" / "z.cpp")  # rename preserves mtime
+        after = watch._scan_all(self.root)
+        self.assertNotEqual(before, after)
+
+
+class ScanTracked(unittest.TestCase):
+    """Narrow mode: signature over an explicit tracked file set."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+
+    def _write(self, rel: str, mtime: float) -> Path:
+        p = self.root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("x")
+        os.utime(p, (mtime, mtime))
+        return p
+
+    def test_deleted_tracked_file_changes_signature(self):
+        a = self._write("a.cpp", 2_000_000.0)
+        b = self._write("b.cpp", 1_000_000.0)
+        before = watch._scan_tracked({a, b})
+        b.unlink()
+        after = watch._scan_tracked({a, b})
+        self.assertNotEqual(before, after)
+
+    def test_missing_files_are_skipped_not_fatal(self):
+        a = self._write("a.cpp", 1_000_000.0)
+        ghost = self.root / "ghost.cpp"
+        latest, seen = watch._scan_tracked({a, ghost})
+        self.assertEqual(latest, a.stat().st_mtime)
+        self.assertEqual(seen, frozenset({a}))
 
 
 class RefreshProject(unittest.TestCase):
