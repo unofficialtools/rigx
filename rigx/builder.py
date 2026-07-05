@@ -159,10 +159,24 @@ def _locked_nixpkgs_flakeref(root_str: str) -> str | None:
     try:
         data = json.loads((Path(root_str) / "flake.lock").read_text())
         nodes = data["nodes"]
+
+        # An input edge is either a node name (str) or a follow-path list —
+        # a chain of input names to walk from the ROOT node (elements are
+        # edge labels, not node keys, so taking edge[-1] as a top-level
+        # node key resolves the wrong node or KeyErrors). Intermediate
+        # edges may themselves be follow-paths; depth-cap against cycles.
+        def resolve(edge, depth: int = 0) -> str:
+            if depth > 32:
+                raise ValueError("flake.lock follows-path cycle")
+            if isinstance(edge, str):
+                return edge
+            node_name = data["root"]
+            for step in edge:
+                node_name = resolve(nodes[node_name]["inputs"][step], depth + 1)
+            return node_name
+
         edge = nodes[data["root"]]["inputs"]["nixpkgs"]
-        # An input edge is a node name, or a follow-path list ending in one.
-        node_name = edge[-1] if isinstance(edge, list) else edge
-        locked = nodes[node_name]["locked"]
+        locked = nodes[resolve(edge)]["locked"]
     except (OSError, ValueError, KeyError, TypeError):
         return None
     owner, repo, rev = locked.get("owner"), locked.get("repo"), locked.get("rev")

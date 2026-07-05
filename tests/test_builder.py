@@ -407,6 +407,99 @@ class BuildRejectsScript(unittest.TestCase):
             builder.build(proj, ["publish"])
 
 
+class LockedNixpkgsFlakeref(unittest.TestCase):
+    """_locked_nixpkgs_flakeref resolves the root's `nixpkgs` input in
+    flake.lock — including follows-path (list-valued) edges, whose
+    elements are input names walked from the root node, NOT top-level
+    node keys."""
+
+    def _resolve(self, lock: dict) -> str | None:
+        import json
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "flake.lock").write_text(json.dumps(lock))
+            return builder._locked_nixpkgs_flakeref(tmp)
+
+    @staticmethod
+    def _github(rev: str) -> dict:
+        return {"type": "github", "owner": "NixOS", "repo": "nixpkgs", "rev": rev}
+
+    def test_plain_string_edge(self):
+        lock = {
+            "root": "root",
+            "nodes": {
+                "root": {"inputs": {"nixpkgs": "nixpkgs"}},
+                "nixpkgs": {"locked": self._github("aaa111")},
+            },
+        }
+        self.assertEqual(self._resolve(lock), "github:NixOS/nixpkgs/aaa111")
+
+    def test_follows_path_edge_walked_from_root(self):
+        # root's nixpkgs follows `upstream.nixpkgs`. The dedup'd node is
+        # keyed `nixpkgs_2`; a decoy top-level `nixpkgs` node carries the
+        # WRONG rev — taking edge[-1] as a node key would return it.
+        lock = {
+            "root": "root",
+            "nodes": {
+                "root": {"inputs": {
+                    "nixpkgs": ["upstream", "nixpkgs"],
+                    "upstream": "upstream",
+                }},
+                "upstream": {
+                    "inputs": {"nixpkgs": "nixpkgs_2"},
+                    "locked": self._github("upstream-rev"),
+                },
+                "nixpkgs_2": {"locked": self._github("correct")},
+                "nixpkgs": {"locked": self._github("wrong")},
+            },
+        }
+        self.assertEqual(self._resolve(lock), "github:NixOS/nixpkgs/correct")
+
+    def test_nested_follows_edge(self):
+        # The intermediate edge is itself a follows-path.
+        lock = {
+            "root": "root",
+            "nodes": {
+                "root": {"inputs": {
+                    "nixpkgs": ["a", "nixpkgs"],
+                    "a": ["b", "a"],
+                    "b": "b",
+                }},
+                "b": {"inputs": {"a": "a"}, "locked": self._github("b-rev")},
+                "a": {
+                    "inputs": {"nixpkgs": "nixpkgs"},
+                    "locked": self._github("a-rev"),
+                },
+                "nixpkgs": {"locked": self._github("deep")},
+            },
+        }
+        self.assertEqual(self._resolve(lock), "github:NixOS/nixpkgs/deep")
+
+    def test_follows_cycle_falls_back_to_none(self):
+        lock = {
+            "root": "root",
+            "nodes": {
+                "root": {"inputs": {"nixpkgs": ["nixpkgs"]}},
+            },
+        }
+        self.assertIsNone(self._resolve(lock))
+
+    def test_missing_lock_returns_none(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(builder._locked_nixpkgs_flakeref(tmp))
+
+    def test_non_github_input_returns_none(self):
+        lock = {
+            "root": "root",
+            "nodes": {
+                "root": {"inputs": {"nixpkgs": "nixpkgs"}},
+                "nixpkgs": {"locked": {"type": "path", "path": "/x"}},
+            },
+        }
+        self.assertIsNone(self._resolve(lock))
+
+
 class FlakeRef(unittest.TestCase):
     def test_shape(self):
         proj = _project_with()
