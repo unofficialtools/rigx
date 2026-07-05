@@ -311,6 +311,34 @@ class CmdNew(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("invalid TOML", err)
 
+    def test_rejects_name_with_space(self):
+        # `rigx new script "a b"` would append `[targets.a b]` — invalid
+        # TOML that bricks every subsequent command.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "rigx.toml").write_text('[project]\nname = "p"\n')
+            rc, _out, err = self._run(root, "script", "a b")
+            self.assertEqual(rc, 1)
+            self.assertIn("invalid target name", err)
+            self.assertNotIn("a b", (root / "rigx.toml").read_text())
+
+    def test_rejects_name_with_path_traversal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "rigx.toml").write_text('[project]\nname = "p"\n')
+            for bad in ("../evil", "a/b", "a.b", '"quoted"'):
+                rc, _out, err = self._run(root, "executable", bad)
+                self.assertEqual(rc, 1, bad)
+                self.assertIn("invalid target name", err)
+
+    def test_accepts_hyphenated_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "rigx.toml").write_text('[project]\nname = "p"\n')
+            rc, _out, err = self._run(root, "script", "my-task")
+            self.assertEqual(rc, 0, err)
+            self.assertIn("[targets.my-task]", (root / "rigx.toml").read_text())
+
     def test_finds_project_root_from_subdirectory(self):
         # Without -C, cmd_new must search upward for rigx.toml like every
         # other command, not assume cwd is the project root.

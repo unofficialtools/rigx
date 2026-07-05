@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
 from rigx import config, scaffold
 from rigx.commands.helpers import find_project_root
+
+# A bad name would be appended verbatim as `[targets.<name>]` (spaces make
+# rigx.toml unparseable, bricking every later command) and interpolated into
+# stub file paths (`/` or `..` would write outside src/).
+_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
 
 
 def cmd_new(args: argparse.Namespace) -> int:
@@ -19,6 +25,13 @@ def cmd_new(args: argparse.Namespace) -> int:
         except SystemExit:
             # Keep the friendlier "create one first" message below.
             root = Path.cwd()
+    if not _NAME_RE.match(args.name):
+        print(
+            f"rigx: invalid target name {args.name!r} — use letters, digits, "
+            f"'_' or '-', starting with a letter or '_'",
+            file=sys.stderr,
+        )
+        return 1
     toml_path = root / "rigx.toml"
     if not toml_path.is_file():
         print(
