@@ -1003,6 +1003,32 @@ class EnsureHostTestDepsBuilt(unittest.TestCase):
             builder._ensure_host_test_deps_built(proj, host_tests, jobs=None)
         build_mock.assert_not_called()
 
+    def test_module_merged_test_deps_filtered(self):
+        # Module-merged deps are stored under dotted qualified keys
+        # (`mod.helper_test`). find_target used to miss those, so
+        # test-kind module deps leaked into the build list and build()
+        # errored on them. Buildable module deps must still go through.
+        from rigx.config import TargetDeps
+        proj = _project_with(**{
+            "mod.lib": Target(
+                name="lib", namespace="mod", kind="executable",
+                sources=["mod/a.c"],
+            ),
+            "mod.helper_test": Target(
+                name="helper_test", namespace="mod", kind="test",
+                sandbox=True, script="echo",
+            ),
+            "host_t": Target(
+                name="host_t", kind="test", sandbox=False, script="echo",
+                deps=TargetDeps(internal=["mod.lib", "mod.helper_test"]),
+            ),
+        })
+        host_tests = [("host_t", proj.targets["host_t"])]
+        with mock.patch("rigx.builder.build") as build_mock:
+            builder._ensure_host_test_deps_built(proj, host_tests, jobs=None)
+        called_specs = build_mock.call_args.args[1]
+        self.assertEqual(called_specs, ["mod.lib"])
+
     def test_dedups_deps_across_multiple_host_tests(self):
         from rigx.config import TargetDeps
         proj = _project_with(**{
