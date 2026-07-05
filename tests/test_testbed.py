@@ -222,6 +222,53 @@ class FaultRules(unittest.TestCase):
                     pass
             self.assertIn("banana", str(ctx.exception))
 
+    def test_fault_rejects_ruleset_method_names(self):
+        """`hasattr(RuleSet, k)` would accept method names ('apply'),
+        letting setattr shadow the method and TypeError later inside a
+        pump thread. Only dataclass fields are valid rules."""
+        net = testbed.Network()
+        net.declare("a")
+        net.declare("b", listens_on=[1])
+        net.link("a", "b", to_port=1)
+        with self.assertRaises(ValueError) as ctx:
+            with net.fault("a", "b", apply=0.5):
+                pass
+        self.assertIn("apply", str(ctx.exception))
+
+    def test_fault_rejects_bad_rule_values(self):
+        """Bad values must fail at fault() time, not mid-pump (where
+        they'd hang the connection instead of failing the test)."""
+        net = testbed.Network()
+        net.declare("a")
+        net.declare("b", listens_on=[1])
+        net.link("a", "b", to_port=1)
+        for bad in (
+            {"drop_rate": "0.5"},     # not a number
+            {"drop_rate": 1.5},       # probability out of range
+            {"delay_ms": -10},        # negative
+            {"blocked": "yes"},       # not a bool
+            {"corrupt_rate": True},   # bool is not a rate
+        ):
+            with self.assertRaises(ValueError, msg=f"rules={bad}"):
+                with net.fault("a", "b", **bad):
+                    pass
+
+    def test_fault_validates_proto_and_reports_it_on_no_match(self):
+        net = testbed.Network()
+        net.declare("a")
+        net.declare("b", listens_on=[1])
+        net.link("a", "b", to_port=1)  # TCP only
+        with self.assertRaises(ValueError) as ctx:
+            with net.fault("a", "b", proto="sctp", blocked=True):
+                pass
+        self.assertIn("'tcp' or 'udp'", str(ctx.exception))
+        # A valid proto with no matching link names the proto in the
+        # error so the tcp/udp mixup is visible.
+        with self.assertRaises(ValueError) as ctx:
+            with net.fault("a", "b", proto="udp", blocked=True):
+                pass
+        self.assertIn("proto='udp'", str(ctx.exception))
+
     def test_fault_on_undeclared_link_raises(self):
         net = testbed.Network()
         net.declare("a")

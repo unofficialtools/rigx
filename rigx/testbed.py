@@ -49,7 +49,7 @@ import tempfile
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Iterator
 
@@ -648,6 +648,41 @@ class Network:
         applies to both TCP and UDP links between the pair; pass
         `"tcp"` or `"udp"` to scope to one. On exit, rules are
         restored to their pre-block values — faults nest cleanly."""
+        if proto is not None and proto not in ("tcp", "udp"):
+            raise ValueError(
+                f"fault proto must be 'tcp' or 'udp', got {proto!r}"
+            )
+        # Validate against the actual RuleSet *fields* — hasattr would
+        # also accept method names like 'apply', letting setattr shadow
+        # the method and blow up later inside a pump thread. Values are
+        # type/range-checked here for the same reason: a bad value
+        # (drop_rate="0.5") would otherwise explode mid-pump, silently
+        # hanging the connection instead of failing the test.
+        valid = [f.name for f in fields(RuleSet)]
+        for k, v in rules.items():
+            if k not in valid:
+                raise ValueError(
+                    f"unknown fault rule {k!r}; valid: " + ", ".join(valid)
+                )
+            if k == "blocked":
+                if not isinstance(v, bool):
+                    raise ValueError(
+                        f"fault rule 'blocked' must be a bool, got {v!r}"
+                    )
+                continue
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise ValueError(
+                    f"fault rule {k!r} must be a number, got {v!r}"
+                )
+            if v < 0:
+                raise ValueError(
+                    f"fault rule {k!r} must be >= 0, got {v!r}"
+                )
+            if k in ("drop_rate", "corrupt_rate") and v > 1:
+                raise ValueError(
+                    f"fault rule {k!r} is a probability — must be <= 1, "
+                    f"got {v!r}"
+                )
         affected = [
             link for (s, d, p, pr), link in self._links.items()
             if s == src and d == dst
@@ -657,14 +692,8 @@ class Network:
         if not affected:
             raise ValueError(
                 f"no link matches src={src!r} dst={dst!r} "
-                f"to_port={to_port!r}"
+                f"to_port={to_port!r} proto={proto!r}"
             )
-        for k in rules:
-            if not hasattr(RuleSet, k):
-                raise ValueError(
-                    f"unknown fault rule {k!r}; valid: "
-                    f"drop_rate, delay_ms, jitter_ms, corrupt_rate, blocked"
-                )
         snapshots = [(link, _snapshot(link.rules)) for link in affected]
         for link in affected:
             for k, v in rules.items():
