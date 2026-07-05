@@ -615,6 +615,43 @@ class UdpForwarding(unittest.TestCase):
                 reply, _ = s.recvfrom(4096)
                 self.assertEqual(reply, b"req")
 
+    def test_idle_sessions_evicted_under_continuous_traffic(self):
+        """Session GC must run on a timer, not only on the recv-timeout
+        branch — under continuous traffic that branch never fires, so
+        idle sessions (and their upstream sockets + reply pumps) would
+        pile up forever. Shrink the timers, let sender `a` idle past
+        the timeout while `b` keeps the forwarder busy, and check `a`'s
+        next datagram arrives via a *fresh* upstream socket (different
+        source port at the destination)."""
+        net = testbed.Network()
+        listen_addr, listen_port, dst_port = self._two_capsules_udp(net)
+        fc_addr = net.address("fc")
+        net._UDP_SESSION_IDLE_TIMEOUT = 0.15
+        net._UDP_GC_INTERVAL = 0.05
+        with udp_echo_server(fc_addr, dst_port) as received, net:
+            a = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            b = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                a.sendto(b"a1", (listen_addr, listen_port))
+                # Keep traffic flowing so recvfrom never times out
+                # while `a` sits idle past its session timeout.
+                deadline = time.monotonic() + 0.5
+                while time.monotonic() < deadline:
+                    b.sendto(b"bb", (listen_addr, listen_port))
+                    time.sleep(0.02)
+                a.sendto(b"a2", (listen_addr, listen_port))
+                time.sleep(0.2)
+            finally:
+                a.close()
+                b.close()
+        a_peers = [peer for data, peer in received if data.startswith(b"a")]
+        self.assertEqual(len(a_peers), 2)
+        self.assertNotEqual(
+            a_peers[0][1], a_peers[1][1],
+            "idle session was never evicted — both datagrams used the "
+            "same upstream socket",
+        )
+
     def test_link_to_udp_port_not_declared_rejected(self):
         """`fc` declared TCP 5001 only; UDP link to 5001 should fail
         with a clear pointer at `udp_listens_on`."""

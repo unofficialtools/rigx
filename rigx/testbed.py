@@ -955,6 +955,7 @@ class Network:
     # listener thread head-of-line. Acceptable for tests where delay
     # is modest; switch to a heap-based scheduler if it bites.
     _UDP_SESSION_IDLE_TIMEOUT = 60.0  # seconds before a quiet session is GC'd
+    _UDP_GC_INTERVAL = 1.0            # how often the forwarder sweeps for them
 
     def _udp_forwarder(self, listener: socket.socket, link: _Link) -> None:
         sessions: dict[tuple[str, int], _UdpSession] = {}
@@ -1000,13 +1001,21 @@ class Network:
                 except OSError:
                     pass
 
+        # Sweep for idle sessions on a timer, not only when recvfrom
+        # times out — under continuous traffic the timeout branch never
+        # fires, so idle sessions would otherwise accumulate sockets
+        # and reply-pump threads forever.
+        last_gc = time.monotonic()
         try:
             while not self._stopping:
+                now = time.monotonic()
+                if now - last_gc >= self._UDP_GC_INTERVAL:
+                    with sessions_lock:
+                        gc_idle()
+                    last_gc = now
                 try:
                     payload, peer = listener.recvfrom(65535)
                 except (socket.timeout, BlockingIOError):
-                    with sessions_lock:
-                        gc_idle()
                     continue
                 except OSError:
                     return
