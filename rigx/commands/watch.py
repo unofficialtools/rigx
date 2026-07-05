@@ -189,7 +189,8 @@ def cmd_watch(args: argparse.Namespace) -> int:
     Default: watches each target's declared inputs (sources, includes,
     public_headers, lockfiles, rigx.toml). Use `--watch-all` to revert
     to the legacy 'scan the whole project tree (minus output/, .git,
-    result, .rigx, flake.lock)' behavior — useful when files outside
+    result, .rigx, flake.nix, flake.lock)' behavior — useful when files
+    outside
     declared inputs (generated headers, ad-hoc data) should also
     trigger rebuilds.
     """
