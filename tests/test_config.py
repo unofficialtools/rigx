@@ -1073,6 +1073,85 @@ class Modules(unittest.TestCase):
             proj.targets["frontend.app"].deps.internal, ["frontend.lib"]
         )
 
+    def test_intra_module_interpolated_source_derives_qualified_dep(self):
+        # `${gen}` in a module target's sources names the namespaced
+        # sibling (`frontend.gen`); the auto-derived dep edge must carry
+        # the qualified name, not silently drop.
+        root = self._setup({
+            "rigx.toml": """
+                [project]
+                name = "p"
+
+                [modules]
+                include = ["frontend"]
+            """,
+            "frontend/rigx.toml": """
+                [targets.gen]
+                kind = "custom"
+                install_script = "mkdir -p $out && echo '' > $out/hello.nim"
+
+                [targets.app]
+                kind = "executable"
+                sources = ["${gen}/hello.nim"]
+            """,
+        })
+        proj = config.load(root)
+        self.assertEqual(
+            proj.targets["frontend.app"].deps.internal, ["frontend.gen"]
+        )
+
+    def test_intra_module_run_ref_auto_qualifies(self):
+        # `run = "tool"` inside a module binds to the namespaced sibling
+        # and is stored qualified so validation and codegen see it.
+        root = self._setup({
+            "rigx.toml": """
+                [project]
+                name = "p"
+
+                [modules]
+                include = ["frontend"]
+            """,
+            "frontend/rigx.toml": """
+                [targets.tool]
+                kind = "executable"
+                sources = ["t.cpp"]
+
+                [targets.r]
+                kind = "run"
+                run = "tool"
+                outputs = ["out.txt"]
+            """,
+            "frontend/t.cpp": "",
+        })
+        proj = config.load(root)
+        self.assertEqual(proj.targets["frontend.r"].run, "frontend.tool")
+
+    def test_intra_module_run_ref_wrong_kind_rejected(self):
+        # A qualified run ref to a non-runnable sibling must fail
+        # validation instead of silently degrading to a PATH command.
+        root = self._setup({
+            "rigx.toml": """
+                [project]
+                name = "p"
+
+                [modules]
+                include = ["frontend"]
+            """,
+            "frontend/rigx.toml": """
+                [targets.lib]
+                kind = "static_library"
+                sources = ["l.cpp"]
+
+                [targets.r]
+                kind = "run"
+                run = "lib"
+                outputs = ["out.txt"]
+            """,
+            "frontend/l.cpp": "",
+        })
+        with self.assertRaisesRegex(ConfigError, "must be one of"):
+            config.load(root)
+
     def test_module_rejects_project_section(self):
         root = self._setup({
             "rigx.toml": """

@@ -90,6 +90,19 @@ def _scan_interpolated_refs(items: list[str]) -> list[str]:
                 seen.append(ref)
     return seen
 
+
+def _qualify_ref(ref: str, namespace: str, targets: dict[str, "Target"]) -> str:
+    """Resolve a possibly-bare target reference written inside a module:
+    prefer the namespace-qualified sibling (`gen` → `frontend.gen`),
+    falling back to the bare name (a parent-owned target, a cross-flake
+    ref, or — for `run` — a PATH command). Mirrors the deps.internal
+    auto-qualification in `_build_target`."""
+    if namespace and "." not in ref:
+        qualified = f"{namespace}.{ref}"
+        if qualified in targets:
+            return qualified
+    return ref
+
 # Capsule backends.
 #
 #   `lite`  — `unofficialtools/nix-docker`-style FROM-scratch container
@@ -1494,6 +1507,10 @@ def _load(root: Path, _visited: set[Path]) -> Project:
         # also restating `deps.internal = ["gen"]`; the interpolation
         # already names the producer, so the dep is implied.
         for ref in _scan_interpolated_refs(target.sources):
+            # Inside a module, `${gen}` names the namespaced sibling
+            # (`frontend.gen`) — resolve before the membership check so
+            # the derived dep edge isn't silently dropped.
+            ref = _qualify_ref(ref, target.namespace, targets)
             if ref in targets and ref not in target.deps.internal:
                 target.deps.internal.append(ref)
         for dep in target.deps.internal:
@@ -1545,6 +1562,10 @@ def _load(root: Path, _visited: set[Path]) -> Project:
         if target.kind == "run":
             if not target.run:
                 raise ConfigError(f"target {qname}: kind='run' requires 'run = <name>'")
+            # A module target may name a sibling bare (`run = "tool"`);
+            # store the qualified name so validation and downstream
+            # consumers (flake codegen, graph edges) see the merged key.
+            target.run = _qualify_ref(target.run, target.namespace, targets)
             # If `run` matches an internal target, require it to be runnable.
             # Otherwise, treat `run` as a bare command name resolved via PATH
             # (supplied by deps.nixpkgs / deps.git).
