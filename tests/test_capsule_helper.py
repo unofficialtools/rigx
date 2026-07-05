@@ -423,7 +423,7 @@ class PublishTupleForm(unittest.TestCase):
             publish={5000: 5040},
             publish_udp={6000: ("127.0.10.2", 6040)},
         )
-        self.assertEqual(cap.host_endpoint(5000), ("127.0.0.1", 5040))
+        self.assertEqual(cap.host_endpoint(5000), ("0.0.0.0", 5040))
         self.assertEqual(
             cap.host_endpoint(6000, proto="udp"), ("127.0.10.2", 6040)
         )
@@ -431,6 +431,23 @@ class PublishTupleForm(unittest.TestCase):
             cap.host_endpoint(6000)            # TCP map doesn't have 6000
         with self.assertRaises(KeyError):
             cap.host_endpoint(5000, proto="udp")  # UDP map doesn't have 5000
+
+    def test_int_publish_form_reports_wildcard_bind(self):
+        """The bare-int publish form renders as `host:cont`, which
+        docker binds on 0.0.0.0 — host_endpoint reports that truthfully
+        while host_address maps the wildcard to 127.0.0.1 (the address
+        a host-side client can actually connect to). The explicit
+        tuple form passes through untouched."""
+        cap = capsule.Capsule(
+            name="svc", container_name="x",
+            capsule_dir=Path("/nowhere"),
+            manifest={},
+            publish={5000: 5040, 5001: ("127.0.10.2", 5041)},
+        )
+        self.assertEqual(cap.host_endpoint(5000), ("0.0.0.0", 5040))
+        self.assertEqual(cap.host_address(5000), "127.0.0.1")
+        self.assertEqual(cap.host_port(5000), 5040)
+        self.assertEqual(cap.host_address(5001), "127.0.10.2")
 
 
 class CapsuleHandle(unittest.TestCase):

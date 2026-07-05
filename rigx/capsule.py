@@ -79,10 +79,14 @@ a `(container_path, mode)` tuple. Hosts are the keys in the
 
 
 def _split_publish(value: PublishSpec) -> tuple[str, int]:
-    """Normalize a publish-mapping value to `(host_addr, host_port)`."""
+    """Normalize a publish-mapping value to `(host_addr, host_port)`.
+    The bare-int form renders as `host:cont`, which docker binds on
+    all interfaces — so it normalizes to `0.0.0.0`, matching the
+    actual bind. Callers that need a *connectable* address map the
+    wildcard to loopback (see `Capsule.host_address`)."""
     if isinstance(value, tuple):
         return value
-    return ("127.0.0.1", value)
+    return ("0.0.0.0", value)
 
 
 def _publish_specs(value: PublishMapping) -> list[PublishSpec]:
@@ -167,9 +171,13 @@ class Capsule:
     def host_address(
         self, container_port: int, *, proto: str = "tcp"
     ) -> str:
-        """Host-side address the container port is published on."""
+        """Host-side address the container port is published on. A
+        wildcard bind (the bare-int publish form → `0.0.0.0`) is
+        reported as `127.0.0.1`: `0.0.0.0` isn't a connectable
+        destination, and the point of this accessor is
+        `connect((host_address(p), host_port(p)))`."""
         addr, _ = self.host_endpoint(container_port, proto=proto)
-        return addr
+        return "127.0.0.1" if addr == "0.0.0.0" else addr
 
     def host_endpoint(
         self, container_port: int, *, proto: str = "tcp"
@@ -204,6 +212,9 @@ class Capsule:
         accept — so this method is TCP-only. For UDP, sleep briefly or
         send-and-retry from the test orchestrator."""
         host_addr, host_port = self.host_endpoint(container_port, proto="tcp")
+        if host_addr == "0.0.0.0":
+            # Wildcard bind — poll it via loopback.
+            host_addr = "127.0.0.1"
         deadline = time.monotonic() + timeout
         last_err: OSError | None = None
         while time.monotonic() < deadline:
