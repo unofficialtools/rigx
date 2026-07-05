@@ -37,6 +37,29 @@ def mermaid(project: Project, root_spec: str) -> str:
     edges: list[tuple[str, str]] = []
     visited: set[str] = set()
 
+    # Sanitization collapses `.`, `-`, and `/` to `_`, so distinct names
+    # like `web.app` / `web-app` / `web_app` share a sanitized base. Assign
+    # ids through a registry that suffixes `_2`, `_3`, ... on collision;
+    # allocation follows the deterministic visit order, so ids are stable
+    # within a render. Labels always carry the true name, so a suffixed id
+    # never changes what the user reads.
+    assigned: dict[tuple[str, str], str] = {}  # (namespace, name) -> id
+    used_ids: set[str] = set()
+
+    def node_id(namespace: str, name: str, prefix: str = "") -> str:
+        key = (namespace, name)
+        if key in assigned:
+            return assigned[key]
+        base = prefix + _node_id(name)
+        nid = base
+        counter = 2
+        while nid in used_ids:
+            nid = f"{base}_{counter}"
+            counter += 1
+        assigned[key] = nid
+        used_ids.add(nid)
+        return nid
+
     def add_node(node_id: str, label: str, klass: str) -> None:
         if node_id not in nodes:
             nodes[node_id] = (label, klass)
@@ -46,30 +69,31 @@ def mermaid(project: Project, root_spec: str) -> str:
             return
         visited.add(qual)
         target = owning.targets[qual]
-        add_node(_node_id(qual), f"{qual} [{target.kind}]", "internal")
+        qual_id = node_id("target", qual)
+        add_node(qual_id, f"{qual} [{target.kind}]", "internal")
 
         for d in target.deps.internal:
             if d in owning.targets:
-                edges.append((_node_id(qual), _node_id(d)))
+                edges.append((qual_id, node_id("target", d)))
                 visit(d)
             elif "." in d and d.split(".", 1)[0] in owning.local_deps:
                 # Cross-flake: render as an opaque leaf. Going deeper would
                 # require following another flake's loaded sub_project, which
                 # is doable but bloats the graph; users can `rigx graph` from
                 # inside the sibling for that.
-                node_id = _node_id(d)
-                add_node(node_id, f"{d} [local-dep]", "cross_flake")
-                edges.append((_node_id(qual), node_id))
+                dep_id = node_id("target", d)
+                add_node(dep_id, f"{d} [local-dep]", "cross_flake")
+                edges.append((qual_id, dep_id))
 
         for d in target.deps.nixpkgs:
-            node_id = "pkg_" + _node_id(d)
-            add_node(node_id, f"pkgs.{d}", "nixpkgs")
-            edges.append((_node_id(qual), node_id))
+            dep_id = node_id("pkg", d, prefix="pkg_")
+            add_node(dep_id, f"pkgs.{d}", "nixpkgs")
+            edges.append((qual_id, dep_id))
 
         for d in target.deps.git:
-            node_id = "git_" + _node_id(d)
-            add_node(node_id, f"git:{d}", "git")
-            edges.append((_node_id(qual), node_id))
+            dep_id = node_id("git", d, prefix="git_")
+            add_node(dep_id, f"git:{d}", "git")
+            edges.append((qual_id, dep_id))
 
         # `run` adds an implicit dep on the named internal target; surface it.
         if (
@@ -77,7 +101,7 @@ def mermaid(project: Project, root_spec: str) -> str:
             and target.run in owning.targets
             and target.run not in target.deps.internal
         ):
-            edges.append((_node_id(qual), _node_id(target.run)))
+            edges.append((qual_id, node_id("target", target.run)))
             visit(target.run)
 
     visit(root_name)

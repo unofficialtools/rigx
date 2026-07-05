@@ -117,6 +117,41 @@ class Mermaid(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no such target"):
             graph.mermaid(proj, "missing")
 
+    def test_colliding_sanitized_names_stay_distinct(self):
+        # `web.app`, `web-app`, and `web_app` all sanitize to `web_app`;
+        # each must get its own node (with the true name in the label),
+        # not be merged into one node with merged edges.
+        proj = _project({
+            "web.app": Target(name="web.app", kind="static_library", sources=["a.cpp"]),
+            "web-app": Target(name="web-app", kind="static_library", sources=["b.cpp"]),
+            "web_app": Target(
+                name="web_app", kind="executable", sources=["m.cpp"],
+                deps=TargetDeps(internal=["web.app", "web-app"]),
+            ),
+        })
+        out = graph.mermaid(proj, "web_app")
+        self.assertIn('web_app["web_app [executable]"]', out)
+        self.assertIn('web_app_2["web.app [static_library]"]', out)
+        self.assertIn('web_app_3["web-app [static_library]"]', out)
+        self.assertIn("web_app --> web_app_2", out)
+        self.assertIn("web_app --> web_app_3", out)
+        # Ids are stable within (and across identical) renders.
+        self.assertEqual(out, graph.mermaid(proj, "web_app"))
+
+    def test_pkg_prefix_does_not_collide_with_target_name(self):
+        # A target literally named `pkg_fmt` must not merge with the
+        # `pkg_`-prefixed node for the nixpkgs dep `fmt`.
+        proj = _project({
+            "pkg_fmt": Target(
+                name="pkg_fmt", kind="executable", sources=["m.cpp"],
+                deps=TargetDeps(nixpkgs=["fmt"]),
+            ),
+        })
+        out = graph.mermaid(proj, "pkg_fmt")
+        self.assertIn('pkg_fmt["pkg_fmt [executable]"]', out)
+        self.assertIn('pkg_fmt_2(["pkgs.fmt"])', out)
+        self.assertIn("pkg_fmt --> pkg_fmt_2", out)
+
     def test_classes_assigned(self):
         proj = _project({
             "hello": Target(
