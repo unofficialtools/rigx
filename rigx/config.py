@@ -943,8 +943,9 @@ def _build_target(
         raise ConfigError(f"{tctx}: env must be a table of name → string values")
     env = dict(env_raw)
     ports_raw = tconf.get("ports", [])
+    # bool is a subclass of int — reject `[true]` explicitly.
     if not isinstance(ports_raw, list) or not all(
-        isinstance(x, int) for x in ports_raw
+        isinstance(x, int) and not isinstance(x, bool) for x in ports_raw
     ):
         raise ConfigError(f"{tctx}: ports must be a list of integers")
     ports = list(ports_raw)

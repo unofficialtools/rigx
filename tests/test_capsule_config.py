@@ -179,6 +179,23 @@ class CapsuleParse(unittest.TestCase):
                 config.load(root)
             self.assertIn("ports", str(ctx.exception))
 
+    def test_ports_rejects_booleans(self):
+        # bool subclasses int — `[true]` must not pass the int check.
+        body = """
+            [project]
+            name = "p"
+
+            [targets.svc]
+            kind       = "capsule"
+            backend    = "lite"
+            entrypoint = "/bin/true"
+            ports      = [true]
+        """
+        with TempProject(body) as root:
+            with self.assertRaises(ConfigError) as ctx:
+                config.load(root)
+            self.assertIn("ports", str(ctx.exception))
+
     def test_short_name_collision_in_deps_internal(self):
         """`deps.internal = ["myapp", "frontend.myapp"]` — both expose
         as `${myapp}` inside the entrypoint. Validator catches this."""
