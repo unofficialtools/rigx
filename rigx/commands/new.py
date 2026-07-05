@@ -56,11 +56,15 @@ def cmd_new(args: argparse.Namespace) -> int:
     except ValueError as e:
         print(f"rigx: {e}", file=sys.stderr)
         return 1
-    for rel, body in s.files.items():
+    # Check every path up-front so a clash aborts before anything is
+    # written — a mid-loop abort would leave a partial scaffold behind.
+    for rel in s.files:
         path = root / rel
         if path.exists():
             print(f"rigx: refusing to overwrite existing file {path}", file=sys.stderr)
             return 1
+    for rel, body in s.files.items():
+        path = root / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(body)
         print(f"  wrote {rel}")

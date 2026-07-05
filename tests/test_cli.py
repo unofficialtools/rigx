@@ -331,6 +331,22 @@ class CmdNew(unittest.TestCase):
                 self.assertEqual(rc, 1, bad)
                 self.assertIn("invalid target name", err)
 
+    def test_overwrite_clash_leaves_no_partial_scaffold(self):
+        # static_library writes src/lib.cpp then include/lib.h; if only
+        # the second clashes, nothing must be written (a mid-loop abort
+        # used to leave the first stub orphaned and rigx.toml untouched).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            toml_body = '[project]\nname = "p"\n'
+            (root / "rigx.toml").write_text(toml_body)
+            (root / "include").mkdir()
+            (root / "include" / "lib.h").write_text("// mine\n")
+            rc, _out, err = self._run(root, "static_library", "lib")
+            self.assertEqual(rc, 1)
+            self.assertIn("refusing to overwrite", err)
+            self.assertFalse((root / "src" / "lib.cpp").exists())
+            self.assertEqual((root / "rigx.toml").read_text(), toml_body)
+
     def test_accepts_hyphenated_name(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
