@@ -19,6 +19,11 @@ from pathlib import Path
 # TOML bare-key charset. Anything else must be emitted as a quoted key.
 _BARE_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
+
+class FmtError(ValueError):
+    """Formatting failed, or the formatted output would not round-trip
+    to the same document (in which case nothing is written)."""
+
 # Top-level section order. Anything not listed lands in the catch-all
 # `*_OTHER` group, sorted alphabetically.
 _TOP_LEVEL_ORDER = [
@@ -106,7 +111,7 @@ def _emit_scalar(v) -> str:
             # after the opening delimiter.
             return '"""\n' + _escape_basic(v, multiline=True) + '"""'
         return f'"{_escape_basic(v)}"'
-    raise ValueError(f"cannot emit scalar: {v!r}")
+    raise FmtError(f"cannot emit scalar: {v!r}")
 
 
 def _emit_key(k: str) -> str:
@@ -208,6 +213,8 @@ def _emit_section(key: str, value: object) -> str:
     """Render one top-level section. Targets are special-cased because
     each target is its own [targets.X] block."""
     if key == "targets" and isinstance(value, dict):
+        if not value:
+            return "[targets]"
         return "\n\n".join(_emit_target(n, t) for n, t in value.items())
     if key == "dependencies" and isinstance(value, dict):
         # [dependencies.git.X] / [dependencies.local.X] sub-sections.
@@ -275,8 +282,13 @@ def _emit_section(key: str, value: object) -> str:
 def format_toml(source: str) -> str:
     """Parse a TOML string and re-emit it in canonical form. Round-trip
     is structurally idempotent: a second `format_toml` call on the
-    output produces the same bytes."""
-    data = tomllib.loads(source)
+    output produces the same bytes. The output is verified to reparse
+    to the same document; any emitter bug raises `FmtError` instead of
+    silently corrupting the file."""
+    try:
+        data = tomllib.loads(source)
+    except tomllib.TOMLDecodeError as e:
+        raise FmtError(f"invalid TOML: {e}") from e
     sections: list[str] = []
     # Top-level scalars (rare, but legal TOML) render as a leading
     # key = value block; rewriting them as [key] headers would silently
@@ -299,7 +311,23 @@ def format_toml(source: str) -> str:
     for key in sorted(data.keys()):
         if key not in seen:
             sections.append(_emit_section(key, data[key]))
-    return "\n\n".join(s for s in sections if s) + "\n"
+    canonical = "\n\n".join(s for s in sections if s) + "\n"
+    # Safety net: the canonical form must parse back to the exact same
+    # document. This turns any residual emitter bug into a visible
+    # error instead of silent config corruption on `rigx fmt --write`.
+    try:
+        reparsed = tomllib.loads(canonical)
+    except tomllib.TOMLDecodeError as e:
+        raise FmtError(
+            f"formatter bug: output is not valid TOML ({e}); "
+            "refusing to emit"
+        ) from e
+    if reparsed != data:
+        raise FmtError(
+            "formatter bug: formatting would change the file's meaning; "
+            "refusing to emit"
+        )
+    return canonical
 
 
 def format_file(path: Path, *, write: bool) -> str:

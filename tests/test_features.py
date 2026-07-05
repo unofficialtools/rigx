@@ -132,6 +132,73 @@ class Fmt(unittest.TestCase):
         self.assertEqual(tomllib.loads(out), tomllib.loads(src))
         self.assertEqual(fmt.format_toml(out), out)
 
+    def test_round_trip_safety_net_raises(self):
+        # An emitter bug that changes the document's meaning must raise
+        # FmtError instead of silently emitting corrupted output.
+        src = '[project]\nname = "p"\n'
+        with mock.patch.object(fmt, "_emit_scalar", return_value='"wrong"'):
+            with self.assertRaises(fmt.FmtError):
+                fmt.format_toml(src)
+
+    def test_write_refused_on_formatter_bug(self):
+        # format_file(write=True) must not touch the file when the
+        # round-trip check fails.
+        src = '[project]\nname = "p"\n'
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "rigx.toml"
+            path.write_text(src)
+            with mock.patch.object(
+                fmt, "_emit_scalar", return_value='"wrong"'
+            ):
+                with self.assertRaises(fmt.FmtError):
+                    fmt.format_file(path, write=True)
+            self.assertEqual(path.read_text(), src)
+
+    def test_invalid_toml_raises_fmt_error(self):
+        with self.assertRaises(fmt.FmtError):
+            fmt.format_toml("[project\nname =")
+
+    def test_empty_targets_table_preserved(self):
+        src = '[targets]\n'
+        out = fmt.format_toml(src)
+        self.assertEqual(tomllib.loads(out), tomllib.loads(src))
+
+    def test_kitchen_sink_round_trip(self):
+        # Broad property check: a document combining every nasty case
+        # (escapes, triple quotes, dotted/spaced keys, scalars at odd
+        # levels, empty tables) parses back identical.
+        src = dedent('''
+            toplevel = "scalar"
+
+            [project]
+            name = "p"
+            desc = "back\\\\slash \\"quoted\\" and \\u0001 control"
+
+            [dependencies]
+            flat = 1
+
+            [dependencies.git.lib]
+            url = "https://x/y.git"
+
+            [modules]
+            "a.b" = "m/one"
+
+            [targets.app]
+            kind = "script"
+            script = """
+            sed -e 's/\\\\(a\\\\)/\\\\1/'
+            echo "quo\\"""ted"
+            trailing backslash \\\\"""
+            env = { "K.1" = "v,1", PATH2 = "/x" }
+
+            [targets.app.variants.debug]
+            script = "true"
+        ''').lstrip()
+        parsed = tomllib.loads(src)
+        out = fmt.format_toml(src)
+        self.assertEqual(tomllib.loads(out), parsed)
+        self.assertEqual(fmt.format_toml(out), out)
+
     def test_canonical_section_order(self):
         # Sections come out in TOP_LEVEL_ORDER regardless of source order.
         src = dedent("""

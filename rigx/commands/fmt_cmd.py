@@ -15,7 +15,11 @@ def cmd_fmt(args: argparse.Namespace) -> int:
     if not toml_path.is_file():
         print(f"rigx: no rigx.toml at {toml_path}", file=sys.stderr)
         return 1
-    canonical = fmt.format_file(toml_path, write=args.write)
+    try:
+        canonical = fmt.format_file(toml_path, write=args.write)
+    except fmt.FmtError as e:
+        print(f"rigx: {toml_path}: {e}", file=sys.stderr)
+        return 1
     if not args.write:
         sys.stdout.write(canonical)
     return 0
