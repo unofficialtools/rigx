@@ -315,12 +315,14 @@ class PublishTupleForm(unittest.TestCase):
         parts = sorted(line.split("=", 1)[1].split(","))
         self.assertEqual(parts, sorted(["127.0.10.2:5040:5000", "5041:5001"]))
 
-    def test_udp_publish_renders_with_proto_suffix(self):
-        """`publish_udp` entries get the `/udp` suffix per docker -p
-        syntax. TCP and UDP can mix in one start() call."""
+    def test_udp_publish_rides_its_own_env_var(self):
+        """`publish_udp` entries land in RIGX_PUBLISH_UDP (the runner
+        appends the `/udp` suffix itself), NOT folded into RIGX_PUBLISH
+        — folding them there applied each UDP mapping twice, once from
+        each var. TCP and UDP can mix in one start() call."""
         runner_body = (
             '#!/bin/sh\n'
-            'env | grep "^RIGX_PUBLISH=" > "$DUMP"\n'
+            'env | grep "^RIGX_PUBLISH" | sort > "$DUMP"\n'
             'exit 0\n'
         )
         with fake_capsule("svc", runner_body=runner_body) as root:
@@ -333,11 +335,32 @@ class PublishTupleForm(unittest.TestCase):
                     output_dir=root / "output",
                 ):
                     pass
-            line = dump.read_text().strip()
-        parts = sorted(line.split("=", 1)[1].split(","))
+            lines = dump.read_text().splitlines()
         self.assertEqual(
-            parts, sorted(["5040:5000", "127.0.10.2:6040:6000/udp"])
+            lines,
+            [
+                "RIGX_PUBLISH=5040:5000",
+                "RIGX_PUBLISH_UDP=127.0.10.2:6040:6000",
+            ],
         )
+
+    def test_udp_only_publish_leaves_tcp_var_unset(self):
+        runner_body = (
+            '#!/bin/sh\n'
+            'env | grep "^RIGX_PUBLISH" | sort > "$DUMP" || true\n'
+            'exit 0\n'
+        )
+        with fake_capsule("svc", runner_body=runner_body) as root:
+            dump = root / "publish-dump"
+            with mock.patch.dict(os.environ, {"DUMP": str(dump)}):
+                with capsule.start(
+                    "svc",
+                    publish_udp={6000: 6040},
+                    output_dir=root / "output",
+                ):
+                    pass
+            lines = dump.read_text().splitlines()
+        self.assertEqual(lines, ["RIGX_PUBLISH_UDP=6040:6000"])
 
     def test_host_endpoint_proto_kwarg_picks_right_map(self):
         """`host_endpoint(port, proto="udp")` reads from `publish_udp`

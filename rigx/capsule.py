@@ -428,32 +428,35 @@ def start(
         runner_env["RIGX_DETACH"] = "1"
     if network:
         runner_env["RIGX_NETWORK"] = network
-    if publish or publish_udp:
-        # docker -p syntax: `host:cont` (binds 0.0.0.0) or
-        # `host_addr:host_port:cont` (binds the given address). UDP
-        # entries get the `/udp` suffix; TCP is the default and
-        # doesn't need one. List-valued mappings expand to one
-        # entry per host endpoint — letting a container port also
-        # be reachable on an externally-exposed address. The qemu
-        # runner translates this to `QEMU_NET_OPTS=hostfwd=...` at
-        # the start of its body so the underlying NixOS vm script
-        # sees an additional hostfwd rule per declared port.
-        def _fmt(spec: PublishSpec, cont: int, proto: str) -> str:
-            if isinstance(spec, tuple):
-                addr, host_port = spec
-                base = f"{addr}:{host_port}:{cont}"
-            else:
-                base = f"{spec}:{cont}"
-            return f"{base}/udp" if proto == "udp" else base
+    # docker -p syntax: `host:cont` (binds 0.0.0.0) or
+    # `host_addr:host_port:cont` (binds the given address). TCP and UDP
+    # mappings ride separate vars — RIGX_PUBLISH and RIGX_PUBLISH_UDP —
+    # and the runner appends the `/udp` suffix to the latter itself.
+    # (Folding `/udp`-suffixed entries into RIGX_PUBLISH would apply
+    # each UDP mapping twice: once from each var. On qemu the duplicate
+    # hostfwd rule fails to bind and the VM dies at boot.) List-valued
+    # mappings expand to one entry per host endpoint — letting a
+    # container port also be reachable on an externally-exposed
+    # address. The qemu runner translates both vars to
+    # `QEMU_NET_OPTS=hostfwd=...` rules at the start of its body.
+    def _fmt(spec: PublishSpec, cont: int) -> str:
+        if isinstance(spec, tuple):
+            addr, host_port = spec
+            return f"{addr}:{host_port}:{cont}"
+        return f"{spec}:{cont}"
 
-        parts: list[str] = []
-        for cont, mapping in (publish or {}).items():
-            for spec in _publish_specs(mapping):
-                parts.append(_fmt(spec, cont, "tcp"))
-        for cont, mapping in (publish_udp or {}).items():
-            for spec in _publish_specs(mapping):
-                parts.append(_fmt(spec, cont, "udp"))
-        runner_env["RIGX_PUBLISH"] = ",".join(parts)
+    tcp_parts: list[str] = []
+    for cont, mapping in (publish or {}).items():
+        for spec in _publish_specs(mapping):
+            tcp_parts.append(_fmt(spec, cont))
+    udp_parts: list[str] = []
+    for cont, mapping in (publish_udp or {}).items():
+        for spec in _publish_specs(mapping):
+            udp_parts.append(_fmt(spec, cont))
+    if tcp_parts:
+        runner_env["RIGX_PUBLISH"] = ",".join(tcp_parts)
+    if udp_parts:
+        runner_env["RIGX_PUBLISH_UDP"] = ",".join(udp_parts)
     if env:
         for k, v in env.items():
             if "\n" in k or "\n" in v:
@@ -507,24 +510,10 @@ def start(
         spec["network"] = network
     if backend != "qemu":
         spec["detach"] = True
-    if publish:
-        pub_entries: list[str] = []
-        for cont, mapping in publish.items():
-            for s in _publish_specs(mapping):
-                if isinstance(s, tuple):
-                    pub_entries.append(f"{s[0]}:{s[1]}:{cont}")
-                else:
-                    pub_entries.append(f"{s}:{cont}")
-        spec["publish"] = pub_entries
-    if publish_udp:
-        udp_entries: list[str] = []
-        for cont, mapping in publish_udp.items():
-            for s in _publish_specs(mapping):
-                if isinstance(s, tuple):
-                    udp_entries.append(f"{s[0]}:{s[1]}:{cont}")
-                else:
-                    udp_entries.append(f"{s}:{cont}")
-        spec["publish_udp"] = udp_entries
+    if tcp_parts:
+        spec["publish"] = tcp_parts
+    if udp_parts:
+        spec["publish_udp"] = udp_parts
     if env:
         spec["env"] = dict(env)
     if vols:

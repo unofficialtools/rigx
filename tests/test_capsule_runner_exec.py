@@ -194,6 +194,102 @@ class SpecEnvPrecedence(RunnerExecBase):
         self.assertNotIn("b", envs)
 
 
+class PublishAppliedOnce(RunnerExecBase):
+    """Each publish mapping must yield exactly one `-p` flag (docker)
+    or one hostfwd rule (qemu). The old host contract folded UDP
+    entries into RIGX_PUBLISH with a `/udp` suffix ON TOP OF the spec's
+    publish_udp — applying every UDP mapping twice; on qemu the
+    duplicate hostfwd rule fails to bind and the VM dies at boot."""
+
+    # What the fixed orchestrator sets: spec + equivalent legacy vars.
+    _SPEC = {
+        "name": "c1", "detach": True,
+        "publish": ["5040:5000"],
+        "publish_udp": ["6040:6000"],
+    }
+    _LEGACY = {
+        "RIGX_PUBLISH": "5040:5000",
+        "RIGX_PUBLISH_UDP": "6040:6000",
+        "RIGX_DETACH": "1",
+    }
+
+    def test_lite_runner_emits_one_p_flag_per_mapping(self):
+        script = capsule_common.capsule_runner_script(
+            _capsule_target(), mode="run"
+        )
+        args = self.run_runner(script, spec=self._SPEC,
+                               extra_env=dict(self._LEGACY))
+        pubs = self.flag_values(args, "-p")
+        self.assertEqual(sorted(pubs), ["5040:5000", "6040:6000/udp"])
+
+    def test_qemu_runner_emits_one_hostfwd_rule_per_mapping(self):
+        script = capsule_common.qemu_runner_script(
+            _capsule_target(backend="qemu")
+        )
+        opts = self.run_qemu_runner(script, spec=self._SPEC,
+                                    extra_env=dict(self._LEGACY))
+        rules = sorted(opts.split(",")) if opts else []
+        self.assertEqual(
+            rules,
+            ["hostfwd=tcp::5040-:5000", "hostfwd=udp::6040-:6000"],
+        )
+
+    def run_qemu_runner(
+        self,
+        script: str,
+        *,
+        spec: dict | None = None,
+        extra_env: dict[str, str] | None = None,
+    ) -> str:
+        """Like run_runner, but for the qemu flavor: stub out the
+        underlying NixOS vm script and return the QEMU_NET_OPTS the
+        runner exec'd it with."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        cap_dir = root / "cap"
+        (cap_dir / "bin").mkdir(parents=True)
+        vm_bin = cap_dir / "system" / "vm-script" / "bin"
+        vm_bin.mkdir(parents=True)
+        vm = vm_bin / "run-svc-vm"
+        vm.write_text(
+            '#!/usr/bin/env bash\n'
+            'printf \'%s\' "${QEMU_NET_OPTS:-}" > "$QEMU_DUMP"\n'
+            'exit 0\n'
+        )
+        vm.chmod(0o755)
+        runner = cap_dir / "bin" / "run-svc"
+        runner.write_text(script)
+        runner.chmod(0o755)
+
+        bin_dir = root / "fakebin"
+        bin_dir.mkdir()
+        (bin_dir / "fake_jq.py").write_text(_FAKE_JQ_PY)
+        jq = bin_dir / "jq"
+        jq.write_text(
+            f'#!/usr/bin/env bash\n'
+            f'exec "{sys.executable}" "{bin_dir}/fake_jq.py" "$@"\n'
+        )
+        jq.chmod(0o755)
+
+        dump = root / "qemu-opts"
+        env = {
+            k: v for k, v in os.environ.items() if not k.startswith("RIGX_")
+        }
+        env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
+        env["QEMU_DUMP"] = str(dump)
+        if spec is not None:
+            spec_path = root / "spec.json"
+            spec_path.write_text(json.dumps(spec))
+            env["RIGX_RUNTIME_SPEC"] = str(spec_path)
+        env.update(extra_env or {})
+        r = subprocess.run(
+            [str(runner)], env=env, capture_output=True, text=True,
+        )
+        self.assertEqual(r.returncode, 0, msg=r.stderr)
+        return dump.read_text()
+
+
 class SpecLoaderText(unittest.TestCase):
     """Text-level pin: the loader assigns spec fields directly (spec
     overrides legacy) — the old `${VAR:-$_v}` form gave legacy vars
