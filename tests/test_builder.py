@@ -774,6 +774,26 @@ class SandboxedTests(unittest.TestCase):
         self.assertTrue(any(c.endswith("#verify") for c in cmd))
         self.assertIn("--no-link", cmd)
 
+    def test_sandboxed_dotted_name_sanitized_for_flake_attr(self):
+        # Module-merged test keys are dotted (`frontend.smoke`), but nix
+        # parses `#frontend.smoke` as an attrPATH — the flake declares the
+        # sanitized attr `frontend_smoke`, like every other build path.
+        proj = self._proj(**{
+            "frontend.smoke": Target(
+                name="smoke", namespace="frontend", kind="test",
+                script="exit 0",
+            ),
+        })
+        with mock.patch("rigx.builder.write_flake"), \
+             mock.patch("rigx.builder._nix_bin", return_value="/usr/bin/nix"), \
+             mock.patch("rigx.builder.subprocess.run") as run:
+            run.return_value = mock.Mock(returncode=0)
+            results = builder.run_tests(proj)
+        self.assertEqual(results, [("frontend.smoke", 0)])
+        cmd = run.call_args.args[0]
+        self.assertTrue(any(c.endswith("#frontend_smoke") for c in cmd))
+        self.assertFalse(any(c.endswith("#frontend.smoke") for c in cmd))
+
     def test_sandbox_false_dispatches_via_nix_shell(self):
         # When sandbox=false, the host-side path is used — `run_script_target`
         # is invoked, NOT `nix build`.

@@ -521,8 +521,11 @@ def _run_sandboxed_tests(
     nix = _nix_bin()
 
     def run_one(name: str) -> tuple[int, str]:
+        # `name` may be a module-merged dotted key (`frontend.smoke`);
+        # sanitize it like every other build path so nix gets the attr
+        # the flake actually declares instead of parsing an attrpath.
         cmd = [
-            nix, *NIX_EXPERIMENTAL, "build", _flake_ref(project, name),
+            nix, *NIX_EXPERIMENTAL, "build", _flake_ref(project, _nix_id(name)),
             "--no-link",
         ]
         # Capture only when running in parallel — sequential mode streams
