@@ -1523,28 +1523,28 @@ def _load(root: Path, _visited: set[Path]) -> Project:
         if target.kind == "custom":
             if not target.install_script:
                 raise ConfigError(
-                    f"target {tname}: kind='custom' requires 'install_script'"
+                    f"target {qname}: kind='custom' requires 'install_script'"
                 )
         if target.kind == "script":
             if not target.script:
                 raise ConfigError(
-                    f"target {tname}: kind='script' requires 'script'"
+                    f"target {qname}: kind='script' requires 'script'"
                 )
         if target.kind == "test":
             if not target.script:
                 raise ConfigError(
-                    f"target {tname}: kind='test' requires 'script'"
+                    f"target {qname}: kind='test' requires 'script'"
                 )
         if target.kind == "testbed":
             if not target.script:
                 raise ConfigError(
-                    f"target {tname}: kind='testbed' requires 'script' "
+                    f"target {qname}: kind='testbed' requires 'script' "
                     f"(an interactive host-side scenario; runs via "
-                    f"`rigx run {tname}`)"
+                    f"`rigx run {qname}`)"
                 )
         if target.kind == "run":
             if not target.run:
-                raise ConfigError(f"target {tname}: kind='run' requires 'run = <name>'")
+                raise ConfigError(f"target {qname}: kind='run' requires 'run = <name>'")
             # If `run` matches an internal target, require it to be runnable.
             # Otherwise, treat `run` as a bare command name resolved via PATH
             # (supplied by deps.nixpkgs / deps.git).
@@ -1552,12 +1552,12 @@ def _load(root: Path, _visited: set[Path]) -> Project:
                 runnable_kinds = {"executable"}
                 if targets[target.run].kind not in runnable_kinds:
                     raise ConfigError(
-                        f"target {tname}: run target '{target.run}' must be one of "
+                        f"target {qname}: run target '{target.run}' must be one of "
                         f"{sorted(runnable_kinds)}, got {targets[target.run].kind!r}"
                     )
             if not target.outputs:
                 raise ConfigError(
-                    f"target {tname}: kind='run' requires 'outputs' (files to capture)"
+                    f"target {qname}: kind='run' requires 'outputs' (files to capture)"
                 )
         if target.kind == "capsule":
             if not target.backend:

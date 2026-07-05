@@ -450,6 +450,24 @@ class ValidationErrors(unittest.TestCase):
             with self.assertRaisesRegex(ConfigError, "requires 'script'"):
                 config.load(root)
 
+    def test_kind_validation_error_names_the_broken_target(self):
+        # The broken target is parsed *before* another target; the error
+        # must name the broken one, not whichever target parsed last.
+        body = """
+            [project]
+            name = "p"
+            [targets.broken]
+            kind = "script"
+            [targets.zlast]
+            kind = "executable"
+            sources = ["a.cpp"]
+        """
+        with TempProject(body) as root:
+            with self.assertRaisesRegex(
+                ConfigError, r"target broken: kind='script' requires 'script'"
+            ):
+                config.load(root)
+
     def test_custom_missing_install_script(self):
         body = """
             [project]
