@@ -294,6 +294,24 @@ class LsSourceCLI(unittest.TestCase):
         self.assertIn("'ghost' not found", err)
 
 
+class CmdNew(unittest.TestCase):
+    def _run(self, root: Path, *argv: str) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            rc = cli.main(["-C", str(root), "new", *argv])
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_broken_toml_reports_clean_error(self):
+        # A syntax error in rigx.toml must produce a clean error, not a
+        # raw tomllib traceback.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "rigx.toml").write_text("[project\nname = broken")
+            rc, _out, err = self._run(root, "script", "task")
+        self.assertEqual(rc, 1)
+        self.assertIn("invalid TOML", err)
+
+
 class FormatBytes(unittest.TestCase):
     def test_b(self):
         self.assertEqual(cli._format_bytes(0), "0 B")

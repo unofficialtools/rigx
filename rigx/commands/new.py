@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import argparse
 import sys
-import tomllib
 from pathlib import Path
 
-from rigx import scaffold
+from rigx import config, scaffold
 
 
 def cmd_new(args: argparse.Namespace) -> int:
@@ -20,8 +19,11 @@ def cmd_new(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
-    with toml_path.open("rb") as f:
-        data = tomllib.load(f)
+    try:
+        data = config._read_toml(toml_path)
+    except config.ConfigError as e:
+        print(f"rigx: {e}", file=sys.stderr)
+        return 1
     if args.name in data.get("targets", {}):
         print(
             f"rigx: target {args.name!r} already exists in {toml_path}",
