@@ -1152,6 +1152,63 @@ class Modules(unittest.TestCase):
         with self.assertRaisesRegex(ConfigError, "must be one of"):
             config.load(root)
 
+    def test_find_target_resolves_module_merged_names(self):
+        root = self._setup({
+            "rigx.toml": """
+                [project]
+                name = "p"
+
+                [modules]
+                include = ["frontend"]
+            """,
+            "frontend/rigx.toml": """
+                [targets.app]
+                kind = "executable"
+                sources = ["m.cpp"]
+            """,
+            "frontend/m.cpp": "",
+        })
+        proj = config.load(root)
+        self.assertEqual(
+            proj.find_target("frontend.app"), (proj, "frontend.app")
+        )
+        self.assertIsNone(proj.find_target("frontend.missing"))
+
+    def test_deps_internal_into_local_dep_module_target(self):
+        # `sub.mod.t` — a target merged from a [modules] include *inside*
+        # a local-dep — must resolve, both via find_target and in phase-4
+        # deps.internal validation.
+        root = self._setup({
+            "rigx.toml": """
+                [project]
+                name = "parent"
+
+                [dependencies.local.sub]
+                path = "./sub"
+
+                [targets.bundle]
+                kind = "custom"
+                install_script = "true"
+                deps.internal = ["sub.mod.t"]
+            """,
+            "sub/rigx.toml": """
+                [project]
+                name = "sub"
+
+                [modules]
+                include = ["mod"]
+            """,
+            "sub/mod/rigx.toml": """
+                [targets.t]
+                kind = "executable"
+                sources = ["t.cpp"]
+            """,
+            "sub/mod/t.cpp": "",
+        })
+        proj = config.load(root)
+        sub = proj.local_deps["sub"].sub_project
+        self.assertEqual(proj.find_target("sub.mod.t"), (sub, "mod.t"))
+
     def test_module_rejects_project_section(self):
         root = self._setup({
             "rigx.toml": """

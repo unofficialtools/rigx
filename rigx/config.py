@@ -460,16 +460,17 @@ class Project:
         (owning_project, target_name_in_that_project). Returns None if the
         name doesn't resolve. Used to render cross-flake `deps.internal`
         refs and to expand `${frontend.app}` interpolations."""
+        # Module-merged targets live in self.targets under their dotted
+        # qualified name — check before treating the head as a local-dep.
+        if qualified in self.targets:
+            return (self, qualified)
         if "." in qualified:
             head, tail = qualified.split(".", 1)
             if head in self.local_deps and self.local_deps[head].sub_project:
-                sub = self.local_deps[head].sub_project
-                # Recurse so 'a.b.c' walks through nested local-deps.
-                return sub.find_target(tail) if "." in tail else (
-                    (sub, tail) if tail in sub.targets else None
-                )
-            return None
-        return (self, qualified) if qualified in self.targets else None
+                # Recurse so 'a.b.c' walks nested local-deps and the
+                # sub-project's own module-merged (dotted) names alike.
+                return self.local_deps[head].sub_project.find_target(tail)
+        return None
 
 
 class ConfigError(ValueError):
