@@ -83,6 +83,27 @@ class Fmt(unittest.TestCase):
         self.assertNotIn("[version]", out)
         self.assertEqual(fmt.format_toml(out), out)
 
+    def test_dependencies_scalars_preserved(self):
+        # Non-table values directly under [dependencies] were silently
+        # dropped, and a scalar under a sub-table emitted a bare header
+        # with no body (value deleted, type changed).
+        src = dedent("""
+            [dependencies]
+            flat = "x"
+
+            [dependencies.git]
+            note = "y"
+
+            [dependencies.git.mylib]
+            url = "https://example.com/repo.git"
+            rev = "abc123"
+
+            [dependencies.local]
+        """).lstrip()
+        out = fmt.format_toml(src)
+        self.assertEqual(tomllib.loads(out), tomllib.loads(src))
+        self.assertEqual(fmt.format_toml(out), out)
+
     def test_canonical_section_order(self):
         # Sections come out in TOP_LEVEL_ORDER regardless of source order.
         src = dedent("""

@@ -194,14 +194,36 @@ def _emit_section(key: str, value: object) -> str:
         return "\n\n".join(_emit_target(n, t) for n, t in value.items())
     if key == "dependencies" and isinstance(value, dict):
         # [dependencies.git.X] / [dependencies.local.X] sub-sections.
+        # Non-table values (directly under [dependencies] or under a
+        # sub-table) must be preserved as key = value, not dropped.
         chunks: list[str] = []
-        for sub_key in sorted(value.keys()):
+        scalar_items = [
+            (k, v) for k, v in value.items() if not isinstance(v, dict)
+        ]
+        sub_keys = sorted(
+            k for k, v in value.items() if isinstance(v, dict)
+        )
+        if scalar_items or not sub_keys:
+            chunks.append("[dependencies]")
+            if scalar_items:
+                chunks.append(_emit_kv_block(scalar_items))
+            chunks.append("")
+        for sub_key in sub_keys:
             sub = value[sub_key]
-            if not isinstance(sub, dict):
-                continue
-            for name, conf in sub.items():
+            scalar_confs = [
+                (n, c) for n, c in sub.items() if not isinstance(c, dict)
+            ]
+            table_confs = [
+                (n, c) for n, c in sub.items() if isinstance(c, dict)
+            ]
+            if scalar_confs or not table_confs:
+                chunks.append(f"[dependencies.{sub_key}]")
+                if scalar_confs:
+                    chunks.append(_emit_kv_block(scalar_confs))
+                chunks.append("")
+            for name, conf in table_confs:
                 chunks.append(f"[dependencies.{sub_key}.{name}]")
-                if isinstance(conf, dict) and conf:
+                if conf:
                     chunks.append(_emit_kv_block(list(conf.items())))
                 chunks.append("")
         return "\n".join(chunks).rstrip()
