@@ -65,5 +65,53 @@ class ScanAll(unittest.TestCase):
         self.assertEqual(latest, (self.root / "src/a.cpp").stat().st_mtime)
 
 
+class RefreshProject(unittest.TestCase):
+    """After a rigx.toml edit, rebuilds must use the reloaded config —
+    not the stale in-memory project loaded at watch startup."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.toml = self.root / "rigx.toml"
+        self.toml.write_text('[project]\nname = "p"\n')
+
+    def _load(self):
+        from rigx import config
+        return config.load(self.root)
+
+    def test_unchanged_mtime_keeps_same_project(self):
+        proj = self._load()
+        mtime = self.toml.stat().st_mtime
+        proj2, tm = watch._refresh_project(proj, mtime)
+        self.assertIs(proj2, proj)
+        self.assertEqual(tm, mtime)
+
+    def test_edited_toml_reloads_project(self):
+        proj = self._load()
+        self.toml.write_text(
+            '[project]\nname = "p"\n\n'
+            '[targets.task]\nkind = "script"\nscript = "true"\n'
+        )
+        os.utime(self.toml, (2_000_000_000.0, 2_000_000_000.0))
+        proj2, tm = watch._refresh_project(proj, 1.0)
+        self.assertIsNot(proj2, proj)
+        self.assertIn("task", proj2.targets)
+        self.assertEqual(tm, self.toml.stat().st_mtime)
+
+    def test_broken_edit_warns_and_keeps_previous_project(self):
+        import io
+        from contextlib import redirect_stdout
+        proj = self._load()
+        self.toml.write_text("[project\nbroken")
+        out = io.StringIO()
+        with redirect_stdout(out):
+            proj2, tm = watch._refresh_project(proj, 1.0)
+        self.assertIs(proj2, proj)
+        # mtime advances so the same broken file isn't re-parsed every poll.
+        self.assertEqual(tm, self.toml.stat().st_mtime)
+        self.assertIn("config reload failed", out.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -114,6 +114,27 @@ def _declared_input_files(project, targets: list[str] | None) -> set[Path]:
     return files
 
 
+def _refresh_project(project, last_toml_mtime: float):
+    """Reload the project when rigx.toml's mtime changed, so subsequent
+    rebuilds use the edited config instead of the stale in-memory one.
+    Returns (project, mtime). A broken edit keeps the previous project
+    (watching continues) and prints a warning instead of dying or
+    silently ignoring the edit."""
+    toml_p = project.root / "rigx.toml"
+    try:
+        tm = toml_p.stat().st_mtime
+    except OSError:
+        return project, last_toml_mtime
+    if tm == last_toml_mtime:
+        return project, last_toml_mtime
+    from rigx import config
+    try:
+        return config.load(project.root), tm
+    except Exception as e:
+        print(f"[rigx] config reload failed: {e} (still using previous config)")
+        return project, tm
+
+
 def _scan_all(root: Path) -> float:
     """Latest mtime under `root` for the --watch-all mode, skipping
     VCS/output dirs. flake.nix and flake.lock are rigx-managed — every
@@ -155,32 +176,30 @@ def cmd_watch(args: argparse.Namespace) -> int:
     mode = "all files" if watch_all else "declared inputs"
     print(f"[rigx] watching {project.root} [{mode}] (Ctrl-C to stop)")
 
+    toml_path = project.root / "rigx.toml"
+    last_toml_mtime = toml_path.stat().st_mtime if toml_path.is_file() else 0.0
+
     if watch_all:
         def scan() -> float:
+            # Reload after a rigx.toml edit so rebuilds use the new config.
+            nonlocal project, last_toml_mtime
+            project, last_toml_mtime = _refresh_project(project, last_toml_mtime)
             return _scan_all(project.root)
     else:
         # Resolve the file set up-front. If TOML changes, we'll
         # re-resolve at next iteration so newly-declared inputs start
         # being watched without a `rigx watch` restart.
         tracked = _declared_input_files(project, targets)
-        last_toml_mtime = (project.root / "rigx.toml").stat().st_mtime \
-            if (project.root / "rigx.toml").is_file() else 0.0
 
         def scan() -> float:
-            nonlocal tracked, last_toml_mtime
             # If rigx.toml changed, reload the project + tracked set so
-            # newly added sources etc. start being watched.
-            toml_p = project.root / "rigx.toml"
-            if toml_p.is_file():
-                tm = toml_p.stat().st_mtime
-                if tm != last_toml_mtime:
-                    last_toml_mtime = tm
-                    try:
-                        from rigx import config
-                        proj2 = config.load(project.root)
-                        tracked = _declared_input_files(proj2, targets)
-                    except Exception:
-                        pass
+            # newly added sources etc. start being watched AND rebuilds
+            # use the new config (not the stale in-memory project).
+            nonlocal project, tracked, last_toml_mtime
+            new_proj, last_toml_mtime = _refresh_project(project, last_toml_mtime)
+            if new_proj is not project:
+                project = new_proj
+                tracked = _declared_input_files(project, targets)
             latest = 0.0
             for path in list(tracked):
                 try:
