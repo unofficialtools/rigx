@@ -708,6 +708,11 @@ class Network:
         if self._running:
             return
         self._running = True
+        # `_stop()` latches `_stopping` — clear it so a re-entered
+        # Network actually serves traffic instead of every proxy loop
+        # exiting immediately (listeners would bind but TCP clients
+        # hang in the accept backlog forever).
+        self._stopping = False
         # Allocate per-volume tempdirs before starting proxies so a
         # later `bindings()` call has something to point capsules at.
         # Failure here aborts entry — partially-allocated dirs are
@@ -723,11 +728,20 @@ class Network:
                     f"testbed: cannot allocate shared volume "
                     f"{sv.name!r}: {e}"
                 ) from e
-        for link in self._links.values():
-            if link.proto == "udp":
-                self._start_udp_link(link)
-            else:
-                self._start_tcp_link(link)
+        # If the Nth link fails to bind, tear down the N-1 listeners
+        # (and accept threads, and volume tempdirs) already started —
+        # otherwise the failed entry leaks fds/threads and `_running`
+        # stays True, so a retry silently no-ops and `__exit__` never
+        # runs (the exception aborts the `with` before entry).
+        try:
+            for link in self._links.values():
+                if link.proto == "udp":
+                    self._start_udp_link(link)
+                else:
+                    self._start_tcp_link(link)
+        except BaseException:
+            self._stop()
+            raise
 
     def _start_tcp_link(self, link: _Link) -> None:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

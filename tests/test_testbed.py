@@ -255,6 +255,61 @@ class TopologyValidation(unittest.TestCase):
                 net.declare("b", listens_on=[2])
 
 
+class LifecycleRobustness(unittest.TestCase):
+    def test_failed_enter_cleans_up_partial_state(self):
+        """If the Nth link fails to bind, the listeners already started
+        (and volume tempdirs) are torn down and `_running` resets, so
+        the failure doesn't leak and the Network can be retried."""
+        net = testbed.Network()
+        vol = net.shared_volume("data")
+        net.declare("sim", listens_on=[])
+        net.declare("fc", listens_on=[5001])
+        net.declare("gs", listens_on=[5002])
+        net.link("sim", "fc", to_port=5001)
+        net.link("sim", "gs", to_port=5002)
+        # Pre-bind the *second* link's port so the first listener has
+        # already started when the second bind fails.
+        squat = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        squat.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        squat.bind(("127.0.0.1", 0))
+        squat.listen(1)
+        second_link = list(net._links.values())[-1]
+        try:
+            second_link.listen_port = squat.getsockname()[1]
+            with self.assertRaises(RuntimeError):
+                net.__enter__()
+        finally:
+            squat.close()
+        self.assertFalse(net._running)
+        self.assertEqual(net._listeners, [])
+        self.assertEqual(net._threads, [])
+        self.assertIsNone(vol.host_path)
+        # Retry after freeing the port: entry now succeeds cleanly.
+        second_link.listen_port = testbed._free_port()
+        with net:
+            self.assertTrue(net._running)
+            self.assertEqual(len(net._listeners), 2)
+
+    def test_network_can_be_reentered_after_exit(self):
+        """Exiting and re-entering the same Network must serve traffic
+        again — `_stop()` latches `_stopping`, which `_start()` has to
+        clear or the second run's proxy loops exit instantly."""
+        net = testbed.Network()
+        listen_port, dst_port = _two_capsules(net)
+        with echo_server(dst_port):
+            with net:
+                self.assertEqual(
+                    _send_recv("127.0.0.1", listen_port, b"one\n"),
+                    b"one\n",
+                )
+            with net:
+                self.assertEqual(
+                    _send_recv("127.0.0.1", listen_port, b"two\n",
+                               timeout=0.5),
+                    b"two\n",
+                )
+
+
 class DistinctAddresses(unittest.TestCase):
     """`Network(subnet=...)` allocates a per-capsule loopback alias
     from `127.0.0.0/8`. The proxy upstream socket binds on the
