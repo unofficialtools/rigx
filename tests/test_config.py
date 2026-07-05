@@ -1209,6 +1209,27 @@ class Modules(unittest.TestCase):
         sub = proj.local_deps["sub"].sub_project
         self.assertEqual(proj.find_target("sub.mod.t"), (sub, "mod.t"))
 
+    def test_mutually_including_modules_raise_clean_cycle_error(self):
+        root = self._setup({
+            "rigx.toml": """
+                [project]
+                name = "p"
+
+                [modules]
+                include = ["a"]
+            """,
+            "a/rigx.toml": """
+                [modules]
+                include = ["../b"]
+            """,
+            "b/rigx.toml": """
+                [modules]
+                include = ["../a"]
+            """,
+        })
+        with self.assertRaisesRegex(ConfigError, "include cycle"):
+            config.load(root)
+
     def test_module_rejects_project_section(self):
         root = self._setup({
             "rigx.toml": """

@@ -974,11 +974,15 @@ def _build_target(
 
 
 def _enumerate_modules(
-    data: dict, base_root: Path, ns_prefix: str = ""
+    data: dict, base_root: Path, ns_prefix: str = "",
+    _visited: frozenset[Path] = frozenset(),
 ):
     """Yield (namespace, module_root, raw_data) for each `[modules].include`
     entry, recursing into nested module trees. Validates that modules don't
-    declare `[project]` or `[nixpkgs]` — those are reserved for the parent."""
+    declare `[project]` or `[nixpkgs]` — those are reserved for the parent.
+    `_visited` holds the resolved roots on the current include chain so
+    mutually-including modules fail with a clear cycle error instead of a
+    RecursionError."""
     section = data.get("modules", {})
     if not isinstance(section, dict):
         raise ConfigError("[modules] must be a table")
@@ -993,6 +997,9 @@ def _enumerate_modules(
         mod_root = (base_root / entry).resolve()
         mod_basename = Path(entry).name
         ns = f"{ns_prefix}.{mod_basename}" if ns_prefix else mod_basename
+        if mod_root in _visited:
+            chain = " -> ".join(str(p) for p in [*_visited, mod_root])
+            raise ConfigError(f"module {ns}: include cycle: {chain}")
         if not (mod_root / "rigx.toml").is_file():
             raise ConfigError(f"module {ns}: no rigx.toml at {mod_root}")
         with (mod_root / "rigx.toml").open("rb") as f:
@@ -1006,7 +1013,9 @@ def _enumerate_modules(
                 f"module {ns}: must not contain [nixpkgs] (parent's nixpkgs ref is shared)"
             )
         yield (ns, mod_root, mod_data)
-        yield from _enumerate_modules(mod_data, mod_root, ns)
+        yield from _enumerate_modules(
+            mod_data, mod_root, ns, _visited | {mod_root}
+        )
 
 
 def load(root: Path) -> Project:
