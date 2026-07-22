@@ -1433,6 +1433,12 @@ Like `kind = "script"`, testbeds aren't buildable — naming one in
 and ends with `read -r _` or `input(...)` so the user can hold the
 scenario open while they poke at it.
 
+A testbed target can *also* (or instead) declare a `services` table —
+a deployable description of the same kind of multi-capsule system,
+turned into a real supervised deployment on a remote server via `rigx
+remote <target> deploy ssh://user@host`. See [SSH/single-host deployment](#sshsingle-host-deployment--rigx-remote-deploy-prototype)
+under Advanced features.
+
 ### `capsule` — runnable container artifact (experimental)
 
 ```toml
@@ -1448,7 +1454,7 @@ ports         = [5000]
 A capsule packages a rigx-built artifact as a container that mounts
 the host's `/nix/store` at runtime — `FROM scratch` image, kilobytes
 in size, no NixOS, no systemd. After `rigx build greeter`, run with
-`./output/greeter/bin/run-greeter` (needs `docker` or `podman`).
+`./output/greeter/bin/run-greeter` (needs `podman` or `docker`).
 
 The full schema, the `rigx.capsule` Python orchestrator, and the
 `rigx.testbed` network simulator are documented under
@@ -1699,7 +1705,7 @@ The hint is suppressed outside a git work-tree (no actionable advice).
 
 > Status: experimental. Linux-only. Capsule runners need `/nix/store`
 > and the Nix daemon socket mountable (the standard nix multi-user
-> setup), and `docker` or `podman` on PATH.
+> setup), and `podman` or `docker` on PATH.
 
 ### Capsule schema
 
@@ -1746,8 +1752,9 @@ The runner inherits a few env knobs that orchestrators set:
 | env var             | purpose                                          |
 |---------------------|--------------------------------------------------|
 | `RIGX_NAME`         | stable container name (default: random uuid)     |
-| `RIGX_DETACH`       | `1` = `docker run -d` (default: foreground)      |
-| `RIGX_NETWORK`      | join an existing docker network                  |
+| `RIGX_DETACH`       | `1` = `run -d`, returning once the container is spawned (default: interactive) |
+| `RIGX_FOREGROUND`   | `1` = attached with no TTY — neither `-d` nor `-it`. For running under a process supervisor: the engine stays in the foreground so the supervisor sees the container exit, but no TTY is requested because there isn't one. Ignored if `RIGX_DETACH` is also set. This is what `rigx remote deploy` sets in its systemd units. |
+| `RIGX_NETWORK`      | join an existing container network               |
 | `RIGX_PUBLISH`      | `host:cont,host:cont,…` port forwards            |
 | `RIGX_ENV`          | `K=V,K=V,…` extra env vars                       |
 | `RIGX_VOLUMES`      | `host:cont[:mode],…` extra bind-mounts (`mode`: `rw` / `ro`, default `rw`). Relative `host` paths resolve against `RIGX_PROJECT_ROOT`. Appended to any `volumes` declared in `rigx.toml`. |
@@ -2258,9 +2265,10 @@ Then `rigx test flight_loop` runs the suite.
   lite/nixos) the Nix daemon socket being mountable — the standard
   nix-multi-user setup on Linux. qemu additionally needs KVM for
   acceptable performance.
-- `docker` or `podman` must be on PATH for `lite`/`nixos` capsules at
-  runtime. `qemu` capsules need qemu in the closure (rigx pulls it in
-  automatically) but no docker.
+- `podman` or `docker` must be on PATH for `lite`/`nixos` capsules at
+  runtime (podman is preferred when both are installed). `qemu`
+  capsules need qemu in the closure (rigx pulls it in automatically)
+  but no container engine.
 - L2 simulation deferred. The testbed operates at L4 (TCP byte
   streams / UDP datagrams) — no Ethernet frames, no ARP, no MTU
   effects, no link-layer drops. Bus protocols (CAN, MIL-STD-1553, …)
@@ -2277,6 +2285,168 @@ Then `rigx test flight_loop` runs the suite.
 - See [TODO.md](TODO.md) for further deferred items — s6
   multi-service capsules, time control, qcow2-baked qemu disks for
   cross-host portability.
+
+### SSH/single-host deployment — `rigx remote deploy` (prototype)
+
+> Status: prototype, not yet in a release. Builds on `kind = "capsule"`
+> (above) and adds a declarative `services` section to `kind =
+> "testbed"`, alongside the interactive `rigx.testbed.Network` mode
+> documented above — a testbed target can have either, or both. Known
+> gaps: the deployment plan is assembled directly by rigx and
+> content-addressed into the Nix store (`nix store add`), not yet
+> produced by rigx's own `flake.nix`/build pipeline the way capsules
+> are; there's no sudoers scoping yet, so the SSH user needs
+> unrestricted sudo on the target, not a narrowly-scoped grant; and
+> services run rootful. Rootless-as-`rigx` is the intended endpoint,
+> but it needs subuid/subgid ranges, lingering, userns-aware ownership
+> for the persistent volumes, and rules out host ports below 1024 — it
+> belongs with the sudoers design, not ahead of it.
+
+`rigx remote <target> deploy ssh://user@host` takes a testbed from
+`rigx.toml` to a running, supervised deployment on any Linux server
+reachable over SSH — no container engine, Kubernetes, Nix, or rigx
+needs to be preinstalled there, and no container registry is involved.
+
+Services run under Podman, which bootstrap installs if the target has
+no container engine at all. Podman rather than Docker because it is
+daemonless: a deployed testbed is a set of independently supervised
+systemd units, and Docker would put every one of them behind a single
+daemon whose restart takes them all down at once. A target that
+already has Docker is used as-is — podman is what gets *installed*,
+not what is *required*.
+
+A deployable testbed adds a `services` table to `kind = "testbed"`:
+each service names a `kind = "capsule"` target, its start-order
+dependencies, restart policy, port/volume/secret wiring, and an
+optional health check:
+
+```toml
+[targets.web_capsule]
+kind          = "capsule"
+backend       = "lite"
+deps.internal = ["web_bin"]
+entrypoint    = "${web_bin}/bin/web_bin --port 8080"
+ports         = [8080]
+
+[targets.db_capsule]
+kind          = "capsule"
+backend       = "lite"
+deps.internal = ["postgres_bin"]
+entrypoint    = "${postgres_bin}/bin/postgres"
+
+[targets.myapp]
+kind = "testbed"
+
+# Persistent volumes: survive redeploys, rollback, and Nix GC — fixed
+# host path, /var/lib/rigx/<testbed>/volumes/<name>, created once.
+[targets.myapp.volumes.data]
+
+# Secrets: read locally, piped straight over the ssh connection into
+# `systemd-creds encrypt` on the target — never written to disk in
+# plaintext, never touches the Nix store.
+[targets.myapp.secrets.api_key]
+source = "env:MYAPP_API_KEY"   # or "file:./secrets/api_key.txt"
+
+[targets.myapp.services.db]
+capsule = "db_capsule"
+restart = "always"             # "always" | "on-failure" | "no"
+
+[targets.myapp.services.db.volumes]
+data = "/var/lib/postgresql/data"
+
+[targets.myapp.services.web]
+capsule    = "web_capsule"
+depends_on = ["db"]            # start order, health gate, restart propagation
+restart    = "always"
+ports      = [{ host = 8080, container = 8080 }]
+
+[targets.myapp.services.web.secrets]
+api_key = "/run/secrets/api_key"   # path exposed inside the capsule
+
+[targets.myapp.services.web.healthcheck]
+command  = "curl -f http://127.0.0.1:8080/healthz"
+interval = 2
+retries  = 10
+```
+
+Deploy it to a bare server that only has SSH + sudo:
+
+```sh
+rigx remote myapp deploy ssh://deploy@203.0.113.10
+```
+
+One command:
+
+1. **Bootstraps the host** — detects OS/arch, requires systemd,
+   installs a pinned Nix (multi-user) if missing, installs Podman from
+   the distro's own package repository if no container engine is
+   present, creates a dedicated `rigx` service user. Safe to re-run —
+   every step is idempotent.
+2. **Builds `web_capsule` and `db_capsule`** for real, through the
+   normal rigx build pipeline — same as `rigx build`.
+3. **Compiles a deployment plan** (dependency order, one systemd unit
+   per service, `bin/activate`/`bin/rollback`) and `nix copy`s it —
+   plus every capsule's full closure — to the target in one shot.
+   Re-running later only transfers what changed; substituter
+   negotiation skips capsules the target already has.
+4. **Pushes `api_key`** over the same ssh connection.
+5. **Activates**: starts `db`, then `web` (per `depends_on`),
+   health-gating each changed service against its `healthcheck` before
+   moving on. The deployment only counts as "live" once every changed
+   service has passed its gate; a failure rolls back whatever this run
+   touched automatically.
+
+#### What supervision you actually get
+
+Once deployed, each service is an ordinary systemd unit, with three
+behaviors worth knowing precisely:
+
+**`restart` means what it says.** `restart = "always"` renders as
+`Restart=always` *plus* `StartLimitIntervalSec=0`, with `RestartSec=5`
+as backoff. Without that override, systemd's default start limit (5
+starts in 10s) would park a crash-looping service in `failed` and stop
+retrying — so `"always"` would quietly have meant "always, for about
+ten seconds". The tradeoff is that a permanently broken service
+retries forever instead of parking; a broken *deployment* is already
+caught at deploy time by the health gate, so a failure appearing later
+is treated as a runtime fault worth continuing to recover from.
+
+**`healthcheck` is a runtime probe, not just a deploy gate.** Each
+healthchecked service gets a `rigx-<testbed>-<service>-health.timer`
+that re-runs the check on its `interval` for as long as the service is
+up, and restarts the service after `retries` consecutive failures.
+This matters because `Restart=` only reacts to the process *exiting* —
+a service that hangs while still running would otherwise stay `active`
+forever with nothing to notice. The timer is `BindsTo=` its service,
+so it never probes something you deliberately stopped.
+
+**`depends_on` propagates restarts, not just start order.** It renders
+as `Requires=` + `After=` *and* `PartOf=`, so restarting `db` also
+restarts `web`. `Requires=` alone propagates stops but not restarts,
+which would leave `web` running against a connection that went away.
+
+To see it, on the target:
+
+```sh
+systemctl status rigx-myapp-web.service
+systemctl list-timers 'rigx-myapp-*'          # the health probes
+journalctl -u rigx-myapp-web-health.service   # why a restart fired
+```
+
+Managing an already-deployed testbed doesn't rebuild or retransmit
+anything — it just drives the systemd units already on the target:
+
+```sh
+rigx remote myapp stop     ssh://deploy@203.0.113.10   # reverse dependency order
+rigx remote myapp start    ssh://deploy@203.0.113.10   # dependency order
+rigx remote myapp restart  ssh://deploy@203.0.113.10   # dependency order
+rigx remote myapp rollback ssh://deploy@203.0.113.10   # back to the previous generation
+```
+
+`<target>` (right after `remote`) always names which deployable
+(`services`-bearing) testbed to act on — there's no default, even
+when a project only defines one. `ssh_url` accepts an optional port:
+`ssh://user@host:2222`.
 
 ---
 
@@ -2425,7 +2595,7 @@ nim_flags = ["-d:release"]
 # image that mounts the host's /nix/store at runtime so the binary is
 # reachable. `${hello_go}` interpolates to the rigx-built target's store
 # path. After `rigx build greeter`, drop into the image with
-# `./output/greeter/bin/shell-greeter` (needs docker/podman on PATH).
+# `./output/greeter/bin/shell-greeter` (needs podman/docker on PATH).
 #
 # Heavier first build than the rest of this project — nix builds the
 # scratch image and the daemon pulls dockerTools dependencies. Skip

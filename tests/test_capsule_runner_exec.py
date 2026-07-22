@@ -3,7 +3,7 @@
 `rigx/nix/capsule_common.py` renders the bash runner at build time;
 `rigx.capsule.start()` drives it at run time — possibly a runner built
 by a different rigx version. These tests execute the real rendered
-runner under bash with a fake `docker` (records the argv it would have
+runner under bash with fake engines (recording the argv they would have
 run) and a fake `jq` (implements exactly the filters the runtime-spec
 loader uses) so the spec-vs-legacy precedence contract is pinned
 without needing a container engine on the test host.
@@ -69,12 +69,17 @@ else:
     sys.exit(f"fake jq: unsupported filter {filt!r} — update the test")
 '''
 
-_FAKE_DOCKER = f"""\
+def _fake_engine(name: str) -> str:
+    """A stand-in for one container engine. Records which engine the
+    runner actually picked, so the podman-first preference is pinned
+    rather than assumed."""
+    return f"""\
 #!{_BASH}
+printf '%s' {name} > "$ENGINE_USED"
 cmd="${{1:-}}"; shift || true
 case "$cmd" in
     load) cat > /dev/null ;;
-    run)  printf '%s\\n' "$@" > "$DOCKER_DUMP" ;;
+    run)  printf '%s\\n' "$@" > "$ENGINE_DUMP" ;;
 esac
 exit 0
 """
@@ -90,8 +95,14 @@ def _capsule_target(**kwargs) -> Target:
 
 class RunnerExecBase(unittest.TestCase):
     """Shared harness: lay out a fake built capsule, prepend fake
-    docker/jq to PATH, run the rendered runner, return the `docker run`
-    argv (one arg per line in $DOCKER_DUMP)."""
+    engine/jq binaries to PATH, run the rendered runner, return the
+    `<engine> run` argv (one arg per line in $ENGINE_DUMP).
+
+    `engines` controls which fakes exist on PATH; the engine the runner
+    actually chose lands in `self.engine_used`. Note the fakes must
+    cover every engine the runner knows about, or a real one installed
+    on the test host would be found instead.
+    """
 
     def run_runner(
         self,
@@ -99,7 +110,7 @@ class RunnerExecBase(unittest.TestCase):
         *,
         spec: dict | None = None,
         extra_env: dict[str, str] | None = None,
-        expect_dump: str = "docker",
+        engines: tuple[str, ...] = ("podman", "docker"),
     ) -> list[str]:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -121,16 +132,23 @@ class RunnerExecBase(unittest.TestCase):
             f'exec "{sys.executable}" "{bin_dir}/fake_jq.py" "$@"\n'
         )
         jq.chmod(0o755)
-        docker = bin_dir / "docker"
-        docker.write_text(_FAKE_DOCKER)
-        docker.chmod(0o755)
+        for engine in engines:
+            path = bin_dir / engine
+            path.write_text(_fake_engine(engine))
+            path.chmod(0o755)
 
-        dump = root / "docker-args"
+        dump = root / "engine-args"
+        used = root / "engine-used"
         env = {
             k: v for k, v in os.environ.items() if not k.startswith("RIGX_")
         }
+        # Prepended, so the runner still has coreutils. Fakes for *both*
+        # engines are laid down by default precisely because bin_dir
+        # only shadows: with a podman fake missing, a real podman on the
+        # test host would be picked up instead.
         env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
-        env["DOCKER_DUMP"] = str(dump)
+        env["ENGINE_DUMP"] = str(dump)
+        env["ENGINE_USED"] = str(used)
         env["XDG_CACHE_HOME"] = str(root / "cache")
         if spec is not None:
             spec_path = root / "spec.json"
@@ -141,6 +159,7 @@ class RunnerExecBase(unittest.TestCase):
             [_BASH, str(runner)], env=env, capture_output=True, text=True,
         )
         self.assertEqual(r.returncode, 0, msg=r.stderr)
+        self.engine_used = used.read_text() if used.exists() else None
         return dump.read_text().splitlines()
 
     @staticmethod
@@ -321,6 +340,76 @@ class SpecLoaderText(unittest.TestCase):
             self.assertNotIn(":-$_v", script)
             self.assertIn('RIGX_PUBLISH="$_v"', script)
             self.assertIn("_RIGX_SPEC_ENV", script)
+
+
+class EnginePreference(RunnerExecBase):
+    """Podman is preferred; docker remains a working fallback."""
+
+    def test_podman_wins_when_both_are_installed(self):
+        script = capsule_common.capsule_runner_script(
+            _capsule_target(), mode="run",
+        )
+        self.run_runner(script, engines=("podman", "docker"))
+        self.assertEqual(self.engine_used, "podman")
+
+    def test_docker_still_used_when_it_is_the_only_engine(self):
+        script = capsule_common.capsule_runner_script(
+            _capsule_target(), mode="run",
+        )
+        self.run_runner(script, engines=("docker",))
+        self.assertEqual(self.engine_used, "docker")
+
+    def test_every_runner_prefers_podman_then_falls_back(self):
+        # Behavioral coverage above executes the lite runner; the other
+        # three share the detection block, so pin its order directly.
+        for script in (
+            capsule_common.capsule_runner_script(_capsule_target(), mode="run"),
+            capsule_common.capsule_runner_script(_capsule_target(), mode="shell"),
+            capsule_common.nixos_runner_script(_capsule_target(backend="nixos")),
+        ):
+            podman_at = script.index("ENGINE=podman")
+            docker_at = script.index("ENGINE=docker")
+            self.assertLess(podman_at, docker_at)
+
+
+class ForegroundMode(RunnerExecBase):
+    """`RIGX_FOREGROUND=1` is what makes a runner supervisable: attached
+    so the supervisor sees the container exit, but no TTY to ask for."""
+
+    def test_foreground_passes_neither_detach_nor_tty_flags(self):
+        script = capsule_common.capsule_runner_script(
+            _capsule_target(), mode="run",
+        )
+        args = self.run_runner(script, extra_env={"RIGX_FOREGROUND": "1"})
+        self.assertNotIn("-d", args)
+        self.assertNotIn("-it", args)
+        self.assertIn("--rm", args)
+
+    def test_default_mode_is_still_interactive(self):
+        script = capsule_common.capsule_runner_script(
+            _capsule_target(), mode="run",
+        )
+        args = self.run_runner(script)
+        self.assertIn("-it", args)
+
+    def test_detach_wins_over_foreground(self):
+        script = capsule_common.capsule_runner_script(
+            _capsule_target(), mode="run",
+        )
+        args = self.run_runner(
+            script, extra_env={"RIGX_DETACH": "1", "RIGX_FOREGROUND": "1"},
+        )
+        self.assertIn("-d", args)
+        self.assertNotIn("-it", args)
+
+    def test_nixos_runner_honours_foreground_and_keeps_privileged(self):
+        script = capsule_common.nixos_runner_script(
+            _capsule_target(backend="nixos"),
+        )
+        args = self.run_runner(script, extra_env={"RIGX_FOREGROUND": "1"})
+        self.assertNotIn("-it", args)
+        self.assertNotIn("-d", args)
+        self.assertIn("--privileged", args)
 
 
 if __name__ == "__main__":

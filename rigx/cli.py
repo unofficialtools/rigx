@@ -41,6 +41,13 @@ from rigx.commands.lock import cmd_lock
 from rigx.commands.ls_source import cmd_ls_source
 from rigx.commands.new import cmd_new
 from rigx.commands.pkg import cmd_pkg
+from rigx.commands.remote_cmd import (
+    cmd_remote_deploy,
+    cmd_remote_restart,
+    cmd_remote_rollback,
+    cmd_remote_start,
+    cmd_remote_stop,
+)
 from rigx.commands.run_cmd import cmd_run
 from rigx.commands.test_cmd import cmd_test
 from rigx.commands.version_cmd import cmd_version
@@ -197,6 +204,69 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sp.add_argument("attr", help="nixpkgs attr name (uv, jq, ripgrep, …)")
     sp.set_defaults(func=cmd_pkg, pkg_args=[])
+
+    sp = sub.add_parser(
+        "remote",
+        help="manage a declarative testbed deployment (experimental)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  rigx remote myapp deploy ssh://deploy@203.0.113.10\n"
+            "  rigx remote myapp stop ssh://deploy@203.0.113.10\n"
+            "  rigx remote myapp start ssh://deploy@203.0.113.10\n"
+            "  rigx remote myapp rollback ssh://deploy@203.0.113.10"
+        ),
+    )
+    sp.add_argument(
+        "target",
+        help="testbed target name (kind='testbed' with a 'services' section)",
+    )
+    remote_sub = sp.add_subparsers(dest="remote_command", required=True)
+
+    def _add_ssh_url_arg(p: argparse.ArgumentParser) -> None:
+        p.add_argument("ssh_url", help="ssh://[user@]host[:port] deploy destination")
+
+    dp = remote_sub.add_parser(
+        "deploy",
+        help="bootstrap a target host and deploy a testbed to it",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  rigx remote myapp deploy ssh://deploy@203.0.113.10\n"
+            "  rigx remote myapp deploy ssh://deploy@203.0.113.10:2222"
+        ),
+    )
+    _add_ssh_url_arg(dp)
+    dp.set_defaults(func=cmd_remote_deploy)
+
+    for action, func in (
+        ("start", cmd_remote_start),
+        ("stop", cmd_remote_stop),
+        ("restart", cmd_remote_restart),
+    ):
+        lp = remote_sub.add_parser(
+            action,
+            help=f"{action} an already-deployed testbed's services",
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+            epilog=(
+                "examples:\n"
+                f"  rigx remote myapp {action} ssh://deploy@203.0.113.10"
+            ),
+        )
+        _add_ssh_url_arg(lp)
+        lp.set_defaults(func=func)
+
+    rp = remote_sub.add_parser(
+        "rollback",
+        help="roll an already-deployed testbed back to its previous generation",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  rigx remote myapp rollback ssh://deploy@203.0.113.10"
+        ),
+    )
+    _add_ssh_url_arg(rp)
+    rp.set_defaults(func=cmd_remote_rollback)
 
     return p
 

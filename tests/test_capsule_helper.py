@@ -49,6 +49,35 @@ def fake_capsule(
         tmp.cleanup()
 
 
+class ContainerEnginePreference(unittest.TestCase):
+    """Podman first, docker as fallback — matching what `rigx remote
+    deploy` installs and supervises on a target, so a capsule that runs
+    locally is running under the same engine it will be deployed under.
+    """
+
+    def _which(self, available: set[str]):
+        return lambda name: f"/usr/bin/{name}" if name in available else None
+
+    def test_prefers_podman_when_both_present(self):
+        with mock.patch.object(
+            capsule.shutil, "which", side_effect=self._which({"podman", "docker"}),
+        ):
+            self.assertEqual(capsule._container_engine(), "podman")
+
+    def test_falls_back_to_docker(self):
+        with mock.patch.object(
+            capsule.shutil, "which", side_effect=self._which({"docker"}),
+        ):
+            self.assertEqual(capsule._container_engine(), "docker")
+
+    def test_raises_when_neither_present(self):
+        with mock.patch.object(
+            capsule.shutil, "which", side_effect=self._which(set()),
+        ):
+            with self.assertRaises(RuntimeError):
+                capsule._container_engine()
+
+
 class StartContract(unittest.TestCase):
     def test_runner_receives_rigx_env_vars(self):
         """`start()` invokes the runner with RIGX_NAME, RIGX_DETACH,

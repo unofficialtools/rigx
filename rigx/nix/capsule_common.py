@@ -185,7 +185,14 @@ def capsule_runner_script(target: Target, *, mode: str) -> str:
                         as a fallback for older orchestrators).
       RIGX_NAME         stable container name (default: random uuid)
       RIGX_DETACH       1 = `-d` instead of `-it`; default interactive
-      RIGX_NETWORK      join an existing docker network
+      RIGX_FOREGROUND   1 = attached with no TTY (neither `-d` nor
+                        `-it`). For running under a process supervisor:
+                        the engine stays in the foreground so the
+                        supervisor sees the container exit, but no TTY
+                        is requested because there isn't one. Ignored
+                        when RIGX_DETACH is also set. Used by
+                        `rigx.deploy.units`.
+      RIGX_NETWORK      join an existing container network
       RIGX_PUBLISH      comma-list of `host:container` port pairs
       RIGX_PUBLISH_UDP  comma-list of `host:container` UDP pairs
       RIGX_ENV          comma-list of `KEY=VALUE` extra env vars
@@ -213,9 +220,9 @@ def capsule_runner_script(target: Target, *, mode: str) -> str:
 #!/usr/bin/env bash
 set -euo pipefail
 
-if command -v docker >/dev/null 2>&1; then ENGINE=docker
-elif command -v podman >/dev/null 2>&1; then ENGINE=podman
-else echo "{label}: docker or podman is required on PATH" >&2; exit 1
+if command -v podman >/dev/null 2>&1; then ENGINE=podman
+elif command -v docker >/dev/null 2>&1; then ENGINE=docker
+else echo "{label}: podman or docker is required on PATH" >&2; exit 1
 fi
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
@@ -238,6 +245,12 @@ echo "[{label}] loading {image_tag}" >&2
 RUN_FLAGS=(--rm)
 if [ -n "${{RIGX_DETACH:-}}" ]; then
     RUN_FLAGS+=(-d)
+elif [ -n "${{RIGX_FOREGROUND:-}}" ]; then
+    # Attached but no TTY: the supervisor (systemd) wants the engine
+    # to stay in the foreground so it can see the container exit, but
+    # ExecStart's stdin is /dev/null, and `-t` against a non-terminal
+    # is a hard error on docker.
+    :
 else
     RUN_FLAGS+=(-it)
 fi
@@ -307,9 +320,9 @@ def nixos_runner_script(target: Target) -> str:
 #!/usr/bin/env bash
 set -euo pipefail
 
-if command -v docker >/dev/null 2>&1; then ENGINE=docker
-elif command -v podman >/dev/null 2>&1; then ENGINE=podman
-else echo "{label}: docker or podman is required on PATH" >&2; exit 1
+if command -v podman >/dev/null 2>&1; then ENGINE=podman
+elif command -v docker >/dev/null 2>&1; then ENGINE=docker
+else echo "{label}: podman or docker is required on PATH" >&2; exit 1
 fi
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
@@ -323,6 +336,9 @@ echo "[{label}] loading {image_tag}" >&2
 RUN_FLAGS=(--rm --privileged)
 if [ -n "${{RIGX_DETACH:-}}" ]; then
     RUN_FLAGS+=(-d)
+elif [ -n "${{RIGX_FOREGROUND:-}}" ]; then
+    # See the lite runner: attached, no TTY, for supervisor use.
+    :
 else
     RUN_FLAGS+=(-it)
 fi
