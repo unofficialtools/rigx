@@ -350,6 +350,30 @@ class GeneratePythonScript(unittest.TestCase):
         self.assertIn("./python/pyproject.toml", out)
         self.assertIn("./python/uv.lock", out)
 
+    def test_venv_scrubs_nondeterministic_dist_info(self):
+        """uv writes per-build provenance for path deps; it must be removed.
+
+        uv_cache.json holds a nanosecond wall-clock stamp and direct_url.json
+        embeds $NIX_BUILD_TOP; both are hashed into RECORD, so the venv FOD
+        hash drifts on every rebuild unless the files *and* their RECORD rows
+        are stripped."""
+        t = Target(
+            name="p",
+            kind="python_script",
+            sources=["a.py"],
+        )
+        out = nix_gen.generate(_project(targets={"p": t}))
+        self.assertIn(
+            "\\( -name direct_url.json -o -name uv_cache.json \\) -delete", out
+        )
+        self.assertIn(
+            "-exec sed -i -E '/\\/(direct_url|uv_cache)\\.json,/d' {} +", out
+        )
+        # Scoped to .dist-info so a package's own data file of the same name
+        # survives.
+        self.assertIn("find .venv -type f -path '*.dist-info/*'", out)
+        self.assertIn("find .venv -type f -path '*.dist-info/RECORD'", out)
+
 
 class GenerateCustom(unittest.TestCase):
     def test_scripts_inlined(self):

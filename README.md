@@ -1247,6 +1247,12 @@ python_venv_extra = ["vendor", "wheels/*.whl"]
 
 If omitted, every build fails deterministically on hash mismatch.
 
+The venv is normalized before hashing (`pyvenv.cfg`, `bin/`, `__pycache__`,
+store symlinks, and uv's per-build `.dist-info/direct_url.json` and
+`uv_cache.json` are removed) so the hash depends on the lock, not on when or
+where you built. If a hash still drifts between builds, that is a bug —
+please report it.
+
 ### `run` — execute an artifact, capture its output files
 
 ```toml

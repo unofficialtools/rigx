@@ -116,6 +116,16 @@ def mk_python_derivation(target: Target, project: Project) -> str:
     lines.append("      done")
     lines.append("      find .venv -type d -name __pycache__ -prune -exec rm -rf {} +")
     lines.append("      rm -rf .venv/bin")
+    # Scrub per-build provenance metadata that uv writes for path/local-wheel
+    # deps: uv_cache.json holds a nanosecond wall-clock stamp (differs every
+    # build) and direct_url.json embeds $NIX_BUILD_TOP plus the target name
+    # (stable only under a sandboxed build, and never shared across targets).
+    # RECORD carries a sha256 of both, so its rows must go too or deleting the
+    # files changes nothing.
+    lines.append("      find .venv -type f -path '*.dist-info/*' \\")
+    lines.append("        \\( -name direct_url.json -o -name uv_cache.json \\) -delete")
+    lines.append("      find .venv -type f -path '*.dist-info/RECORD' \\")
+    lines.append("        -exec sed -i -E '/\\/(direct_url|uv_cache)\\.json,/d' {} +")
     lines.append("      find .venv -exec touch -h -d @1 {} +")
     lines.append("      runHook postBuild")
     lines.append("    '';")

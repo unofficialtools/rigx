@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.11.0 — 2026-07-25
+
+### Behavior changes
+
+- **`python_script` venvs are now reproducible for path / local-wheel deps,
+  which changes their `python_venv_hash`.** For such deps uv writes two
+  per-build files into `.dist-info/`: `uv_cache.json`, containing a
+  nanosecond wall-clock timestamp (so it differed on *every* build), and
+  `direct_url.json`, containing `$NIX_BUILD_TOP` and the target name (stable
+  only under a sandboxed build, and never shared between two targets with
+  identical `pyproject.toml` + `uv.lock`). Both are hashed into `RECORD`.
+  The venv build phase now deletes both files and strips their `RECORD` rows.
+
+  Projects whose deps are all registry wheels are unaffected — uv never wrote
+  these files for them, and their pinned hashes remain valid. Projects with a
+  path or vendored-wheel dep must re-pin `python_venv_hash` once, using the
+  usual workflow (build, copy the `got:` hash). They should not have to do it
+  again.
+
 ## 0.10.0 — 2026-07-05
 
 Bug-fix release: a full-codebase review followed by 49 fix commits, each with a
