@@ -259,6 +259,41 @@ class Volume:
 
 
 @dataclass
+class TestbedHealthcheck:
+    """`[targets.<testbed>.services.<name>.healthcheck]` — exit-code
+    based, one shape only (design decision #7): a command plus a
+    retry interval/count. No liveness/readiness split, no HTTP-
+    specific fields."""
+    command: str
+    interval: int = 1
+    retries: int = 10
+
+
+@dataclass
+class TestbedPort:
+    host: int
+    container: int
+
+
+@dataclass
+class TestbedService:
+    """One `[targets.<testbed>.services.<name>]` entry: a reference to
+    a `kind = "capsule"` target plus deployment wiring (start order,
+    restart policy, ports, named volume/secret mounts, healthcheck).
+    The declarative counterpart to the interactive
+    `rigx.testbed.Network` scenario driven by `script` — see design
+    decisions #1 and #9."""
+    name: str
+    capsule: str
+    depends_on: list[str] = field(default_factory=list)
+    restart: str = "always"          # "always" | "on-failure" | "no" -> systemd Restart=
+    ports: list[TestbedPort] = field(default_factory=list)
+    volumes: dict[str, str] = field(default_factory=dict)   # volume name -> mount path
+    secrets: dict[str, str] = field(default_factory=dict)   # secret name -> exposed path
+    healthcheck: TestbedHealthcheck | None = None
+
+
+@dataclass
 class Variant:
     name: str
     cxxflags: list[str] = field(default_factory=list)
@@ -375,6 +410,22 @@ class Target:
     # The full identity is `namespace.name` when namespace is set; this is
     # what populates `project.targets` keys and Nix attr names.
     namespace: str = ""
+    # Declarative testbed deployment section (kind = "testbed" only).
+    # Optional and independent of `script` — a testbed target may have
+    # `script` (interactive fault-injection mode, via `rigx run`),
+    # `services` (declarative deploy mode, via `rigx remote deploy`),
+    # or both. See design decisions #1 and #9.
+    services: dict[str, TestbedService] = field(default_factory=dict)
+    # `[targets.<testbed>.volumes.<name>]` — names of persistent
+    # volumes services may mount by name. No per-volume fields yet
+    # (design decision #8: fixed host path, `/var/lib/rigx/<testbed>/
+    # volumes/<name>`, created once by `bin/activate`).
+    testbed_volumes: list[str] = field(default_factory=list)
+    # `[targets.<testbed>.secrets.<name>]` — name -> `source` string
+    # ("env:VAR" or "file:path"), read locally before being piped over
+    # SSH at deploy time (design decision #6). Never rigx's own at-rest
+    # storage format.
+    testbed_secrets: dict[str, str] = field(default_factory=dict)
 
     def variant_names(self) -> list[str]:
         return sorted(self.variants.keys())
@@ -747,6 +798,171 @@ def _parse_volumes(
     return out
 
 
+_TESTBED_RESTART_POLICIES = {"always", "on-failure", "no"}
+
+
+def _parse_testbed_healthcheck(raw, ctx: str) -> TestbedHealthcheck | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{ctx}: healthcheck must be a table")
+    unknown = set(raw.keys()) - {"command", "interval", "retries"}
+    if unknown:
+        raise ConfigError(
+            f"{ctx}: unknown keys {sorted(unknown)} "
+            f"(allowed: command, interval, retries)"
+        )
+    command = raw.get("command")
+    if not isinstance(command, str) or not command:
+        raise ConfigError(f"{ctx}: 'command' must be a non-empty string")
+    interval = raw.get("interval", 1)
+    retries = raw.get("retries", 10)
+    if not isinstance(interval, int) or isinstance(interval, bool) or interval <= 0:
+        raise ConfigError(f"{ctx}: 'interval' must be a positive integer")
+    if not isinstance(retries, int) or isinstance(retries, bool) or retries <= 0:
+        raise ConfigError(f"{ctx}: 'retries' must be a positive integer")
+    return TestbedHealthcheck(command=command, interval=interval, retries=retries)
+
+
+def _parse_testbed_ports(raw, ctx: str) -> list[TestbedPort]:
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ConfigError(f"{ctx}: ports must be a list of inline tables")
+    out: list[TestbedPort] = []
+    for i, entry in enumerate(raw):
+        ectx = f"{ctx}.ports[{i}]"
+        if not isinstance(entry, dict):
+            raise ConfigError(
+                f"{ectx}: must be an inline table with `host` and `container`"
+            )
+        unknown = set(entry.keys()) - {"host", "container"}
+        if unknown:
+            raise ConfigError(
+                f"{ectx}: unknown keys {sorted(unknown)} (allowed: host, container)"
+            )
+        host = entry.get("host")
+        container = entry.get("container")
+        for label, val in (("host", host), ("container", container)):
+            if not isinstance(val, int) or isinstance(val, bool):
+                raise ConfigError(f"{ectx}: '{label}' must be an integer")
+        out.append(TestbedPort(host=host, container=container))
+    return out
+
+
+def _parse_testbed_str_map(raw, ctx: str, *, field_name: str) -> dict[str, str]:
+    """Parse a `[targets.<t>.services.<s>.{volumes,secrets}]` table:
+    name -> string value (mount path / exposed path)."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in raw.items()
+    ):
+        raise ConfigError(f"{ctx}: {field_name} must be a table of name -> string")
+    return dict(raw)
+
+
+def _parse_testbed_services(tconf: dict, tctx: str) -> dict[str, TestbedService]:
+    raw = tconf.get("services")
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{tctx}: services must be a table")
+    out: dict[str, TestbedService] = {}
+    for sname, sconf in raw.items():
+        sctx = f"{tctx}.services.{sname}"
+        if not isinstance(sconf, dict):
+            raise ConfigError(f"{sctx}: must be a table")
+        unknown = set(sconf.keys()) - {
+            "capsule", "depends_on", "restart", "ports",
+            "volumes", "secrets", "healthcheck",
+        }
+        if unknown:
+            raise ConfigError(f"{sctx}: unknown keys {sorted(unknown)}")
+        capsule = sconf.get("capsule")
+        if not isinstance(capsule, str) or not capsule:
+            raise ConfigError(
+                f"{sctx}: 'capsule' must be a non-empty string "
+                f"(a kind='capsule' target name)"
+            )
+        depends_on = sconf.get("depends_on", [])
+        if not isinstance(depends_on, list) or not all(
+            isinstance(d, str) for d in depends_on
+        ):
+            raise ConfigError(f"{sctx}: depends_on must be a list of service names")
+        restart = str(sconf.get("restart", "always"))
+        if restart not in _TESTBED_RESTART_POLICIES:
+            raise ConfigError(
+                f"{sctx}: restart must be one of "
+                f"{sorted(_TESTBED_RESTART_POLICIES)} (got {restart!r})"
+            )
+        out[sname] = TestbedService(
+            name=sname,
+            capsule=capsule,
+            depends_on=list(depends_on),
+            restart=restart,
+            ports=_parse_testbed_ports(sconf.get("ports"), sctx),
+            volumes=_parse_testbed_str_map(sconf.get("volumes"), sctx, field_name="volumes"),
+            secrets=_parse_testbed_str_map(sconf.get("secrets"), sctx, field_name="secrets"),
+            healthcheck=_parse_testbed_healthcheck(
+                sconf.get("healthcheck"), f"{sctx}.healthcheck"
+            ),
+        )
+    # depends_on must reference sibling services declared in this same
+    # testbed — cycle detection happens later in the plan compiler,
+    # which needs a topological sort anyway.
+    for sname, svc in out.items():
+        for dep in svc.depends_on:
+            if dep == sname:
+                raise ConfigError(
+                    f"{tctx}.services.{sname}: depends_on cannot reference itself"
+                )
+            if dep not in out:
+                raise ConfigError(
+                    f"{tctx}.services.{sname}: depends_on references "
+                    f"undeclared service {dep!r}"
+                )
+    return out
+
+
+def _parse_testbed_volumes(tconf: dict, tctx: str) -> list[str]:
+    raw = tconf.get("volumes")
+    if raw is None:
+        return []
+    if not isinstance(raw, dict):
+        raise ConfigError(
+            f"{tctx}: volumes must be a table of "
+            f"`[targets.<testbed>.volumes.<name>]` declarations"
+        )
+    return sorted(raw.keys())
+
+
+def _parse_testbed_secrets(tconf: dict, tctx: str) -> dict[str, str]:
+    raw = tconf.get("secrets")
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{tctx}: secrets must be a table")
+    out: dict[str, str] = {}
+    for name, sconf in raw.items():
+        sctx = f"{tctx}.secrets.{name}"
+        if not isinstance(sconf, dict):
+            raise ConfigError(f"{sctx}: must be a table")
+        source = sconf.get("source")
+        if not isinstance(source, str) or not source:
+            raise ConfigError(
+                f"{sctx}: 'source' must be a non-empty string "
+                f"(e.g. 'env:VAR' or 'file:path')"
+            )
+        if not (source.startswith("env:") or source.startswith("file:")):
+            raise ConfigError(
+                f"{sctx}: 'source' must start with 'env:' or 'file:' "
+                f"(got {source!r})"
+            )
+        out[name] = source
+    return out
+
+
 def _infer_language(sources: list[str], explicit: str, ctx: str) -> str:
     """Resolve a target's `language` field.
 
@@ -971,9 +1187,21 @@ def _build_target(
         f"{tctx}.nixos_modules",
         output_prefix=path_prefix,
     )
-    volumes = _parse_volumes(
-        tconf.get("volumes"), tctx, path_prefix=path_prefix,
-    )
+    # `volumes` means two different things depending on `kind`: a list
+    # of capsule bind-mounts, or (testbed) a table of named persistent-
+    # volume declarations. Branch rather than overload one parser.
+    if kind == "testbed":
+        volumes = []
+        services = _parse_testbed_services(tconf, tctx)
+        testbed_volumes = _parse_testbed_volumes(tconf, tctx)
+        testbed_secrets = _parse_testbed_secrets(tconf, tctx)
+    else:
+        volumes = _parse_volumes(
+            tconf.get("volumes"), tctx, path_prefix=path_prefix,
+        )
+        services = {}
+        testbed_volumes = []
+        testbed_secrets = {}
     user = str(tconf.get("user", "") or "")
 
     return Target(
@@ -1019,6 +1247,9 @@ def _build_target(
         user=user,
         variants=variants,
         namespace=namespace,
+        services=services,
+        testbed_volumes=testbed_volumes,
+        testbed_secrets=testbed_secrets,
     )
 
 
@@ -1619,12 +1850,39 @@ def _load(root: Path, _visited: set[Path]) -> Project:
                     f"target {qname}: kind='test' requires 'script'"
                 )
         if target.kind == "testbed":
-            if not target.script:
+            if not target.script and not target.services:
                 raise ConfigError(
                     f"target {qname}: kind='testbed' requires 'script' "
-                    f"(an interactive host-side scenario; runs via "
-                    f"`rigx run {qname}`)"
+                    f"(an interactive host-side scenario, runs via "
+                    f"`rigx run {qname}`) and/or 'services' (a declarative "
+                    f"deployment manifest, deploys via "
+                    f"`rigx remote {qname} deploy ssh://…`)"
                 )
+            for sname, svc in target.services.items():
+                sctx = f"target {qname}: services.{sname}"
+                capsule_target = targets.get(svc.capsule)
+                if capsule_target is None:
+                    raise ConfigError(
+                        f"{sctx}: capsule '{svc.capsule}' is not a defined target"
+                    )
+                if capsule_target.kind != "capsule":
+                    raise ConfigError(
+                        f"{sctx}: capsule '{svc.capsule}' must be kind='capsule' "
+                        f"(got {capsule_target.kind!r})"
+                    )
+                for vname in svc.volumes:
+                    if vname not in target.testbed_volumes:
+                        raise ConfigError(
+                            f"{sctx}: volumes references undeclared volume "
+                            f"{vname!r} (add [targets.{qname}.volumes.{vname}])"
+                        )
+                for secret_name in svc.secrets:
+                    if secret_name not in target.testbed_secrets:
+                        raise ConfigError(
+                            f"{sctx}: secrets references undeclared secret "
+                            f"{secret_name!r} (add [targets.{qname}.secrets."
+                            f"{secret_name}])"
+                        )
         if target.kind == "run":
             if not target.run:
                 raise ConfigError(f"target {qname}: kind='run' requires 'run = <name>'")

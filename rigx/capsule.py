@@ -35,13 +35,23 @@ from typing import Any, Iterator
 
 
 def _container_engine() -> str:
-    """Return the first container engine on PATH. `docker` first because
-    `podman` is the documented fallback in nix-docker.sh."""
-    for engine in ("docker", "podman"):
+    """Return the first container engine on PATH. `podman` first: it is
+    what `rigx remote deploy` installs and supervises on a deploy target
+    (see `rigx.deploy.bootstrap`), and having local runs prefer the same
+    engine keeps "works locally" a meaningful signal for "works
+    deployed". `docker` stays a fallback so hosts that only have it
+    still run capsules unchanged.
+
+    Note the order only matters on a host with *both* installed — and
+    there it is a behavior change: a container started under docker by
+    an older rigx won't be found by `Capsule.stop()` after the switch,
+    since that shells out to whichever engine this picks now.
+    """
+    for engine in ("podman", "docker"):
         if shutil.which(engine):
             return engine
     raise RuntimeError(
-        "rigx.capsule: docker or podman is required on PATH to run capsules"
+        "rigx.capsule: podman or docker is required on PATH to run capsules"
     )
 
 
