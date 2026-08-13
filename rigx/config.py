@@ -6,6 +6,7 @@ import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlsplit
 
 # `"$vars.<name>"` references in list fields expand to the named entry of
 # `[vars]`. Anchored so embedded substrings ("path/$vars.x") don't match —
@@ -426,6 +427,11 @@ class Target:
     # SSH at deploy time (design decision #6). Never rigx's own at-rest
     # storage format.
     testbed_secrets: dict[str, str] = field(default_factory=dict)
+    # `ssh_url` — where this testbed deploys to. Declared in `rigx.toml`
+    # so the destination is versioned with the thing being deployed
+    # rather than retyped per invocation; `rigx remote <target> <action>
+    # [ssh_url]` overrides it, and is required when this is unset.
+    ssh_url: str = ""
 
     def variant_names(self) -> list[str]:
         return sorted(self.variants.keys())
@@ -963,6 +969,31 @@ def _parse_testbed_secrets(tconf: dict, tctx: str) -> dict[str, str]:
     return out
 
 
+def _parse_testbed_ssh_url(tconf: dict, tctx: str) -> str:
+    """Parse `ssh_url` on a `kind = "testbed"` target — the deploy
+    destination, validated here so a typo fails at config load rather
+    than after bootstrap has already started talking to a host.
+
+    Optional at parse time: a testbed may declare `services` without a
+    destination and have one supplied on the command line instead. The
+    "one of the two must be present" rule belongs to the command (see
+    `rigx.commands.remote_cmd`), not to the schema.
+    """
+    raw = tconf.get("ssh_url")
+    if raw is None:
+        return ""
+    if not isinstance(raw, str) or not raw:
+        raise ConfigError(f"{tctx}: 'ssh_url' must be a non-empty string")
+    parts = urlsplit(raw)
+    if parts.scheme != "ssh":
+        raise ConfigError(
+            f"{tctx}: 'ssh_url' must be an ssh:// URL (got {raw!r})"
+        )
+    if not parts.hostname:
+        raise ConfigError(f"{tctx}: 'ssh_url' is missing a host (got {raw!r})")
+    return raw
+
+
 def _infer_language(sources: list[str], explicit: str, ctx: str) -> str:
     """Resolve a target's `language` field.
 
@@ -1195,6 +1226,7 @@ def _build_target(
         services = _parse_testbed_services(tconf, tctx)
         testbed_volumes = _parse_testbed_volumes(tconf, tctx)
         testbed_secrets = _parse_testbed_secrets(tconf, tctx)
+        testbed_ssh_url = _parse_testbed_ssh_url(tconf, tctx)
     else:
         volumes = _parse_volumes(
             tconf.get("volumes"), tctx, path_prefix=path_prefix,
@@ -1202,6 +1234,7 @@ def _build_target(
         services = {}
         testbed_volumes = []
         testbed_secrets = {}
+        testbed_ssh_url = ""
     user = str(tconf.get("user", "") or "")
 
     return Target(
@@ -1250,6 +1283,7 @@ def _build_target(
         services=services,
         testbed_volumes=testbed_volumes,
         testbed_secrets=testbed_secrets,
+        ssh_url=testbed_ssh_url,
     )
 
 

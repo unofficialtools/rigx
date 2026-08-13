@@ -1,6 +1,6 @@
 """`rigx remote` — manage a declarative testbed deployment.
 
-`rigx remote <target> deploy <ssh_url>` runs the full pipeline:
+`rigx remote <target> deploy [ssh_url]` runs the full pipeline:
 bootstrap the target (Nix + systemd check + service user), build the
 referenced capsules and compile the deployment plan, push it via `nix
 copy`, push any declared secrets, then run the plan's `bin/activate`
@@ -12,6 +12,12 @@ currently-live generation already has and driving
 re-copied. See the project design memory for the full design and
 what's still a known gap (flake.nix integration for the plan itself;
 the non-bootstrap privilege model).
+
+Every action takes its destination from the target's `ssh_url` in
+`rigx.toml`, so the host a testbed deploys to is versioned with the
+testbed rather than retyped per invocation. The positional `ssh_url`
+is an optional override (staging host, one-off), and the only source
+when the target declares none — see `_resolve_ssh_url`.
 """
 
 from __future__ import annotations
@@ -42,6 +48,29 @@ def _resolve_target(project: Project, target_name: str) -> Target:
     return t
 
 
+def _resolve_ssh_url(testbed: Target, args: argparse.Namespace) -> str:
+    """Pick the deploy destination: the command-line `ssh_url` if given,
+    otherwise the target's `ssh_url` from `rigx.toml`.
+
+    The destination lives in `rigx.toml` so it is versioned alongside
+    the thing being deployed instead of retyped (and mistyped) per
+    invocation. The command-line form stays available as an override —
+    for a staging host, or a one-off — and is the only source when the
+    target declares none.
+    """
+    override = getattr(args, "ssh_url", None)
+    if override:
+        return override
+    if testbed.ssh_url:
+        return testbed.ssh_url
+    raise DeployError(
+        f"testbed {testbed.name!r} declares no 'ssh_url' in rigx.toml — "
+        f"either add one to [targets.{testbed.name}] or pass a destination "
+        f"on the command line (rigx remote {testbed.name} "
+        f"{getattr(args, 'remote_command', '<action>')} ssh://user@host)"
+    )
+
+
 def _fetch_previous_manifest(ssh_target: SSHTarget, testbed_name: str) -> dict | None:
     """Read `manifest.json` out of whatever generation is currently
     live on the target (if any) — used to diff removed services at
@@ -64,18 +93,19 @@ def cmd_remote_deploy(args: argparse.Namespace) -> int:
     try:
         project = cli._load(args)
         testbed = _resolve_target(project, args.target)
+        ssh_url = _resolve_ssh_url(testbed, args)
     except (config.ConfigError, DeployError) as e:
         print(f"rigx remote deploy: {e}", file=sys.stderr)
         return 1
 
     try:
-        info = bootstrap.bootstrap(args.ssh_url)
+        info = bootstrap.bootstrap(ssh_url)
         print(
             f"[rigx remote deploy] bootstrap ok: {info.os_name}/{info.arch}, "
             f"nix={'present' if info.has_nix else 'missing'}"
         )
 
-        ssh_target = bootstrap.parse_ssh_url(args.ssh_url)
+        ssh_target = bootstrap.parse_ssh_url(ssh_url)
         previous_manifest = _fetch_previous_manifest(ssh_target, testbed.name)
 
         print(f"[rigx remote deploy] building capsules + compiling plan for {testbed.name!r}")
@@ -105,7 +135,7 @@ def _resolve_and_connect(args: argparse.Namespace) -> tuple[Target, SSHTarget]:
     from rigx import cli
     project = cli._load(args)
     testbed = _resolve_target(project, args.target)
-    return testbed, bootstrap.parse_ssh_url(args.ssh_url)
+    return testbed, bootstrap.parse_ssh_url(_resolve_ssh_url(testbed, args))
 
 
 def _lifecycle(args: argparse.Namespace, action: str) -> int:

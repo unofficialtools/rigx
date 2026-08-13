@@ -211,10 +211,11 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "examples:\n"
-            "  rigx remote myapp deploy ssh://deploy@203.0.113.10\n"
-            "  rigx remote myapp stop ssh://deploy@203.0.113.10\n"
-            "  rigx remote myapp start ssh://deploy@203.0.113.10\n"
-            "  rigx remote myapp rollback ssh://deploy@203.0.113.10"
+            "  rigx remote myapp deploy      # uses ssh_url from rigx.toml\n"
+            "  rigx remote myapp stop\n"
+            "  rigx remote myapp start\n"
+            "  rigx remote myapp rollback\n"
+            "  rigx remote myapp deploy ssh://deploy@203.0.113.10  # override"
         ),
     )
     sp.add_argument(
@@ -224,7 +225,16 @@ def build_parser() -> argparse.ArgumentParser:
     remote_sub = sp.add_subparsers(dest="remote_command", required=True)
 
     def _add_ssh_url_arg(p: argparse.ArgumentParser) -> None:
-        p.add_argument("ssh_url", help="ssh://[user@]host[:port] deploy destination")
+        p.add_argument(
+            "ssh_url",
+            nargs="?",
+            default=None,
+            help=(
+                "ssh://[user@]host[:port] deploy destination. Optional: "
+                "overrides the target's `ssh_url` in rigx.toml, and is "
+                "required only when the target doesn't declare one"
+            ),
+        )
 
     dp = remote_sub.add_parser(
         "deploy",
@@ -232,6 +242,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "examples:\n"
+            "  rigx remote myapp deploy      # uses ssh_url from rigx.toml\n"
             "  rigx remote myapp deploy ssh://deploy@203.0.113.10\n"
             "  rigx remote myapp deploy ssh://deploy@203.0.113.10:2222"
         ),
@@ -250,6 +261,7 @@ def build_parser() -> argparse.ArgumentParser:
             formatter_class=argparse.RawDescriptionHelpFormatter,
             epilog=(
                 "examples:\n"
+                f"  rigx remote myapp {action}\n"
                 f"  rigx remote myapp {action} ssh://deploy@203.0.113.10"
             ),
         )
@@ -262,6 +274,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "examples:\n"
+            "  rigx remote myapp rollback\n"
             "  rigx remote myapp rollback ssh://deploy@203.0.113.10"
         ),
     )

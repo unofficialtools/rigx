@@ -89,8 +89,130 @@ _HOST_INFO = HostInfo(
 )
 
 
+_TESTBED_WITH_SSH_URL = """
+    [project]
+    name = "p"
+
+    [targets.web_capsule]
+    kind       = "capsule"
+    backend    = "lite"
+    entrypoint = "/bin/true"
+
+    [targets.app]
+    kind    = "testbed"
+    ssh_url = "ssh://deploy@declared.example"
+
+    [targets.app.services.web]
+    capsule = "web_capsule"
+"""
+
+
 def _args(root: Path, target="app", ssh_url="ssh://h") -> argparse.Namespace:
     return argparse.Namespace(project=str(root), target=target, ssh_url=ssh_url)
+
+
+class ResolveSshUrl(unittest.TestCase):
+    """The destination lives in rigx.toml so it's versioned with the
+    testbed; the command line is an override, and the only source when
+    the target declares none."""
+
+    def _testbed(self, root: Path, name="app"):
+        return remote_cmd._resolve_target(config.load(root), name)
+
+    def test_uses_declared_ssh_url_when_no_override(self):
+        with TempProject(_TESTBED_WITH_SSH_URL) as root:
+            t = self._testbed(root)
+            args = _args(root, ssh_url=None)
+            self.assertEqual(
+                remote_cmd._resolve_ssh_url(t, args), "ssh://deploy@declared.example",
+            )
+
+    def test_command_line_overrides_the_declared_url(self):
+        with TempProject(_TESTBED_WITH_SSH_URL) as root:
+            t = self._testbed(root)
+            args = _args(root, ssh_url="ssh://staging.example")
+            self.assertEqual(
+                remote_cmd._resolve_ssh_url(t, args), "ssh://staging.example",
+            )
+
+    def test_errors_when_neither_source_has_one(self):
+        with TempProject(_ONE_TESTBED) as root:
+            t = self._testbed(root)
+            args = _args(root, ssh_url=None)
+            with self.assertRaises(DeployError) as cm:
+                remote_cmd._resolve_ssh_url(t, args)
+            msg = str(cm.exception)
+            # The error has to say both ways out, not just "missing".
+            self.assertIn("ssh_url", msg)
+            self.assertIn("[targets.app]", msg)
+            self.assertIn("ssh://user@host", msg)
+
+    def test_deploy_uses_the_declared_url_end_to_end(self):
+        with TempProject(_TESTBED_WITH_SSH_URL) as root:
+            with mock.patch.object(
+                remote_cmd.bootstrap, "bootstrap", return_value=_HOST_INFO,
+            ) as m_bootstrap, mock.patch.object(
+                remote_cmd.bootstrap, "run_remote",
+                return_value=mock.Mock(returncode=1, stdout=""),
+            ), mock.patch.object(
+                remote_cmd.pack, "build_and_push_plan", return_value="/nix/store/p",
+            ):
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    rc = remote_cmd.cmd_remote_deploy(_args(root, ssh_url=None))
+            self.assertEqual(rc, 0, buf.getvalue())
+            m_bootstrap.assert_called_once_with("ssh://deploy@declared.example")
+
+    def test_deploy_reports_the_missing_url_and_exits_nonzero(self):
+        with TempProject(_ONE_TESTBED) as root:
+            with mock.patch.object(
+                remote_cmd.bootstrap, "bootstrap",
+            ) as m_bootstrap:
+                err = io.StringIO()
+                with redirect_stderr(err):
+                    rc = remote_cmd.cmd_remote_deploy(_args(root, ssh_url=None))
+            self.assertEqual(rc, 1)
+            self.assertIn("ssh_url", err.getvalue())
+            # Nothing should have touched the network to find that out.
+            m_bootstrap.assert_not_called()
+
+
+class DeclaredSshUrlSchema(unittest.TestCase):
+    """`ssh_url` is validated at config load, so a typo fails before
+    bootstrap has started talking to a host."""
+
+    def _toml(self, value: str) -> str:
+        return _TESTBED_WITH_SSH_URL.replace(
+            'ssh_url = "ssh://deploy@declared.example"', value,
+        )
+
+    def test_rejects_non_ssh_scheme(self):
+        with TempProject(self._toml('ssh_url = "https://example.com"')) as root:
+            with self.assertRaises(config.ConfigError) as cm:
+                config.load(root)
+            self.assertIn("ssh://", str(cm.exception))
+
+    def test_rejects_url_without_a_host(self):
+        with TempProject(self._toml('ssh_url = "ssh://"')) as root:
+            with self.assertRaises(config.ConfigError) as cm:
+                config.load(root)
+            self.assertIn("host", str(cm.exception))
+
+    def test_rejects_non_string(self):
+        with TempProject(self._toml("ssh_url = 42")) as root:
+            with self.assertRaises(config.ConfigError):
+                config.load(root)
+
+    def test_accepts_a_port(self):
+        with TempProject(
+            self._toml('ssh_url = "ssh://deploy@example.com:2222"')
+        ) as root:
+            t = config.load(root).targets["app"]
+            self.assertEqual(t.ssh_url, "ssh://deploy@example.com:2222")
+
+    def test_absent_ssh_url_is_empty_not_an_error(self):
+        with TempProject(_ONE_TESTBED) as root:
+            self.assertEqual(config.load(root).targets["app"].ssh_url, "")
 
 
 class ResolveTarget(unittest.TestCase):
