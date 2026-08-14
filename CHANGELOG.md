@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.12.0 — 2026-08-13
+
+### New features
+
+- **`rigx remote` — SSH deployment for declarative testbeds.** A
+  `kind = "testbed"` target can now carry a `services` table describing a
+  supervised multi-capsule deployment (dependencies, restart policy, ports,
+  volumes, secrets, health checks) plus an `ssh_url` destination.
+  `rigx remote <target> deploy|start|stop|restart|rollback [ssh_url]`
+  bootstraps a bare Linux host, builds the referenced capsules, compiles a
+  deployment plan, pushes it and every capsule closure with `nix copy`, and
+  drives it with systemd. Nothing needs to be preinstalled on the target but
+  SSH, sudo, and systemd; no container registry is involved. Still a
+  prototype — see the README for the remaining gaps (the plan is assembled
+  by rigx rather than by its own `flake.nix`; no sudoers scoping; services
+  run rootful).
+
+- **`RIGX_FOREGROUND=1` capsule runner mode.** Attached with no TTY —
+  neither `-d` nor `-it`. For running a capsule under a process supervisor,
+  which needs the engine to stay in the foreground so it can see the
+  container exit, but has no TTY to offer. `RIGX_DETACH` still wins if both
+  are set; unset behaves exactly as before.
+
+### Behavior changes
+
+- **Podman is now preferred over Docker when both are installed.**
+  `rigx.capsule` and the generated capsule runners try `podman` first and
+  fall back to `docker`; previously the order was reversed. Docker-only and
+  podman-only hosts are unaffected. On a host with *both*, a container
+  started under Docker by an older rigx will not be found by
+  `Capsule.stop()`, which shells out to whichever engine is selected now —
+  such containers need stopping by hand once, after upgrading.
+
+  The motivation is `rigx remote`: Podman is daemonless, so a deployment's
+  services are independent units rather than sharing a single daemon whose
+  restart takes all of them down at once. Preferring the same engine locally
+  keeps "works locally" a meaningful signal for "works deployed".
+
 ## 0.11.0 — 2026-07-25
 
 ### Behavior changes

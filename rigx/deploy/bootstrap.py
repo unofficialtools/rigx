@@ -25,7 +25,7 @@ separate, not-yet-implemented pieces (see the project design memory).
 from __future__ import annotations
 
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from urllib.parse import urlsplit
 
 # Pinned Determinate Systems Nix installer release (multi-user install,
@@ -100,6 +100,11 @@ class HostInfo:
     has_systemd: bool
     has_nix: bool
     has_container_engine: bool
+    # Non-empty when the target's container engine probably can't
+    # resolve service names on a user-defined network. A warning rather
+    # than an error: the deployment still starts, peer lookups just
+    # fail — see `check_dns_backend`.
+    dns_warning: str = ""
 
 
 # `ssh host 'command -v nix'` doesn't reliably see a freshly installed
@@ -168,10 +173,17 @@ def install_podman(target: SSHTarget) -> None:
     rootful rather than as a socket-group member; see
     `rigx.deploy.units`.
     """
+    # Debian/Ubuntu ship apt-daily timers and unattended-upgrades, which
+    # take the apt lock on their own schedule. Without a wait, a deploy
+    # that lands during one dies with "Could not get lock
+    # /var/lib/apt/lists/lock" — a transient collision presented as a
+    # deploy failure. `DPkg::Lock::Timeout` (apt 2.0+) blocks instead;
+    # older apt ignores unknown -o keys, so it is safe to pass anyway.
+    apt = "sudo DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300"
     install = " ; ".join([
         "if command -v apt-get >/dev/null 2>&1; then "
-        "sudo DEBIAN_FRONTEND=noninteractive apt-get update && "
-        "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y podman",
+        f"{apt} update && "
+        f"{apt} install -y podman",
         "elif command -v dnf >/dev/null 2>&1; then sudo dnf install -y podman",
         "elif command -v yum >/dev/null 2>&1; then sudo yum install -y podman",
         "elif command -v zypper >/dev/null 2>&1; then "
@@ -185,6 +197,42 @@ def install_podman(target: SSHTarget) -> None:
         "fi",
     ])
     run_remote(target, f"{_CONTAINER_ENGINE_CHECK} || {{ {install} ; }}")
+
+
+def check_dns_backend(target: SSHTarget) -> str:
+    """Return a warning if service-name resolution on a user-defined
+    network looks unavailable, else "".
+
+    Services address each other as `<service>:<port>`, which needs the
+    engine's DNS backend: netavark (with aardvark-dns) on modern
+    podman, or the legacy CNI `dnsname` plugin. The failure mode is the
+    reason this check exists at all — without a resolver, containers
+    start fine and joining the network succeeds; only the *lookups*
+    fail, at runtime, looking like an application bug. Better to say so
+    at deploy time.
+
+    Docker's embedded resolver is always present on user-defined
+    networks, so docker hosts return "" without a probe.
+    """
+    proc = run_remote(
+        target,
+        "command -v podman >/dev/null 2>&1 && "
+        "podman info --format '{{.Host.NetworkBackend}}' 2>/dev/null || true",
+        check=False,
+    )
+    backend = proc.stdout.strip()
+    if not backend:
+        return ""  # docker-only host, or podman too old to report — leave it
+    if backend == "netavark":
+        return ""
+    return (
+        f"{target.destination}: podman is using the {backend!r} network "
+        f"backend; service-name resolution needs netavark + aardvark-dns "
+        f"(or the CNI 'dnsname' plugin). Services will start, but peer "
+        f"lookups like 'db:5432' will fail at runtime. Install "
+        f"aardvark-dns/netavark, or publish the ports and address peers "
+        f"over the host instead."
+    )
 
 
 def ensure_rigx_user(target: SSHTarget) -> None:
@@ -230,4 +278,4 @@ def bootstrap(url: str) -> HostInfo:
                 f"no container engine is on PATH"
             )
     ensure_rigx_user(target)
-    return info
+    return replace(info, dns_warning=check_dns_backend(target))

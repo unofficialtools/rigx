@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from rigx.config import Project, Target
 from rigx.nix.capsule_common import (
+    internal_dep_paths_expr,
     capsule_image_tag,
     capsule_manifest,
     nixos_runner_script,
@@ -125,7 +126,13 @@ def mk_nixos_capsule_derivation(target: Target, project: Project) -> str:
         f"  capsuleManifest_{safe_name} = "
         f"pkgs.writeText \"manifest.json\""
     )
-    lines.append(f"    (builtins.toJSON {nix_value(manifest)});")
+    # `deps` exists so Nix records the capsule's real references —
+    # see `internal_dep_paths_expr`. Without it the entrypoint is
+    # only inside the gzipped image and the closure is a lie.
+    lines.append(
+        f"    (builtins.toJSON ({nix_value(manifest)} // "
+        f"{{ deps = {internal_dep_paths_expr(target, project)}; }}));"
+    )
 
     runner_body = nixos_runner_script(target)
     runner_escaped = runner_body.replace("${", "''${")

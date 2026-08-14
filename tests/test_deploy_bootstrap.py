@@ -150,7 +150,7 @@ class Bootstrap(unittest.TestCase):
             # The install command embeds the engine check as its own
             # guard, so match on something unique to the install body —
             # not on "podman", which the bare check also contains.
-            if "apt-get install -y podman" in cmd:
+            if "install -y podman" in cmd:
                 state["engine"] = True
                 return _completed(0)
             if cmd == bootstrap._NIX_CHECK:
@@ -195,10 +195,10 @@ class Bootstrap(unittest.TestCase):
             info = bootstrap.bootstrap("ssh://h")
 
         self.assertTrue(info.has_container_engine)
-        self.assertTrue(any("apt-get install -y podman" in c for c in calls))
+        self.assertTrue(any("install -y podman" in c for c in calls))
         # podman install happens before the user is (re-)created
         install_idx = next(
-            i for i, c in enumerate(calls) if "apt-get install -y podman" in c
+            i for i, c in enumerate(calls) if "install -y podman" in c
         )
         user_idx = next(i for i, c in enumerate(calls) if "useradd" in c or "id -u" in c)
         self.assertLess(install_idx, user_idx)
@@ -214,9 +214,17 @@ class Bootstrap(unittest.TestCase):
         with mock.patch.object(bootstrap.subprocess, "run", side_effect=fake_run):
             bootstrap.bootstrap("ssh://h")
 
-        install = next(c for c in calls if "apt-get install -y podman" in c)
+        install = next(c for c in calls if "install -y podman" in c)
         for mgr in ("apt-get", "dnf", "yum", "zypper", "pacman", "apk"):
             self.assertIn(mgr, install, f"{mgr} branch missing from podman install")
+        # apt-daily / unattended-upgrades hold the apt lock on their own
+        # schedule; without a wait, a deploy landing during one dies with
+        # "Could not get lock /var/lib/apt/lists/lock". Both apt calls
+        # have to wait, since `update` runs first and would abort the &&.
+        self.assertEqual(
+            install.count("DPkg::Lock::Timeout"), 2,
+            "both apt-get invocations must wait for the apt lock",
+        )
         # Never reinstalls over an engine the host already has.
         self.assertTrue(install.startswith(bootstrap._CONTAINER_ENGINE_CHECK))
 
@@ -231,7 +239,53 @@ class Bootstrap(unittest.TestCase):
             info = bootstrap.bootstrap("ssh://h")
 
         self.assertTrue(info.has_container_engine)
-        self.assertFalse(any("apt-get install -y podman" in c for c in calls))
+        self.assertFalse(any("install -y podman" in c for c in calls))
+
+    def test_warns_when_podman_cannot_resolve_service_names(self):
+        """Peer addressing is `<service>:<port>`, which needs
+        netavark/aardvark-dns. Without it, containers start and joining
+        the network succeeds — only lookups fail, at runtime. Hence a
+        warning at deploy time rather than silence."""
+        calls: list[str] = []
+        fake_run = self._fake_run(calls, nix_present_before_install=True)
+
+        def with_backend(argv, **kw):
+            if "NetworkBackend" in argv[-1]:
+                calls.append(argv[-1])
+                return _completed(0, stdout="cni\n")
+            return fake_run(argv, **kw)
+
+        with mock.patch.object(bootstrap.subprocess, "run", side_effect=with_backend):
+            info = bootstrap.bootstrap("ssh://h")
+
+        self.assertIn("aardvark-dns", info.dns_warning)
+        self.assertIn("cni", info.dns_warning)
+
+    def test_no_warning_on_netavark(self):
+        calls: list[str] = []
+        fake_run = self._fake_run(calls, nix_present_before_install=True)
+
+        def with_backend(argv, **kw):
+            if "NetworkBackend" in argv[-1]:
+                return _completed(0, stdout="netavark\n")
+            return fake_run(argv, **kw)
+
+        with mock.patch.object(bootstrap.subprocess, "run", side_effect=with_backend):
+            self.assertEqual(bootstrap.bootstrap("ssh://h").dns_warning, "")
+
+    def test_no_warning_on_a_docker_only_host(self):
+        # The probe is podman-specific and prints nothing under docker,
+        # whose embedded resolver is always present on user networks.
+        calls: list[str] = []
+        fake_run = self._fake_run(calls, nix_present_before_install=True)
+
+        def with_backend(argv, **kw):
+            if "NetworkBackend" in argv[-1]:
+                return _completed(0, stdout="")
+            return fake_run(argv, **kw)
+
+        with mock.patch.object(bootstrap.subprocess, "run", side_effect=with_backend):
+            self.assertEqual(bootstrap.bootstrap("ssh://h").dns_warning, "")
 
     def test_raises_when_systemd_missing(self):
         def fake_run(argv, **kw):

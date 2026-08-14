@@ -255,6 +255,35 @@ class CapsuleNixGen(unittest.TestCase):
     """
     _FILES = {"src/svc.go": "package main\nfunc main(){}\n"}
 
+    def test_manifest_names_internal_deps_so_nix_records_references(self):
+        """Regression: the entrypoint is baked into the OCI image's Cmd,
+        and the image ships gzipped — so Nix's reference scanner cannot
+        see it and the capsule recorded no dependency on the program it
+        runs. `nix copy` then shipped a capsule whose entrypoint was
+        missing on the target (container exits 127), and locally GC was
+        free to delete the entrypoint out from under a live capsule."""
+        with TempProject(self._BODY, self._FILES) as root:
+            proj = config.load(root)
+            flake = nix_gen.generate(proj)
+        # Bare ${svc_bin}, so Nix substitutes the store path at eval time
+        # and the resulting plaintext in $out is scannable.
+        self.assertIn('deps = [ "${svc_bin}" ]', flake)
+
+    def test_capsule_without_internal_deps_emits_an_empty_dep_list(self):
+        body = """
+            [project]
+            name = "p"
+
+            [targets.svc]
+            kind         = "capsule"
+            backend      = "lite"
+            deps.nixpkgs = ["coreutils"]
+            entrypoint   = "/bin/true"
+        """
+        with TempProject(body, {}) as root:
+            flake = nix_gen.generate(config.load(root))
+        self.assertIn("deps = [ ]", flake)
+
     def test_emits_from_scratch_image_with_nix_conf(self):
         with TempProject(self._BODY, self._FILES) as root:
             proj = config.load(root)

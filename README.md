@@ -1761,6 +1761,7 @@ The runner inherits a few env knobs that orchestrators set:
 | `RIGX_DETACH`       | `1` = `run -d`, returning once the container is spawned (default: interactive) |
 | `RIGX_FOREGROUND`   | `1` = attached with no TTY — neither `-d` nor `-it`. For running under a process supervisor: the engine stays in the foreground so the supervisor sees the container exit, but no TTY is requested because there isn't one. Ignored if `RIGX_DETACH` is also set. This is what `rigx remote deploy` sets in its systemd units. |
 | `RIGX_NETWORK`      | join an existing container network               |
+| `RIGX_NETWORK_ALIAS`| extra name the container answers to on `RIGX_NETWORK` (`--network-alias`), so peers can use a short stable name instead of the unique container name in `RIGX_NAME`. Ignored without `RIGX_NETWORK`. |
 | `RIGX_PUBLISH`      | `host:cont,host:cont,…` port forwards            |
 | `RIGX_ENV`          | `K=V,K=V,…` extra env vars                       |
 | `RIGX_VOLUMES`      | `host:cont[:mode],…` extra bind-mounts (`mode`: `rw` / `ro`, default `rw`). Relative `host` paths resolve against `RIGX_PROJECT_ROOT`. Appended to any `volumes` declared in `rigx.toml`. |
@@ -2369,7 +2370,13 @@ data = "/var/lib/postgresql/data"
 capsule    = "web_capsule"
 depends_on = ["db"]            # start order, health gate, restart propagation
 restart    = "always"
+# Publishing to the *host* is separate from peer reachability. `db`
+# below declares no ports at all and is still reachable at `db:5432`.
 ports      = [{ host = 8080, container = 8080 }]
+
+# Extra env for this service, layered over the capsule's own `env`.
+[targets.myapp.services.web.env]
+LOG_LEVEL = "info"
 
 [targets.myapp.services.web.secrets]
 api_key = "/run/secrets/api_key"   # path exposed inside the capsule
@@ -2406,6 +2413,55 @@ One command:
    moving on. The deployment only counts as "live" once every changed
    service has passed its gate; a failure rolls back whatever this run
    touched automatically.
+
+#### Networking — peers, and what `ports` actually means
+
+Every service in a testbed joins one implicit network, `rigx-<testbed>`,
+created by `bin/activate` on first deploy, and answers on it to its own
+service name. So peers address each other directly:
+
+```toml
+[targets.myapp.services.db]
+capsule = "db_capsule"        # no `ports` — invisible from the host
+
+[targets.myapp.services.web]
+capsule    = "web_capsule"
+depends_on = ["db"]
+ports      = [{ host = 8080, container = 8080 }]
+```
+
+`web` reaches the database at **`db:5432`** — the name from the service
+key, the port from `db_capsule`'s own `ports` declaration. There is no
+`networks` table and no `network` field, because there is nothing left
+to say: membership is every service in the testbed, and the address is
+built from names that already exist.
+
+This changes what `ports` on a service means. It is *only* about the
+host — peers never need it. A service with no `ports` is reachable by
+its peers and unreachable from outside, which is compose's `expose:`
+with nothing to declare. Publishing is an explicit act.
+
+A bind address narrows it further:
+
+```toml
+ports = [{ host = "127.0.0.1:8000", container = 8000 }]   # or "[::1]:8000"
+```
+
+The canonical use is a health endpoint. `activate`'s gate probes over
+host loopback, so binding the port to `127.0.0.1` keeps the probe
+working while leaving the service unreachable from the network — no
+need to expose it publicly, and no need to put `curl` inside the
+capsule.
+
+`container` is checked against the capsule's declared `ports` at config
+load, so publishing a port the capsule never listens on fails
+immediately instead of deploying cleanly and dying at runtime.
+
+> **Name resolution needs the engine's DNS backend** — netavark with
+> aardvark-dns on podman (standard on current distros), or docker's
+> embedded resolver. When it's missing the failure is silent: containers
+> start, joining the network succeeds, and only the lookups fail. `rigx
+> remote deploy` probes for it during bootstrap and warns.
 
 #### What supervision you actually get
 

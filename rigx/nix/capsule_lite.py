@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from rigx.config import Project, Target
 from rigx.nix.capsule_common import (
+    internal_dep_paths_expr,
     PLACEHOLDER_BASH_BIN,
     PLACEHOLDER_PATH,
     capsule_image_tag,
@@ -100,7 +101,13 @@ def mk_lite_capsule_derivation(target: Target, project: Project) -> str:
     lines.append(
         f"  capsuleManifest_{safe_name} = pkgs.writeText \"manifest.json\""
     )
-    lines.append(f"    (builtins.toJSON {nix_value(manifest)});")
+    # `deps` exists so Nix records the capsule's real references —
+    # see `internal_dep_paths_expr`. Without it the entrypoint is
+    # only inside the gzipped image and the closure is a lie.
+    lines.append(
+        f"    (builtins.toJSON ({nix_value(manifest)} // "
+        f"{{ deps = {internal_dep_paths_expr(target, project)}; }}));"
+    )
 
     def _bake_runner(body: str) -> str:
         body = body.replace("${", "''${")

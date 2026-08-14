@@ -36,6 +36,22 @@ echo "$*" >> "$SYSTEMCTL_LOG"
 exit 0
 """
 
+# Container engine stand-in. `network inspect` succeeds only once the
+# network has been "created", so activate's idempotence guard is
+# exercised for real rather than assumed.
+_FAKE_ENGINE = """
+echo "$*" >> "$ENGINE_LOG"
+if [ "${1:-}" = network ]; then
+  case "${2:-}" in
+    inspect) [ -e "$ENGINE_STATE/net-${3:-}" ] ;;
+    create)  touch "$ENGINE_STATE/net-${3:-}" ;;
+    *) exit 0 ;;
+  esac
+  exit $?
+fi
+exit 0
+"""
+
 # Minimal `nix-env --profile P --set T` / `--profile P --rollback`
 # simulation: a `<profile>.history` file tracks every `--set` target in
 # order; `--set` appends + symlinks; `--rollback` pops the last entry
@@ -119,8 +135,12 @@ class ActivateHarness(unittest.TestCase):
         self.bindir.mkdir()
         _write_fake_bin(self.bindir, "systemctl", _FAKE_SYSTEMCTL)
         _write_fake_bin(self.bindir, "nix-env", _FAKE_NIX_ENV)
+        _write_fake_bin(self.bindir, "podman", _FAKE_ENGINE)
         self.systemctl_log = self.root / "systemctl.log"
         self.nixenv_log = self.root / "nixenv.log"
+        self.engine_log = self.root / "engine.log"
+        self.engine_state = self.root / "engine-state"
+        self.engine_state.mkdir()
 
     def addCleanup_(self):
         self._tmp.cleanup()
@@ -137,6 +157,8 @@ class ActivateHarness(unittest.TestCase):
         env["RIGX_PROFILE_DIR"] = str(self.profile_dir)
         env["SYSTEMCTL_LOG"] = str(self.systemctl_log)
         env["NIXENV_LOG"] = str(self.nixenv_log)
+        env["ENGINE_LOG"] = str(self.engine_log)
+        env["ENGINE_STATE"] = str(self.engine_state)
         if extra_env:
             env.update(extra_env)
         return subprocess.run(
@@ -147,6 +169,11 @@ class ActivateHarness(unittest.TestCase):
         if not self.systemctl_log.exists():
             return []
         return self.systemctl_log.read_text().splitlines()
+
+    def engine_calls(self) -> list[str]:
+        if not self.engine_log.exists():
+            return []
+        return self.engine_log.read_text().splitlines()
 
     def profile_target(self, testbed: str) -> str | None:
         link = self.profile_dir / f"rigx-{testbed}"
@@ -313,6 +340,71 @@ class Rollback(ActivateHarness):
         # live unit back to plan1's copy
         web_link = self.systemd_dir / "rigx-app-web.service"
         self.assertEqual(web_link.resolve(), (plan1 / "units" / "rigx-app-web.service").resolve())
+
+
+class NetworkCreation(ActivateHarness):
+    """The shared network has to exist before anything that joins it
+    starts, and re-deploying must not try to recreate it."""
+
+    def _manifest(self):
+        return {
+            "testbed": "app", "network": "rigx-app",
+            "start_order": ["web"],
+            "services": {"web": _service()},
+            "volumes": [], "secrets": [],
+        }
+
+    def test_creates_the_network_before_starting_services(self):
+        plan = _plan_dir(self.root, "plan1", self._manifest())
+        r = self.run_script(plan / "bin" / "activate")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("network create rigx-app", self.engine_calls())
+        # Ordering matters: a unit that joins a missing network fails.
+        self.assertTrue(
+            (self.engine_state / "net-rigx-app").exists(),
+        )
+        self.assertTrue(
+            any("restart rigx-app-web.service" in c for c in self.systemctl_calls())
+        )
+
+    def test_redeploy_does_not_recreate_an_existing_network(self):
+        m = self._manifest()
+        r1 = self.run_script(_plan_dir(self.root, "plan1", m) / "bin" / "activate")
+        self.assertEqual(r1.returncode, 0, r1.stderr)
+        self.engine_log.unlink()
+
+        r2 = self.run_script(
+            _plan_dir(self.root, "plan2", m, previous=m) / "bin" / "activate"
+        )
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+        calls = self.engine_calls()
+        self.assertIn("network inspect rigx-app", calls)
+        self.assertNotIn("network create rigx-app", calls)
+
+    def test_manifest_without_a_network_touches_no_engine(self):
+        m = self._manifest()
+        del m["network"]
+        r = self.run_script(_plan_dir(self.root, "plan1", m) / "bin" / "activate")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.engine_calls(), [])
+
+    def test_fails_clearly_when_no_engine_is_installed(self):
+        (self.bindir / "podman").unlink()
+        plan = _plan_dir(self.root, "plan1", self._manifest())
+        # PATH is scrubbed to the fake bin dir so no real engine on the
+        # test host is found. activate still runs `mkdir` before it gets
+        # to the engine check (state dirs, HOME), so that has to remain
+        # reachable or the script dies at 127 instead of the exit 1 this
+        # is checking for.
+        for tool in ("mkdir", "readlink"):
+            real = shutil.which(tool)
+            if real:
+                (self.bindir / tool).symlink_to(real)
+        r = self.run_script(
+            plan / "bin" / "activate", extra_env={"PATH": str(self.bindir)},
+        )
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("podman or docker", r.stderr)
 
 
 class HealthUnitLifecycle(ActivateHarness):

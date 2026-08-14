@@ -103,6 +103,7 @@ class CompileManifest(unittest.TestCase):
             tb, {"db_capsule": "/nix/store/aaa-db", "web_capsule": "/nix/store/bbb-web"},
         )
         self.assertEqual(manifest["testbed"], "app")
+        self.assertEqual(manifest["network"], "rigx-app")
         self.assertEqual(manifest["start_order"], ["db", "web"])
         self.assertEqual(manifest["volumes"], ["data"])
         self.assertEqual(manifest["secrets"], ["api_key"])
@@ -116,7 +117,11 @@ class CompileManifest(unittest.TestCase):
         self.assertEqual(web["capsule_path"], "/nix/store/bbb-web")
         self.assertEqual(web["depends_on"], ["db"])
         self.assertEqual(web["restart"], "on-failure")
-        self.assertEqual(web["ports"], [{"host": 8080, "container": 8080}])
+        self.assertEqual(web["ports"], [{
+            "host": 8080, "container": 8080,
+            "host_addr": "", "publish": "8080:8080",
+        }])
+        self.assertEqual(web["env"], {})
         self.assertEqual(web["secrets"], {"api_key": "/run/secrets/api_key"})
         self.assertEqual(web["healthcheck"], {
             "command": "curl -f http://127.0.0.1:8080/healthz",

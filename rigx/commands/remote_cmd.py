@@ -104,6 +104,11 @@ def cmd_remote_deploy(args: argparse.Namespace) -> int:
             f"[rigx remote deploy] bootstrap ok: {info.os_name}/{info.arch}, "
             f"nix={'present' if info.has_nix else 'missing'}"
         )
+        if info.dns_warning:
+            # Not fatal: the deployment works, only peer name lookups
+            # break — and they break silently, which is why this is
+            # said out loud rather than left to be discovered.
+            print(f"rigx remote deploy: warning: {info.dns_warning}", file=sys.stderr)
 
         ssh_target = bootstrap.parse_ssh_url(ssh_url)
         previous_manifest = _fetch_previous_manifest(ssh_target, testbed.name)

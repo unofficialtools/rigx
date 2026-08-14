@@ -1,6 +1,6 @@
 [project]
 name = "rigx"
-version = "0.11.0"
+version = "0.12.0"
 
 # Make rigx installable straight from this repo's flake:
 #   nix profile install github:unofficialtools/rigx/stable
@@ -136,6 +136,86 @@ deps.nixpkgs = ["uv"]
 script = """
 rm -rf dist
 uv build --sdist --wheel
+"""
+
+# `rigx run local-install` — put THIS working tree's rigx on your PATH,
+# replacing whatever the nix profile currently has. Nothing is published
+# and nothing is tagged; it installs from the local flake.
+#
+# Use it when you want the in-development rigx to be the `rigx` command
+# everywhere. For a one-off instead, don't install at all:
+#
+#   nix run /path/to/rigx#rigx -- <args>      # single command
+#   nix shell /path/to/rigx#rigx              # this shell only
+#
+# `nix` is deliberately NOT in deps.nixpkgs. `nix shell` prepends its
+# packages to PATH, so pinning nix here would run nixpkgs-24.11's nix
+# (~2.24) against a profile the host's nix (2.34) wrote — a version skew
+# with no upside, since the whole point is to mutate the host's profile.
+[targets.local-install]
+kind = "script"
+deps.nixpkgs = ["git", "gnused", "coreutils"]
+script = """
+set -euo pipefail
+
+# Nix builds from the git tree, so untracked files are invisible to it —
+# a new module you forgot to `git add` would silently not be installed,
+# and you'd debug against stale code. Scoped to the source directories so
+# scratch files elsewhere don't block anything.
+UNTRACKED=$(git ls-files --others --exclude-standard -- rigx tests)
+if [ -n "$UNTRACKED" ]; then
+  echo "local-install: untracked files under rigx/ or tests/:" >&2
+  echo "$UNTRACKED" | sed 's/^/  /' >&2
+  echo "these would NOT be installed — 'git add' them, or set" >&2
+  echo "RIGX_ALLOW_UNTRACKED=1 to install without them." >&2
+  [ -n "${RIGX_ALLOW_UNTRACKED:-}" ] || exit 1
+fi
+
+VERSION=$(sed -nE 's/^version = "(.*)"$/\\1/p' pyproject.toml | head -1)
+if [ -z "$VERSION" ]; then
+  echo "local-install: could not read version from pyproject.toml" >&2
+  exit 1
+fi
+
+if ! git diff --quiet || ! git diff --cached --quiet; then
+  echo "[local-install] working tree is dirty — uncommitted changes are included"
+fi
+echo "[local-install] installing rigx $VERSION from $PWD"
+
+# Replace the existing entry rather than upgrade it: `nix profile upgrade`
+# re-resolves the flake ref and won't reliably pick up a dirty tree, which
+# is exactly what this target exists to install. `remove` errors when
+# there's nothing to remove, which is the normal first-install case.
+nix profile remove rigx >/dev/null 2>&1 || true
+nix profile install .#rigx
+
+# Verify the profile's own binary rather than whatever PATH resolves to.
+# This script runs *under* rigx, so the pre-install build is still on this
+# process's PATH — `command -v rigx` here reports the binary being
+# replaced, not the replacement, and would report success even if the
+# install silently did nothing.
+PROFILE_BIN="$HOME/.nix-profile/bin/rigx"
+if [ ! -x "$PROFILE_BIN" ]; then
+  PROFILE_BIN="${XDG_STATE_HOME:-$HOME/.local/state}/nix/profile/bin/rigx"
+fi
+if [ ! -x "$PROFILE_BIN" ]; then
+  echo "local-install: install reported success but no rigx is in your" >&2
+  echo "  nix profile — check 'nix profile list'" >&2
+  exit 1
+fi
+
+INSTALLED=$("$PROFILE_BIN" -V 2>/dev/null | sed 's/^rigx //' || echo "")
+if [ "$INSTALLED" != "$VERSION" ]; then
+  echo "local-install: profile has rigx '${INSTALLED:-nothing}', expected $VERSION" >&2
+  exit 1
+fi
+
+# Version alone can't prove the swap happened — the old build is usually
+# the same version. Print the store path so it's visible that it moved.
+echo "[local-install] ok: rigx $INSTALLED"
+echo "[local-install]   $PROFILE_BIN"
+echo "[local-install]   -> $(readlink -f "$PROFILE_BIN")"
+echo "[local-install] run 'hash -r' (or open a new shell) to pick it up"
 """
 
 # `rigx run nixpkgs-stage` — generate a nixpkgs-style package.nix into

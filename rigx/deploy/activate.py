@@ -37,6 +37,27 @@ from rigx.deploy import units
 
 _SH_HEADER = "#!/bin/sh\nset -eu\n"
 
+# `sudo` resets PATH to sudoers' `secure_path`, which does not include
+# /nix/var/nix/profiles/default/bin — where a multi-user Nix install puts
+# nix-env. So `sudo <plan>/bin/activate` runs with nix-env unreachable,
+# and the script dies on its very last line, after the services are
+# already up: the deployment works but never records itself.
+# `rigx.deploy.bootstrap._NIX_CHECK` makes the same allowance for `nix`.
+_RESOLVE_NIX_ENV = [
+    ': "${RIGX_NIX_ENV:=}"',
+    'if [ -z "$RIGX_NIX_ENV" ]; then',
+    "  if command -v nix-env >/dev/null 2>&1; then",
+    "    RIGX_NIX_ENV=nix-env",
+    "  elif [ -x /nix/var/nix/profiles/default/bin/nix-env ]; then",
+    "    RIGX_NIX_ENV=/nix/var/nix/profiles/default/bin/nix-env",
+    "  else",
+    '    echo "rigx: nix-env not found (looked on PATH and in'
+    ' /nix/var/nix/profiles/default/bin)" >&2',
+    "    exit 1",
+    "  fi",
+    "fi",
+]
+
 
 def _quote(s: str) -> str:
     return "'" + s.replace("'", "'\\''") + "'"
@@ -53,9 +74,11 @@ def render_activate(manifest: dict, previous_manifest: dict | None = None) -> st
     lines.append(': "${RIGX_SYSTEMD_DIR:=/etc/systemd/system}"')
     lines.append(': "${RIGX_STATE_ROOT:=/var/lib/rigx}"')
     lines.append(': "${RIGX_PROFILE_DIR:=/nix/var/nix/profiles}"')
+    # `RIGX_ENGINE` overrides container-engine detection (below).
     lines.append(f'PROFILE="$RIGX_PROFILE_DIR/rigx-{testbed}"')
     lines.append('SELF="$(cd "$(dirname "$0")/.." && pwd)"')
     lines.append('PREV="$(readlink -f "$PROFILE" 2>/dev/null || true)"')
+    lines.extend(_RESOLVE_NIX_ENV)
     lines.append("")
     # Reverts just the services this run has already restarted, back
     # to whatever the previous generation had (or removes them, if
@@ -97,7 +120,37 @@ def render_activate(manifest: dict, previous_manifest: dict | None = None) -> st
         lines.append(f'mkdir -p "$RIGX_STATE_ROOT/{testbed}/volumes/{vol}"')
     if manifest["secrets"]:
         lines.append(f'mkdir -p "$RIGX_STATE_ROOT/{testbed}/secrets"')
+    # HOME for the service units — systemd provides none for system
+    # services, and the lite capsule runner needs somewhere writable for
+    # its per-container Nix profile/gcroot dirs.
+    lines.append(f'mkdir -p "$RIGX_STATE_ROOT/{testbed}/home"')
     lines.append("")
+
+    # The shared per-testbed network, created before any unit that
+    # joins it starts. Idempotent via `network inspect`, which both
+    # engines have (podman also has `network exists`; docker doesn't).
+    #
+    # The engine is detected here rather than taken from the plan: the
+    # runner picks it at run time on the target, so the plan can't know
+    # it at build time. Same two-line probe the runners use — see
+    # `rigx.nix.capsule_common`.
+    network = manifest.get("network")
+    if network:
+        lines.append(': "${RIGX_ENGINE:=}"')
+        lines.append('if [ -z "$RIGX_ENGINE" ]; then')
+        lines.append("  if command -v podman >/dev/null 2>&1; then RIGX_ENGINE=podman")
+        lines.append("  elif command -v docker >/dev/null 2>&1; then RIGX_ENGINE=docker")
+        lines.append("  else")
+        lines.append(
+            '    echo "rigx: podman or docker is required on PATH" >&2; exit 1'
+        )
+        lines.append("  fi")
+        lines.append("fi")
+        lines.append(
+            f'"$RIGX_ENGINE" network inspect {_quote(network)} >/dev/null 2>&1 || '
+            f'"$RIGX_ENGINE" network create {_quote(network)}'
+        )
+        lines.append("")
 
     # Services present in the previous generation but gone from this
     # one: stop, disable, and remove their unit — computed here at
@@ -205,7 +258,7 @@ def render_activate(manifest: dict, previous_manifest: dict | None = None) -> st
 
     # Last line, only reached if every gate above passed: advance the
     # profile pointer to this generation.
-    lines.append('nix-env --profile "$PROFILE" --set "$SELF"')
+    lines.append('"$RIGX_NIX_ENV" --profile "$PROFILE" --set "$SELF"')
     lines.append("")
     return "\n".join(lines)
 
@@ -221,7 +274,8 @@ def render_rollback(manifest: dict) -> str:
         + "\n"
         + ': "${RIGX_PROFILE_DIR:=/nix/var/nix/profiles}"\n'
         + f'PROFILE="$RIGX_PROFILE_DIR/rigx-{testbed}"\n'
-        + 'nix-env --profile "$PROFILE" --rollback\n'
+        + "\n".join(_RESOLVE_NIX_ENV) + "\n"
+        + '"$RIGX_NIX_ENV" --profile "$PROFILE" --rollback\n'
         + 'NEW_SELF="$(readlink -f "$PROFILE")"\n'
         + 'exec "$NEW_SELF/bin/activate"\n'
     )

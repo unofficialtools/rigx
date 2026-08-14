@@ -339,5 +339,204 @@ class SecretSourceValidation(unittest.TestCase):
         self.assertIn("'env:' or 'file:'", str(cm.exception))
 
 
+_PORTED_CAPSULE = """
+    [targets.web_capsule]
+    kind       = "capsule"
+    backend    = "lite"
+    entrypoint = "/bin/true"
+    ports      = [8000, 9000]
+"""
+
+
+def _with_service(capsule_block: str, service_body: str) -> str:
+    return f"""
+    [project]
+    name = "p"
+    {capsule_block}
+    [targets.app]
+    kind = "testbed"
+
+    [targets.app.services.web]
+    capsule = "web_capsule"
+    {service_body}
+    """
+
+
+class PortBindAddress(unittest.TestCase):
+    """`host` may name an interface, so a port can be reachable from the
+    host without being reachable from the world."""
+
+    def _port(self, host_value: str):
+        with TempProject(
+            _with_service(_PORTED_CAPSULE, f"ports = [{{ host = {host_value}, container = 8000 }}]")
+        ) as root:
+            return config.load(root).targets["app"].services["web"].ports[0]
+
+    def test_bare_integer_binds_everywhere(self):
+        p = self._port("8000")
+        self.assertEqual((p.host, p.container, p.host_addr), (8000, 8000, ""))
+        self.assertEqual(p.publish_spec(), "8000:8000")
+
+    def test_loopback_string_is_split(self):
+        p = self._port('"127.0.0.1:8000"')
+        self.assertEqual((p.host, p.container, p.host_addr), (8000, 8000, "127.0.0.1"))
+        self.assertEqual(p.publish_spec(), "127.0.0.1:8000:8000")
+
+    def test_ipv6_literal_keeps_its_brackets(self):
+        p = self._port('"[::1]:8000"')
+        self.assertEqual(p.host_addr, "[::1]")
+        self.assertEqual(p.publish_spec(), "[::1]:8000:8000")
+
+    def test_hostname_bind_address(self):
+        p = self._port('"localhost:8000"')
+        self.assertEqual(p.host_addr, "localhost")
+
+    def test_rejects_string_without_a_port(self):
+        with self.assertRaises(ConfigError) as cm:
+            self._port('"127.0.0.1"')
+        self.assertIn("addr:port", str(cm.exception))
+
+    def test_rejects_non_integer_port(self):
+        with self.assertRaises(ConfigError):
+            self._port('"127.0.0.1:http"')
+
+    def test_rejects_garbage_bind_address(self):
+        with self.assertRaises(ConfigError):
+            self._port('"not a host:8000"')
+
+    def test_rejects_missing_host(self):
+        with TempProject(
+            _with_service(_PORTED_CAPSULE, "ports = [{ container = 8000 }]")
+        ) as root:
+            with self.assertRaises(ConfigError) as cm:
+                config.load(root)
+            self.assertIn("'host' is required", str(cm.exception))
+
+
+class ServiceEnv(unittest.TestCase):
+    """Per-service env, layered over the capsule's own — so one capsule
+    can back services that differ only in configuration."""
+
+    def _env(self, body: str):
+        with TempProject(_with_service(_CAPSULE, body)) as root:
+            return config.load(root).targets["app"].services["web"].env
+
+    def test_absent_env_is_empty(self):
+        self.assertEqual(self._env(""), {})
+
+    def test_parses_string_table(self):
+        self.assertEqual(
+            self._env('env = { HOSTNAME = "example.com", LOG_LEVEL = "info" }'),
+            {"HOSTNAME": "example.com", "LOG_LEVEL": "info"},
+        )
+
+    def test_rejects_unquoted_numbers(self):
+        # Same rule as capsule env: a bare 8080 fails loudly instead of
+        # silently becoming something else.
+        with self.assertRaises(ConfigError) as cm:
+            self._env("env = { PORT = 8080 }")
+        self.assertIn("string", str(cm.exception))
+
+    def test_rejects_invalid_env_var_name(self):
+        with self.assertRaises(ConfigError) as cm:
+            self._env('env = { "2BAD" = "x" }')
+        self.assertIn("2BAD", str(cm.exception))
+
+
+class ServiceArtifacts(unittest.TestCase):
+    """`artifacts` mounts a rigx-built target read-only into a service."""
+
+    CONTENT = """
+    [targets.site]
+    kind = "custom"
+    install_script = "mkdir -p $out"
+    """
+
+    def _load(self, service_body: str, extra: str = ""):
+        with TempProject(
+            _with_service(_CAPSULE + self.CONTENT + extra, service_body)
+        ) as root:
+            return config.load(root).targets["app"].services["web"]
+
+    def test_parses_target_to_mount_path(self):
+        svc = self._load('artifacts = { site = "/usr/share/www" }')
+        self.assertEqual(svc.artifacts, {"site": "/usr/share/www"})
+
+    def test_rejects_relative_mount_path(self):
+        with self.assertRaises(ConfigError) as cm:
+            self._load('artifacts = { site = "usr/share/www" }')
+        self.assertIn("absolute", str(cm.exception))
+
+    def test_rejects_unknown_target(self):
+        with self.assertRaises(ConfigError) as cm:
+            self._load('artifacts = { nope = "/srv" }')
+        self.assertIn("not a defined target", str(cm.exception))
+
+    def test_rejects_a_target_that_produces_no_output(self):
+        extra = """
+    [targets.scenario]
+    kind   = "script"
+    script = "x.py"
+    """
+        with self.assertRaises(ConfigError) as cm:
+            self._load('artifacts = { scenario = "/srv" }', extra=extra)
+        self.assertIn("produces no output", str(cm.exception))
+
+    def test_rejects_artifact_and_volume_at_the_same_path(self):
+        # A volume may sit *under* an artifact; on top, whichever mounts
+        # last silently wins and the state may be the loser.
+        body = (
+            'artifacts = { site = "/srv/data" }\n'
+            '    volumes = { state = "/srv/data" }'
+        )
+        toml = _with_service(_CAPSULE + self.CONTENT, body).replace(
+            "[targets.app]\n    kind = \"testbed\"",
+            "[targets.app]\n    kind = \"testbed\"\n\n    [targets.app.volumes.state]",
+        )
+        with TempProject(toml) as root:
+            with self.assertRaises(ConfigError) as cm:
+                config.load(root)
+            self.assertIn("both mount at", str(cm.exception))
+
+
+class ServicePortsMatchCapsule(unittest.TestCase):
+    """A published container port has to be one the capsule declares —
+    otherwise the typo deploys cleanly and dies at runtime."""
+
+    def test_accepts_a_declared_port(self):
+        with TempProject(
+            _with_service(
+                _PORTED_CAPSULE, "ports = [{ host = 80, container = 8000 }]",
+            )
+        ) as root:
+            self.assertEqual(
+                config.load(root).targets["app"].services["web"].ports[0].container,
+                8000,
+            )
+
+    def test_rejects_an_undeclared_port(self):
+        with TempProject(
+            _with_service(
+                _PORTED_CAPSULE, "ports = [{ host = 80, container = 8080 }]",
+            )
+        ) as root:
+            with self.assertRaises(ConfigError) as cm:
+                config.load(root)
+            msg = str(cm.exception)
+            self.assertIn("8080", msg)
+            self.assertIn("[8000, 9000]", msg)
+
+    def test_capsule_declaring_no_ports_is_exempt(self):
+        # `ports` is optional on a capsule; absence means unspecified,
+        # not "none", so there's nothing to check against.
+        with TempProject(
+            _with_service(_CAPSULE, "ports = [{ host = 80, container = 8080 }]")
+        ) as root:
+            self.assertEqual(
+                config.load(root).targets["app"].services["web"].ports[0].container,
+                8080,
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -27,6 +27,20 @@ class PlanError(RuntimeError):
     cycles, missing capsule store paths, etc.)."""
 
 
+def network_name(testbed: str) -> str:
+    """The container network every service in `testbed` joins.
+
+    Implicit and unconfigurable on purpose. A flat per-testbed network
+    needs no topology from the user — membership is "every service",
+    and a peer's address is `<service>:<port>` where the port comes
+    from the capsule's own `ports` declaration. That leaves nothing to
+    declare, so there is no `networks` table and no `network` field:
+    the same information that already describes the services describes
+    the network.
+    """
+    return f"rigx-{testbed}"
+
+
 def dependency_order(testbed: Target) -> list[str]:
     """Topologically sort `testbed.services` by `depends_on`.
 
@@ -59,10 +73,34 @@ def dependency_order(testbed: Target) -> list[str]:
     return order
 
 
+def _resolve_artifacts(
+    sname: str, svc, artifact_paths: dict[str, str],
+) -> list[dict]:
+    """Turn a service's `artifacts` table into resolved store-path mounts.
+
+    Sorted by target name so the manifest is stable; `units` re-sorts by
+    mount depth when it renders, since that is what mount ordering needs.
+    """
+    out = []
+    for aname in sorted(svc.artifacts):
+        if aname not in artifact_paths:
+            raise PlanError(
+                f"service {sname!r}: no resolved store path for artifact "
+                f"{aname!r} (build it before compiling the plan)"
+            )
+        out.append({
+            "target": aname,
+            "store_path": artifact_paths[aname],
+            "mount": svc.artifacts[aname],
+        })
+    return out
+
+
 def compile_manifest(
     testbed: Target,
     capsule_paths: dict[str, str],
     capsule_backends: dict[str, str] | None = None,
+    artifact_paths: dict[str, str] | None = None,
 ) -> dict:
     """Compile `testbed` into the manifest dict that becomes
     `manifest.json` in the deployment plan.
@@ -78,6 +116,7 @@ def compile_manifest(
     ("") per capsule so existing callers that don't care still work.
     """
     capsule_backends = capsule_backends or {}
+    artifact_paths = artifact_paths or {}
     if testbed.kind != "testbed":
         raise PlanError(f"{testbed.name!r} is kind={testbed.kind!r}, not 'testbed'")
     if not testbed.services:
@@ -103,10 +142,18 @@ def compile_manifest(
             "depends_on": list(svc.depends_on),
             "restart": svc.restart,
             "ports": [
-                {"host": p.host, "container": p.container} for p in svc.ports
+                {
+                    "host": p.host,
+                    "container": p.container,
+                    "host_addr": p.host_addr,
+                    "publish": p.publish_spec(),
+                }
+                for p in svc.ports
             ],
             "volumes": dict(svc.volumes),
+            "artifacts": _resolve_artifacts(sname, svc, artifact_paths),
             "secrets": dict(svc.secrets),
+            "env": dict(svc.env),
             "healthcheck": (
                 {
                     "command": svc.healthcheck.command,
@@ -120,6 +167,7 @@ def compile_manifest(
 
     return {
         "testbed": testbed.name,
+        "network": network_name(testbed.name),
         "start_order": order,
         "services": services,
         "volumes": sorted(testbed.testbed_volumes),

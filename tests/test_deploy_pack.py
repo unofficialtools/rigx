@@ -136,6 +136,26 @@ class NixStoreSteps(unittest.TestCase):
         self.assertIn("ssh://rigx@example.com", argv)
         self.assertIn("/nix/store/abc-plan", argv)
 
+    def test_copy_to_target_includes_extra_paths(self):
+        """Regression: `nix store add` records NO references, so the
+        plan's closure is the plan alone. Copying it without the
+        capsules ships units whose ExecStart points at paths the target
+        doesn't have — systemd 203/EXEC, after a successful-looking
+        transfer."""
+        target = SSHTarget(host="h")
+        with mock.patch.object(
+            pack.subprocess, "run", return_value=_completed(0),
+        ) as fake_run:
+            pack.copy_to_target(
+                "/nix/store/abc-plan", target,
+                ["/nix/store/cap-web", "/nix/store/art-site"],
+            )
+        argv = fake_run.call_args[0][0]
+        for path in (
+            "/nix/store/abc-plan", "/nix/store/cap-web", "/nix/store/art-site",
+        ):
+            self.assertIn(path, argv)
+
     def test_copy_to_target_raises_on_failure(self):
         target = SSHTarget(host="h")
         with mock.patch.object(
@@ -167,8 +187,37 @@ class BuildAndPushPlan(unittest.TestCase):
         fake_resolve.assert_called_once()
         fake_backends.assert_called_once()
         fake_add.assert_called_once()
-        fake_copy.assert_called_once_with("/nix/store/plan", target)
+        # The capsule path must be handed to nix copy explicitly — the
+        # plan doesn't reference it, whatever its unit files say.
+        fake_copy.assert_called_once_with(
+            "/nix/store/plan", target, ["/nix/store/cap"],
+        )
         self.assertEqual(result, "/nix/store/plan")
+
+    def test_artifacts_are_copied_too(self):
+        testbed = Target(name="app", kind="testbed", services={
+            "web": TestbedService(
+                name="web", capsule="web_capsule",
+                artifacts={"site": "/srv/site"},
+            ),
+        })
+        target = SSHTarget(host="h")
+
+        with mock.patch.object(
+            pack, "resolve_capsule_paths", return_value={"web_capsule": "/nix/store/cap"},
+        ), mock.patch.object(
+            pack, "resolve_capsule_backends", return_value={"web_capsule": "lite"},
+        ), mock.patch.object(
+            pack, "resolve_artifact_paths", return_value={"site": "/nix/store/site"},
+        ), mock.patch.object(
+            pack, "add_to_local_store", return_value="/nix/store/plan",
+        ), mock.patch.object(
+            pack, "copy_to_target",
+        ) as fake_copy:
+            pack.build_and_push_plan(object(), testbed, target)
+
+        _, _, extra = fake_copy.call_args[0]
+        self.assertEqual(sorted(extra), ["/nix/store/cap", "/nix/store/site"])
 
 
 if __name__ == "__main__":

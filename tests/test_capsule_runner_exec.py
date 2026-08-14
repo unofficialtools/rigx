@@ -79,6 +79,7 @@ printf '%s' {name} > "$ENGINE_USED"
 cmd="${{1:-}}"; shift || true
 case "$cmd" in
     load) cat > /dev/null ;;
+    rm)   printf '%s\\n' "$@" >> "$ENGINE_RM" ;;
     run)  printf '%s\\n' "$@" > "$ENGINE_DUMP" ;;
 esac
 exit 0
@@ -111,6 +112,7 @@ class RunnerExecBase(unittest.TestCase):
         spec: dict | None = None,
         extra_env: dict[str, str] | None = None,
         engines: tuple[str, ...] = ("podman", "docker"),
+        unset: tuple[str, ...] = (),
     ) -> list[str]:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -149,12 +151,17 @@ class RunnerExecBase(unittest.TestCase):
         env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
         env["ENGINE_DUMP"] = str(dump)
         env["ENGINE_USED"] = str(used)
+        rm_log = root / "engine-rm"
+        env["ENGINE_RM"] = str(rm_log)
+        self._rm_log = rm_log
         env["XDG_CACHE_HOME"] = str(root / "cache")
         if spec is not None:
             spec_path = root / "spec.json"
             spec_path.write_text(json.dumps(spec))
             env["RIGX_RUNTIME_SPEC"] = str(spec_path)
         env.update(extra_env or {})
+        for key in unset:
+            env.pop(key, None)
         r = subprocess.run(
             [_BASH, str(runner)], env=env, capture_output=True, text=True,
         )
@@ -370,6 +377,81 @@ class EnginePreference(RunnerExecBase):
             podman_at = script.index("ENGINE=podman")
             docker_at = script.index("ENGINE=docker")
             self.assertLess(podman_at, docker_at)
+
+
+class StaleContainerName(RunnerExecBase):
+    """A container can outlive its runner — killing an attached `run`
+    doesn't reliably stop it, so `--rm` never fires and the name stays
+    taken. Under a supervisor the next start then fails with "name
+    already in use" while the stale container keeps serving, so a
+    port-based health check passes and a failed deploy looks fine."""
+
+    def test_named_run_reclaims_the_name_first(self):
+        script = capsule_common.capsule_runner_script(
+            _capsule_target(), mode="run",
+        )
+        self.run_runner(script, extra_env={"RIGX_NAME": "rigx-app-web"})
+        removed = self._rm_log.read_text().split() if self._rm_log.exists() else []
+        self.assertIn("rigx-app-web", removed)
+        self.assertIn("-f", removed)
+
+    def test_unnamed_run_removes_nothing(self):
+        script = capsule_common.capsule_runner_script(
+            _capsule_target(), mode="run",
+        )
+        self.run_runner(script)
+        self.assertFalse(self._rm_log.exists(), "removed a container it doesn't own")
+
+
+class UnsetHome(RunnerExecBase):
+    """systemd sets no HOME for system services, and the runner runs
+    under `set -u` — so a bare $HOME aborted it before the container was
+    ever created, and the deploy failed with no container to inspect."""
+
+    def test_runner_works_with_no_home_at_all(self):
+        script = capsule_common.capsule_runner_script(
+            _capsule_target(), mode="run",
+        )
+        args = self.run_runner(script, unset=("HOME", "XDG_CACHE_HOME"))
+        self.assertIn("--rm", args)
+
+    def test_runner_works_with_xdg_cache_home_but_no_home(self):
+        script = capsule_common.capsule_runner_script(
+            _capsule_target(), mode="run",
+        )
+        args = self.run_runner(
+            script, extra_env={"XDG_CACHE_HOME": "/tmp/xdg-probe"},
+            unset=("HOME",),
+        )
+        self.assertIn("--rm", args)
+
+
+class NetworkAlias(RunnerExecBase):
+    def test_alias_is_passed_alongside_the_network(self):
+        script = capsule_common.capsule_runner_script(
+            _capsule_target(), mode="run",
+        )
+        args = self.run_runner(script, extra_env={
+            "RIGX_NETWORK": "rigx-app", "RIGX_NETWORK_ALIAS": "web",
+        })
+        self.assertEqual(self.flag_values(args, "--network"), ["rigx-app"])
+        self.assertEqual(self.flag_values(args, "--network-alias"), ["web"])
+
+    def test_no_alias_flag_when_unset(self):
+        script = capsule_common.capsule_runner_script(
+            _capsule_target(), mode="run",
+        )
+        args = self.run_runner(script, extra_env={"RIGX_NETWORK": "rigx-app"})
+        self.assertNotIn("--network-alias", args)
+
+    def test_nixos_runner_supports_the_alias_too(self):
+        script = capsule_common.nixos_runner_script(
+            _capsule_target(backend="nixos"),
+        )
+        args = self.run_runner(script, extra_env={
+            "RIGX_NETWORK": "rigx-app", "RIGX_NETWORK_ALIAS": "db",
+        })
+        self.assertEqual(self.flag_values(args, "--network-alias"), ["db"])
 
 
 class ForegroundMode(RunnerExecBase):

@@ -18,6 +18,34 @@ def capsule_image_tag(target: Target) -> str:
     return f"rigx/{safe}:latest"
 
 
+def internal_dep_paths_expr(target: Target, project) -> str:
+    """A Nix list expression of every `deps.internal` store path.
+
+    Written into the capsule's `manifest.json`, and it has to be, because
+    of how Nix computes references: it scans a derivation's output for
+    store-path *strings*. A capsule's entrypoint is baked into the OCI
+    image's `Cmd`, and the image ships as `image/image.tar.gz` — gzipped,
+    so the path is not findable by scanning. The result is a capsule
+    whose recorded references are bash and nothing else: it does not
+    claim to depend on the program it exists to run.
+
+    That breaks two things. `nix copy` of the capsule doesn't bring the
+    application with it, so a deploy lands a container that exits 127.
+    And locally, `nix-collect-garbage` is free to delete the entrypoint
+    while keeping the capsule, quietly breaking an artifact that looks
+    fine.
+
+    Naming the paths in a plaintext file makes the closure honest.
+    """
+    from rigx.nix.render import nix_interp_str, rewrite_interp
+
+    items = [
+        nix_interp_str(rewrite_interp("${" + dep + "}", project))
+        for dep in target.deps.internal
+    ]
+    return "[ " + " ".join(items) + " ]" if items else "[ ]"
+
+
 def capsule_manifest(target: Target) -> dict:
     """The on-disk contract orchestrators (rigx.capsule, rigx.testbed,
     future mixed-backend tools) read instead of reaching into Nix attrs.
@@ -193,6 +221,13 @@ def capsule_runner_script(target: Target, *, mode: str) -> str:
                         when RIGX_DETACH is also set. Used by
                         `rigx.deploy.units`.
       RIGX_NETWORK      join an existing container network
+      RIGX_NETWORK_ALIAS
+                        extra name this container answers to on
+                        RIGX_NETWORK (`--network-alias`), so peers can
+                        use a short stable name rather than the unique
+                        container name in RIGX_NAME. Set by
+                        `rigx.deploy.units`; ignored without
+                        RIGX_NETWORK.
       RIGX_PUBLISH      comma-list of `host:container` port pairs
       RIGX_PUBLISH_UDP  comma-list of `host:container` UDP pairs
       RIGX_ENV          comma-list of `KEY=VALUE` extra env vars
@@ -230,7 +265,12 @@ HERE="$(cd "$(dirname "$0")/.." && pwd)"
 {runtime_spec_loader}
 # Per-container nix-state dirs on host, cleaned up on exit unless the
 # orchestrator wants them persisted (RIGX_KEEP_STATE=1).
-RIGX_CACHE="${{XDG_CACHE_HOME:-$HOME/.cache}}/rigx/lite-state"
+# HOME has a fallback because this runner is not always started by a
+# login: systemd does not set HOME for system services, and the runner
+# runs under `set -u`, so a bare $HOME aborts before the container is
+# ever created. `rigx.deploy.units` sets HOME explicitly; this keeps any
+# other non-interactive caller working too.
+RIGX_CACHE="${{XDG_CACHE_HOME:-${{HOME:-/tmp}}/.cache}}/rigx/lite-state"
 CID="${{RIGX_NAME:-rigx-{target.name}-$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid)}}"
 PROFILE_DIR="$RIGX_CACHE/profiles/$CID"
 GCROOT_DIR="$RIGX_CACHE/gcroots/$CID"
@@ -256,6 +296,9 @@ else
 fi
 [ -n "${{RIGX_NAME:-}}" ] && RUN_FLAGS+=(--name "$RIGX_NAME")
 [ -n "${{RIGX_NETWORK:-}}" ] && RUN_FLAGS+=(--network "$RIGX_NETWORK")
+# A short name peers can dial, independent of the container's own
+# (necessarily unique, necessarily long) --name.
+[ -n "${{RIGX_NETWORK_ALIAS:-}}" ] && RUN_FLAGS+=(--network-alias "$RIGX_NETWORK_ALIAS")
 
 USER_VAL="${{RIGX_USER:-{user_default}}}"
 [ -n "$USER_VAL" ] && RUN_FLAGS+=(--user "$USER_VAL")
@@ -286,6 +329,18 @@ if [ -n "${{RIGX_VOLUMES:-}}" ]; then
     for _v in "${{_RUNTIME_VOLS[@]}}"; do
         RUN_FLAGS+=(-v "$(_rigx_resolve_volume "$_v")")
     done
+fi
+
+# A container from a previous run can outlive its runner: killing an
+# attached `run` does not reliably stop the container, so `--rm` never
+# fires and the name stays taken. The next start then dies with "name
+# already in use" — and under a supervisor that is silent, because the
+# stale container is still serving. A health check aimed at the port
+# passes, so a failed deploy looks like a successful one.
+#
+# The unit owns this name, so reclaiming it is always the right call.
+if [ -n "${{RIGX_NAME:-}}" ]; then
+    "$ENGINE" rm -f "$RIGX_NAME" >/dev/null 2>&1 || true
 fi
 
 exec "$ENGINE" run "${{RUN_FLAGS[@]}}" \\
@@ -344,6 +399,9 @@ else
 fi
 [ -n "${{RIGX_NAME:-}}" ] && RUN_FLAGS+=(--name "$RIGX_NAME")
 [ -n "${{RIGX_NETWORK:-}}" ] && RUN_FLAGS+=(--network "$RIGX_NETWORK")
+# A short name peers can dial, independent of the container's own
+# (necessarily unique, necessarily long) --name.
+[ -n "${{RIGX_NETWORK_ALIAS:-}}" ] && RUN_FLAGS+=(--network-alias "$RIGX_NETWORK_ALIAS")
 
 if [ -n "${{RIGX_PUBLISH:-}}" ]; then
     IFS=',' read -ra PUBS <<< "$RIGX_PUBLISH"
@@ -371,6 +429,18 @@ if [ -n "${{RIGX_VOLUMES:-}}" ]; then
     for _v in "${{_RUNTIME_VOLS[@]}}"; do
         RUN_FLAGS+=(-v "$(_rigx_resolve_volume "$_v")")
     done
+fi
+
+# A container from a previous run can outlive its runner: killing an
+# attached `run` does not reliably stop the container, so `--rm` never
+# fires and the name stays taken. The next start then dies with "name
+# already in use" — and under a supervisor that is silent, because the
+# stale container is still serving. A health check aimed at the port
+# passes, so a failed deploy looks like a successful one.
+#
+# The unit owns this name, so reclaiming it is always the right call.
+if [ -n "${{RIGX_NAME:-}}" ]; then
+    "$ENGINE" rm -f "$RIGX_NAME" >/dev/null 2>&1 || true
 fi
 
 exec "$ENGINE" run "${{RUN_FLAGS[@]}}" \\

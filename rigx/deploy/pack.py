@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import subprocess
 import tempfile
+from collections.abc import Sequence
 from pathlib import Path
 
 from rigx import builder
@@ -37,6 +38,29 @@ def resolve_capsule_backends(project: Project, testbed: Target) -> dict[str, str
         svc.capsule: project.targets[svc.capsule].backend
         for svc in testbed.services.values()
     }
+
+
+def resolve_artifact_paths(project: Project, testbed: Target) -> dict[str, str]:
+    """Build every target named in a service's `artifacts` and return
+    target name -> its resolved Nix store path.
+
+    These are ordinary rigx targets, built the same way capsules are —
+    which is the point: mounting a store path is what makes deployed
+    content immutable and makes a local deletion propagate (the next
+    generation is a different path, not an edited directory)."""
+    names = sorted({
+        aname for svc in testbed.services.values() for aname in svc.artifacts
+    })
+    if not names:
+        return {}
+    built = dict(builder.build(project, names))
+    paths: dict[str, str] = {}
+    for name in names:
+        link = built.get(name)
+        if link is None:
+            raise DeployError(f"artifact {name!r} did not build (no output link)")
+        paths[name] = str(Path(link).resolve())
+    return paths
 
 
 def resolve_capsule_paths(project: Project, testbed: Target) -> dict[str, str]:
@@ -87,13 +111,32 @@ def add_to_local_store(plan_dir: Path) -> str:
     return proc.stdout.strip()
 
 
-def copy_to_target(store_path: str, target: SSHTarget) -> None:
-    """`nix copy` the plan's full transitive closure — including every
-    referenced capsule — to `target`. Substituter negotiation means
-    paths the target already has (e.g. an unchanged capsule from a
-    previous deploy) aren't retransferred."""
+def copy_to_target(
+    store_path: str, target: SSHTarget, extra_paths: Sequence[str] = (),
+) -> None:
+    """`nix copy` the plan and everything it names to `target`.
+
+    `extra_paths` has to be passed explicitly, and getting this wrong is
+    not subtle: **a path added with `nix store add` has an empty
+    reference set.** Nix computes references by scanning *derivation
+    outputs*; a manually added path records none, however many store
+    paths appear in the files inside it. So the plan's "closure" is the
+    plan alone — `nix copy`ing it ships the units and scripts and none
+    of the capsules they exec, and the deployment fails on the target
+    with systemd status 203/EXEC (cannot execute ExecStart).
+
+    This is a direct consequence of the plan not yet being a real
+    derivation (see the module docstring). Once it is, its references
+    are computed by Nix and this parameter goes away.
+
+    The capsules themselves *are* derivation outputs, so passing each
+    one pulls its own closure — interpreter, libraries, image tarball —
+    transitively. Substituter negotiation still means paths the target
+    already has aren't retransferred.
+    """
+    paths = [store_path, *extra_paths]
     proc = subprocess.run(
-        ["nix", "copy", "--to", f"ssh://{target.destination}", store_path],
+        ["nix", "copy", "--to", f"ssh://{target.destination}", *paths],
         capture_output=True, text=True,
     )
     if proc.returncode != 0:
@@ -113,9 +156,15 @@ def build_and_push_plan(
     Nix store paths are content-addressed and host-independent)."""
     capsule_paths = resolve_capsule_paths(project, testbed)
     capsule_backends = resolve_capsule_backends(project, testbed)
-    manifest = plan.compile_manifest(testbed, capsule_paths, capsule_backends)
+    artifact_paths = resolve_artifact_paths(project, testbed)
+    manifest = plan.compile_manifest(
+        testbed, capsule_paths, capsule_backends, artifact_paths,
+    )
     with tempfile.TemporaryDirectory() as d:
         plan_dir = assemble_plan_dir(Path(d) / testbed.name, manifest, previous_manifest)
         store_path = add_to_local_store(plan_dir)
-    copy_to_target(store_path, target)
+    # Everything the plan's units and scripts name by absolute path.
+    # The plan itself records no references — see `copy_to_target`.
+    referenced = sorted({*capsule_paths.values(), *artifact_paths.values()})
+    copy_to_target(store_path, target, referenced)
     return store_path

@@ -27,7 +27,7 @@ class RenderUnit(unittest.TestCase):
         text = units.render_unit("app", "web", svc)
         self.assertIn("Restart=always", text)
         self.assertIn("ExecStart=/nix/store/aaa-web/bin/run-web_capsule", text)
-        self.assertIn("Environment=RIGX_NAME=rigx-app-web", text)
+        self.assertIn('Environment="RIGX_NAME=rigx-app-web"', text)
         self.assertNotIn("RIGX_PUBLISH", text)
         self.assertNotIn("RIGX_VOLUMES", text)
         self.assertNotIn("LoadCredentialEncrypted", text)
@@ -54,7 +54,7 @@ class RenderUnit(unittest.TestCase):
             "volumes": {}, "secrets": {}, "healthcheck": None,
         }
         text = units.render_unit("app", "web", svc)
-        self.assertIn("Environment=RIGX_PUBLISH=8080:8080,9000:90", text)
+        self.assertIn('Environment="RIGX_PUBLISH=8080:8080,9000:90"', text)
 
     def test_volumes_become_rigx_volumes_env_when_no_secrets(self):
         svc = {
@@ -65,8 +65,8 @@ class RenderUnit(unittest.TestCase):
         }
         text = units.render_unit("app", "db", svc)
         self.assertIn(
-            "Environment=RIGX_VOLUMES=/var/lib/rigx/app/volumes/data:"
-            "/var/lib/postgresql/data:rw",
+            'Environment="RIGX_VOLUMES=/var/lib/rigx/app/volumes/data:'
+            '/var/lib/postgresql/data:rw"',
             text,
         )
         self.assertIn("ExecStart=/nix/store/x/bin/run-db_capsule", text)
@@ -109,7 +109,8 @@ def _svc(**overrides):
     base = {
         "capsule": "c", "capsule_path": "/nix/store/x",
         "depends_on": [], "restart": "always", "ports": [],
-        "volumes": {}, "secrets": {}, "healthcheck": None,
+        "volumes": {}, "artifacts": [], "secrets": {}, "env": {},
+        "healthcheck": None,
     }
     base.update(overrides)
     return base
@@ -145,14 +146,20 @@ class Supervision(unittest.TestCase):
         # stdin is /dev/null; `-d` would exit immediately and read as
         # the service having finished. Neither is supervisable.
         text = units.render_unit("app", "web", _svc())
-        self.assertIn("Environment=RIGX_FOREGROUND=1", text)
+        self.assertIn('Environment="RIGX_FOREGROUND=1"', text)
         self.assertNotIn("RIGX_DETACH", text)
 
     def test_foreground_is_set_on_the_secrets_path_too(self):
         text = units.render_unit(
             "app", "web", _svc(secrets={"api_key": "/run/secrets/api_key"}),
         )
-        self.assertIn("Environment=RIGX_FOREGROUND=1", text)
+        self.assertIn('Environment="RIGX_FOREGROUND=1"', text)
+
+    def test_unit_provides_a_home(self):
+        # systemd gives system services no HOME, and the lite runner
+        # needs one for its per-container profile/gcroot dirs.
+        text = units.render_unit("app", "web", _svc())
+        self.assertIn('Environment="HOME=/var/lib/rigx/app/home"', text)
 
     def test_restart_always_is_not_capped_by_the_default_start_limit(self):
         # systemd's default (5 starts in 10s) would park a crash-looping
@@ -187,6 +194,156 @@ class RestartPropagation(unittest.TestCase):
     def test_no_dependencies_means_no_partof(self):
         text = units.render_unit("app", "web", _svc())
         self.assertNotIn("PartOf=", text)
+
+
+class Networking(unittest.TestCase):
+    """Peers reach each other at `<service>:<port>` over the testbed's
+    implicit network; publishing to the host is a separate, explicit
+    act."""
+
+    def test_service_joins_the_network_under_its_own_name(self):
+        text = units.render_unit("app", "web", _svc(), network="rigx-app")
+        self.assertIn('Environment="RIGX_NETWORK=rigx-app"', text)
+        # The alias, not RIGX_NAME, is what a peer dials — RIGX_NAME has
+        # to be unique and is therefore too long to be an address.
+        self.assertIn('Environment="RIGX_NETWORK_ALIAS=web"', text)
+        self.assertIn('Environment="RIGX_NAME=rigx-app-web"', text)
+
+    def test_no_network_wiring_when_none_given(self):
+        text = units.render_unit("app", "web", _svc())
+        self.assertNotIn("RIGX_NETWORK", text)
+
+    def test_service_without_ports_publishes_nothing(self):
+        # The `expose:` equivalent: reachable by peers, invisible from
+        # the host, with nothing extra to declare.
+        text = units.render_unit("app", "web", _svc(), network="rigx-app")
+        self.assertNotIn("RIGX_PUBLISH", text)
+
+    def test_bind_address_is_carried_into_publish(self):
+        svc = _svc(ports=[{
+            "host": 8000, "container": 8000,
+            "host_addr": "127.0.0.1", "publish": "127.0.0.1:8000:8000",
+        }])
+        text = units.render_unit("app", "web", svc, network="rigx-app")
+        self.assertIn('Environment="RIGX_PUBLISH=127.0.0.1:8000:8000"', text)
+
+    def test_falls_back_when_manifest_predates_publish_field(self):
+        svc = _svc(ports=[{"host": 80, "container": 8080}])
+        text = units.render_unit("app", "web", svc)
+        self.assertIn('Environment="RIGX_PUBLISH=80:8080"', text)
+
+    def test_render_units_threads_the_network_through(self):
+        manifest = {
+            "testbed": "app", "network": "rigx-app",
+            "start_order": ["web"],
+            "services": {"web": _svc()},
+            "volumes": [], "secrets": [],
+        }
+        text = units.render_units(manifest)["rigx-app-web.service"]
+        self.assertIn('Environment="RIGX_NETWORK=rigx-app"', text)
+
+
+class Artifacts(unittest.TestCase):
+    """Built content is mounted read-only from the store; state volumes
+    mount read-write at paths underneath it."""
+
+    def test_artifact_is_mounted_read_only(self):
+        svc = _svc(artifacts=[
+            {"target": "apps", "store_path": "/nix/store/x-apps", "mount": "/srv/apps"},
+        ])
+        text = units.render_unit("app", "web", svc)
+        self.assertIn('Environment="RIGX_VOLUMES=/nix/store/x-apps:/srv/apps:ro"', text)
+
+    def test_state_volumes_mount_over_a_read_only_artifact(self):
+        # The whole point: an immutable tree with writable holes. The
+        # artifact must mount first or it buries the state under it.
+        svc = _svc(
+            artifacts=[{
+                "target": "apps", "store_path": "/nix/store/x-apps",
+                "mount": "/srv/apps",
+            }],
+            volumes={"db": "/srv/apps/access/databases", "svc": "/srv/apps/.service"},
+        )
+        text = units.render_unit("app", "web", svc)
+        line = next(l for l in _lines(text) if "RIGX_VOLUMES" in l)
+        # Environment= values are quoted, so drop the closing quote
+        # before splitting or the last mode carries it.
+        specs = line.split("RIGX_VOLUMES=", 1)[1].rstrip('"').split(",")
+        self.assertEqual(specs[0], "/nix/store/x-apps:/srv/apps:ro")
+        self.assertTrue(specs[1].endswith(":/srv/apps/.service:rw"))
+        self.assertTrue(specs[2].endswith(":/srv/apps/access/databases:rw"))
+
+    def test_artifacts_and_volumes_interleave_by_depth_not_by_kind(self):
+        svc = _svc(
+            artifacts=[
+                {"target": "a", "store_path": "/nix/store/a", "mount": "/srv/x/deep"},
+                {"target": "b", "store_path": "/nix/store/b", "mount": "/srv"},
+            ],
+            volumes={"v": "/srv/x"},
+        )
+        text = units.render_unit("app", "web", svc)
+        line = next(l for l in _lines(text) if "RIGX_VOLUMES" in l)
+        dests = [s.rsplit(":", 1)[0].split(":", 1)[1] for s in
+                 line.split("RIGX_VOLUMES=", 1)[1].split(",")]
+        self.assertEqual(dests, ["/srv", "/srv/x", "/srv/x/deep"])
+
+    def test_no_artifacts_key_is_tolerated(self):
+        svc = _svc()
+        svc.pop("artifacts", None)
+        self.assertNotIn("RIGX_VOLUMES", units.render_unit("app", "web", svc))
+
+    def test_artifacts_reach_the_secrets_execstart_path_too(self):
+        svc = _svc(
+            artifacts=[{
+                "target": "apps", "store_path": "/nix/store/x", "mount": "/srv/apps",
+            }],
+            secrets={"k": "/run/secrets/k"},
+        )
+        exec_line = next(
+            l for l in _lines(units.render_unit("app", "web", svc))
+            if l.startswith("ExecStart=")
+        )
+        self.assertIn("/nix/store/x:/srv/apps:ro", exec_line)
+
+
+class NestedVolumeOrdering(unittest.TestCase):
+    def test_parent_mounts_come_before_the_volumes_nested_in_them(self):
+        # A writable app tree with per-app state underneath is the
+        # motivating case: mounting /srv/apps after /srv/apps/x/db would
+        # hide the latter. Volume *names* here sort the wrong way on
+        # purpose, so name-ordering would fail this test.
+        svc = _svc(volumes={
+            "zz_state": "/srv/apps/access/databases",
+            "aa_tree": "/srv/apps",
+            "mm_service": "/srv/apps/.service",
+        })
+        text = units.render_unit("app", "web", svc)
+        line = next(l for l in _lines(text) if "RIGX_VOLUMES" in l)
+        mounts = line.split("RIGX_VOLUMES=", 1)[1].split(",")
+        dests = [m.split(":")[1] for m in mounts]
+        self.assertEqual(dests[0], "/srv/apps")
+        self.assertLess(dests.index("/srv/apps"), dests.index("/srv/apps/.service"))
+        self.assertLess(
+            dests.index("/srv/apps"), dests.index("/srv/apps/access/databases"),
+        )
+
+
+class ServiceEnv(unittest.TestCase):
+    def test_env_becomes_rigx_env(self):
+        text = units.render_unit(
+            "app", "web", _svc(env={"LOG_LEVEL": "info", "HOSTNAME": "x.com"}),
+        )
+        # Sorted, so the unit text is stable and `activate`'s content
+        # diff doesn't see a spurious change on every render.
+        self.assertIn('Environment="RIGX_ENV=HOSTNAME=x.com,LOG_LEVEL=info"', text)
+
+    def test_no_env_line_when_empty(self):
+        self.assertNotIn("RIGX_ENV", units.render_unit("app", "web", _svc()))
+
+    def test_missing_env_key_is_tolerated(self):
+        svc = _svc()
+        svc.pop("env", None)
+        self.assertNotIn("RIGX_ENV", units.render_unit("app", "web", svc))
 
 
 class HealthUnits(unittest.TestCase):

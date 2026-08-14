@@ -272,8 +272,28 @@ class TestbedHealthcheck:
 
 @dataclass
 class TestbedPort:
+    """One published port. `host_addr` is the interface to bind on the
+    host — empty means all of them (`0.0.0.0`), matching docker's
+    default.
+
+    A bind address is how a service stays reachable from the host
+    without being reachable from the world. The canonical use is a
+    health endpoint: `activate`'s gate probes over host loopback, so a
+    service that talks to its peers over the testbed network (and needs
+    no public port at all) can still publish `127.0.0.1:<port>` for the
+    probe alone.
+    """
+
     host: int
     container: int
+    host_addr: str = ""
+
+    def publish_spec(self) -> str:
+        """Render as a `-p` value: `addr:host:container`, or
+        `host:container` when bound to every interface."""
+        if self.host_addr:
+            return f"{self.host_addr}:{self.host}:{self.container}"
+        return f"{self.host}:{self.container}"
 
 
 @dataclass
@@ -288,9 +308,34 @@ class TestbedService:
     capsule: str
     depends_on: list[str] = field(default_factory=list)
     restart: str = "always"          # "always" | "on-failure" | "no" -> systemd Restart=
+    # Ports published to the *host*. Peers don't need this: every
+    # service in a testbed joins a shared network and reaches its peers
+    # at `<service>:<port>`, where the port comes from the capsule's own
+    # `ports` declaration. An empty list therefore means "reachable by
+    # peers, invisible from outside" — the equivalent of compose's
+    # `expose:`, with nothing extra to declare.
     ports: list[TestbedPort] = field(default_factory=list)
     volumes: dict[str, str] = field(default_factory=dict)   # volume name -> mount path
+    # `[targets.<t>.services.<s>.artifacts]` — rigx-built target name ->
+    # where its output is mounted in the container, always read-only.
+    #
+    # This is how content built from the working tree reaches a service.
+    # Being a store path, it gets the two properties that content wants
+    # and a synced directory can't have: it is genuinely immutable at
+    # runtime (mounted `:ro`, so not even root in the container can
+    # write to it), and each deploy swaps in a whole new path — so a
+    # file deleted locally is simply absent from the next generation,
+    # atomically, with rollback restoring it.
+    #
+    # Mutable state is the deliberate exception: declare a `volumes`
+    # entry at a path underneath, and it mounts read-write over the
+    # read-only tree.
+    artifacts: dict[str, str] = field(default_factory=dict)
     secrets: dict[str, str] = field(default_factory=dict)   # secret name -> exposed path
+    # Extra env vars for this service, layered over the capsule's own
+    # `env`. Lets one capsule back several services (or environments)
+    # that differ only in configuration.
+    env: dict[str, str] = field(default_factory=dict)
     healthcheck: TestbedHealthcheck | None = None
 
 
@@ -830,6 +875,44 @@ def _parse_testbed_healthcheck(raw, ctx: str) -> TestbedHealthcheck | None:
     return TestbedHealthcheck(command=command, interval=interval, retries=retries)
 
 
+# A host bind address: a bare hostname/IPv4, or a bracketed IPv6
+# literal (`[::1]`), which is how docker/podman spell it in `-p`.
+_BIND_ADDR_RE = re.compile(r"^(?:[A-Za-z0-9._-]+|\[[0-9A-Fa-f:]+\])$")
+
+
+def _split_bind_addr(value, ectx: str) -> tuple[str, int]:
+    """Split a `host` field into `(bind_addr, port)`.
+
+    A bare integer is a port on every interface. A string is
+    `addr:port` — `"127.0.0.1:8000"`, or `"[::1]:8000"` for IPv6, the
+    same spelling `-p` uses.
+    """
+    if isinstance(value, int) and not isinstance(value, bool):
+        return "", value
+    if not isinstance(value, str):
+        raise ConfigError(
+            f"{ectx}: 'host' must be an integer port or an "
+            f"'addr:port' string (got {value!r})"
+        )
+    if value.startswith("["):
+        addr, sep, port_s = value.partition("]:")
+        addr = addr + "]" if sep else addr
+    else:
+        addr, sep, port_s = value.rpartition(":")
+        if not sep:
+            raise ConfigError(
+                f"{ectx}: 'host' string must be 'addr:port' "
+                f"(got {value!r}; use a bare integer for all interfaces)"
+            )
+    if not sep or not addr or not _BIND_ADDR_RE.match(addr):
+        raise ConfigError(f"{ectx}: 'host' has an invalid bind address: {value!r}")
+    try:
+        port = int(port_s)
+    except ValueError:
+        raise ConfigError(f"{ectx}: 'host' port is not an integer: {value!r}")
+    return addr, port
+
+
 def _parse_testbed_ports(raw, ctx: str) -> list[TestbedPort]:
     if raw is None:
         return []
@@ -847,12 +930,15 @@ def _parse_testbed_ports(raw, ctx: str) -> list[TestbedPort]:
             raise ConfigError(
                 f"{ectx}: unknown keys {sorted(unknown)} (allowed: host, container)"
             )
-        host = entry.get("host")
+        if "host" not in entry:
+            raise ConfigError(f"{ectx}: 'host' is required")
+        host_addr, host = _split_bind_addr(entry["host"], ectx)
         container = entry.get("container")
-        for label, val in (("host", host), ("container", container)):
-            if not isinstance(val, int) or isinstance(val, bool):
-                raise ConfigError(f"{ectx}: '{label}' must be an integer")
-        out.append(TestbedPort(host=host, container=container))
+        if not isinstance(container, int) or isinstance(container, bool):
+            raise ConfigError(f"{ectx}: 'container' must be an integer")
+        out.append(
+            TestbedPort(host=host, container=container, host_addr=host_addr)
+        )
     return out
 
 
@@ -865,6 +951,47 @@ def _parse_testbed_str_map(raw, ctx: str, *, field_name: str) -> dict[str, str]:
         isinstance(k, str) and isinstance(v, str) for k, v in raw.items()
     ):
         raise ConfigError(f"{ctx}: {field_name} must be a table of name -> string")
+    return dict(raw)
+
+
+def _parse_testbed_artifacts(raw, ctx: str) -> dict[str, str]:
+    """Parse `[targets.<t>.services.<s>.artifacts]` — rigx target name ->
+    absolute container path. The target reference is checked against the
+    project in the cross-target pass; here we only check shapes."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in raw.items()
+    ):
+        raise ConfigError(
+            f"{ctx}: artifacts must be a table of target name -> mount path"
+        )
+    for tname, path in raw.items():
+        if not path.startswith("/"):
+            raise ConfigError(
+                f"{ctx}.artifacts.{tname}: mount path must be absolute "
+                f"(got {path!r})"
+            )
+    return dict(raw)
+
+
+def _parse_testbed_service_env(raw, ctx: str) -> dict[str, str]:
+    """Parse `[targets.<t>.services.<s>.env]` — extra env vars layered
+    over the capsule's own `env`. Same rules as capsule `env`: string
+    values only (so `PORT = 8080` fails loudly rather than becoming a
+    surprise), and POSIX-ish names."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in raw.items()
+    ):
+        raise ConfigError(
+            f"{ctx}: env must be a table of name → string values "
+            f"(quote numbers: PORT = \"8080\")"
+        )
+    for name in raw:
+        if not _ENV_NAME_RE.match(name):
+            raise ConfigError(f"{ctx}.env: invalid env var name {name!r}")
     return dict(raw)
 
 
@@ -881,7 +1008,7 @@ def _parse_testbed_services(tconf: dict, tctx: str) -> dict[str, TestbedService]
             raise ConfigError(f"{sctx}: must be a table")
         unknown = set(sconf.keys()) - {
             "capsule", "depends_on", "restart", "ports",
-            "volumes", "secrets", "healthcheck",
+            "volumes", "artifacts", "secrets", "env", "healthcheck",
         }
         if unknown:
             raise ConfigError(f"{sctx}: unknown keys {sorted(unknown)}")
@@ -909,7 +1036,9 @@ def _parse_testbed_services(tconf: dict, tctx: str) -> dict[str, TestbedService]
             restart=restart,
             ports=_parse_testbed_ports(sconf.get("ports"), sctx),
             volumes=_parse_testbed_str_map(sconf.get("volumes"), sctx, field_name="volumes"),
+            artifacts=_parse_testbed_artifacts(sconf.get("artifacts"), sctx),
             secrets=_parse_testbed_str_map(sconf.get("secrets"), sctx, field_name="secrets"),
+            env=_parse_testbed_service_env(sconf.get("env"), sctx),
             healthcheck=_parse_testbed_healthcheck(
                 sconf.get("healthcheck"), f"{sctx}.healthcheck"
             ),
@@ -1904,6 +2033,44 @@ def _load(root: Path, _visited: set[Path]) -> Project:
                         f"{sctx}: capsule '{svc.capsule}' must be kind='capsule' "
                         f"(got {capsule_target.kind!r})"
                     )
+                # A published `container` port has to be one the capsule
+                # actually declares — otherwise the typo deploys fine
+                # and only shows up as a dead port at runtime. Capsules
+                # that declare no ports at all are exempt: `ports` is
+                # optional on a capsule, and absence means "unspecified",
+                # not "none".
+                if capsule_target.ports:
+                    for port in svc.ports:
+                        if port.container not in capsule_target.ports:
+                            raise ConfigError(
+                                f"{sctx}: publishes container port "
+                                f"{port.container}, which capsule "
+                                f"'{svc.capsule}' doesn't declare "
+                                f"(it declares {sorted(capsule_target.ports)}) — "
+                                f"add it to [targets.{svc.capsule}].ports"
+                            )
+                for aname, apath in svc.artifacts.items():
+                    art = targets.get(aname)
+                    if art is None:
+                        raise ConfigError(
+                            f"{sctx}: artifacts references '{aname}', "
+                            f"which is not a defined target"
+                        )
+                    if art.kind in ("script", "testbed", "test"):
+                        raise ConfigError(
+                            f"{sctx}: artifacts references '{aname}', which is "
+                            f"kind={art.kind!r} and produces no output to mount"
+                        )
+                    # Mounting an artifact over a volume's own mount point
+                    # would hide the state it exists to preserve, and which
+                    # one wins would come down to mount ordering.
+                    for vname, vpath in svc.volumes.items():
+                        if vpath == apath:
+                            raise ConfigError(
+                                f"{sctx}: artifact '{aname}' and volume "
+                                f"{vname!r} both mount at {apath!r} — a volume "
+                                f"may sit *under* an artifact, not on top of it"
+                            )
                 for vname in svc.volumes:
                     if vname not in target.testbed_volumes:
                         raise ConfigError(
