@@ -1,5 +1,66 @@
 # Changelog
 
+## Unreleased
+
+### Bug fixes
+
+- **Stopping a testbed service now stops its container.** `ExecStart=` is an
+  attached `podman run`, and killing an attached run does not reliably take
+  the container down with it — so `--rm` never fired and `rigx remote
+  <target> stop` reported `done` while the container kept running,
+  unsupervised, still holding its published ports and NAT rules. Service
+  units now carry an `ExecStopPost=` that reaps the container by name, and
+  `rigx remote stop` reaps explicitly as well, so hosts still running units
+  built by an older rigx get cleaned up too.
+
+  `bin/activate` reaps in the two other places a container could be
+  orphaned: a service removed from the config (its unit is deleted, so
+  nothing is left to stop it), and a failed health gate on a first-ever
+  deploy (the unit is stopped outright, with no previous generation to fall
+  back to). The second is the dangerous one — a container that survives a
+  *failed* deploy holds the ports the next attempt needs while still
+  answering the host-side health probe that decides whether that attempt
+  worked.
+
+### New features
+
+- **Deploys check for host port conflicts before building anything.** A
+  collision on a published host port previously surfaced only when the
+  container tried to bind, which is after `activate` had already restarted
+  the unit — so the operator saw `Restart=always` cycle and the health gate
+  exhaust all its retries against a service that was in fact perfectly
+  healthy and had simply never got far enough to bind. `rigx remote deploy`
+  now inspects the target's running containers first and fails with the
+  port, the service that wants it, and the name of the container already
+  holding it. Containers belonging to the testbed being deployed are ignored
+  (a redeploy always finds its own previous generation there), as are
+  stopped ones.
+
+- **`rigx host ls` / `rigx host destroy <testbed>` — manage a deploy target
+  with no `rigx.toml`.** Every other command starts from a project; these
+  deliberately don't, because the situations that need them are the ones
+  where the config is missing, renamed, or on another machine. `ls` reads
+  the host's own record of itself — each testbed's Nix profile, the manifest
+  of whichever generation is live, and what the container engine is actually
+  running — and flags orphaned `rigx-*` containers that no testbed profile
+  claims. `destroy` removes one testbed's units, containers, network and
+  profile by name. Before this, a deployment whose project had gone missing
+  could not be shut down through rigx at all.
+
+  `destroy` keeps `/var/lib/rigx/<testbed>` unless `--purge` is passed:
+  removing a deployment from a host says nothing about whether its database
+  was wanted.
+
+- **`host_exclusive` on a testbed target.** With `host_exclusive = true`,
+  deploying evicts every *other* rigx testbed found on the host first
+  (keeping their persistent volumes). Off by default, and declared in
+  `rigx.toml` rather than passed as a flag: `deploy` is the most-run command
+  there is, so making it destructive to things it doesn't recognise would
+  mean one mistyped target name silently deleting a peer deployment, and a
+  host legitimately running app + worker + db as separate testbeds would be
+  cut down to one. As a declared property it is reviewable, versioned, and
+  can't be forgotten the way a flag is.
+
 ## 0.12.0 — 2026-08-13
 
 ### New features

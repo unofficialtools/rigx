@@ -1,7 +1,90 @@
 # TODO — capsule + testbed follow-on work
 
-Deferred from the v1 capsule landing. Each entry has enough context to
-pick up cold; no blockers from the current schema.
+Deferred from the v1 capsule landing, plus follow-ons from `rigx
+remote`. Each entry has enough context to pick up cold; no blockers
+from the current schema.
+
+## Deploy health probes assert a port, not a service
+
+A service's `healthcheck.command` runs **on the host**, against a
+published port:
+
+```toml
+[targets.myapp.services.web.healthcheck]
+command = "curl -f -s -o /dev/null http://127.0.0.1/myapp"
+```
+
+Nothing in that probe establishes *which process answered*. It is used
+in two places — as the deploy gate in `rigx.deploy.activate`, and as
+the recurring liveness probe behind `-health.timer` — and in both, "the
+port answered" is being read as "my service is healthy". Those are
+different claims whenever anything else on the host can bind that port.
+
+Both failure directions have been seen:
+
+- **False negative** (observed, now fixed by other means): a stale
+  container from a *different* testbed held port 80, so the gate
+  probed that container and failed 20 times against a service that was
+  in fact serving correctly on its own container. This is now caught
+  earlier — `rigx remote deploy` refuses to start when another
+  container already holds a declared host port
+  (`rigx.deploy.hostinv.find_port_conflicts`), and units reap their
+  containers on stop so the stale holder stops existing in the first
+  place.
+
+- **False positive** (still reachable, and the reason this entry
+  exists): if the squatting process happens to answer the probe
+  *successfully*, the gate passes and the deploy is reported green
+  while the previous generation — or something else entirely — is
+  still the thing serving traffic. Nothing downstream re-checks. This
+  is strictly worse than the false negative, because the false
+  negative is loud.
+
+The preflight narrows the window but does not close it. It samples the
+host once, before the build and copy; a container can appear in the
+interval, and the recurring liveness probe has no preflight at all.
+
+**Fix direction.** Probe the service, not the host port. The plumbing
+already exists: every service joins the per-testbed network
+`rigx-<testbed>` under `--network-alias <service>`
+(`rigx.deploy.plan.network_name`), so a probe run *inside* that
+network reaches exactly one container by construction, with no host
+port involved and nothing else able to answer:
+
+```
+podman run --rm --network rigx-myapp <probe-image> curl -f http://web:8000/myapp
+```
+
+That is a real design change, not a patch, and it is why this is
+deferred rather than done:
+
+- `healthcheck.command` is currently documented as host-side, and that
+  is load-bearing — it is how a probe can use `curl` at all without the
+  capsule having to contain one (`deps.nixpkgs` is strict opt-in, and a
+  FROM-scratch lite capsule has no shell). Moving the probe inside the
+  network needs a decision about *where the probe binary comes from*:
+  a rigx-provided minimal probe capsule, or `podman exec` into the
+  service container (which puts the requirement back on the capsule).
+- Not every service publishes a host port, and the ones that don't
+  currently can't be health-gated meaningfully at all. An
+  in-network probe would fix that as a side effect, which argues for
+  in-network being the *default* rather than an option.
+- The host-side form still has legitimate uses (asserting the
+  published port is reachable from outside, which is a different and
+  also-real property). So this probably ends up as two fields, or one
+  field plus a `scope = "network" | "host"` discriminator, defaulting
+  to `network`.
+
+Cheaper interim mitigation, if the full change stays deferred: have
+`activate` assert, after `systemctl restart` and before the gate loop,
+that the expected container name exists and is running, and that its
+container ID differs from the one recorded for the previous
+generation. That doesn't prove the *probe* reached it, but it does
+catch "the unit never actually replaced anything" — the case where a
+foreign container is answering and ours never started.
+
+Estimate: ~150 lines plus schema and docs for the in-network probe;
+~30 lines for the interim container-identity assertion.
 
 ## QEMU backend (cross-arch user-mode emulation)
 

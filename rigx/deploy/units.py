@@ -128,6 +128,27 @@ def unit_name(testbed: str, service: str) -> str:
     return f"rigx-{testbed}-{service}.service"
 
 
+def container_name(testbed: str, service: str) -> str:
+    """The container a service's unit runs, as `RIGX_NAME` names it."""
+    return f"rigx-{testbed}-{service}"
+
+
+def reap_command(container: str) -> str:
+    """Shell that removes `container` under whichever engine the host has.
+
+    Written with no `$` of any kind on purpose. systemd expands `$VAR`
+    and `${VAR}` inside `ExecStart=`/`ExecStopPost=` before handing the
+    line to the shell, and an unset name expands to *empty* rather than
+    erroring — so a `"$ENGINE"` here would silently become `"" rm -f …`.
+    Trying both engine names in sequence needs no variable, and the
+    engine that isn't installed simply exits 127 and falls through.
+    """
+    return (
+        f"podman rm -f {container} >/dev/null 2>&1 || "
+        f"docker rm -f {container} >/dev/null 2>&1 || true"
+    )
+
+
 def health_unit_name(testbed: str, service: str) -> str:
     return f"rigx-{testbed}-{service}-health.service"
 
@@ -253,6 +274,24 @@ def render_unit(
         if volume_mounts:
             lines.append(_env_line("RIGX_VOLUMES", ",".join(volume_mounts)))
         lines.append(f"ExecStart={runner}")
+
+    # Stopping the unit has to stop the *container*, which does not
+    # follow from stopping the runner. `ExecStart` is an attached
+    # `podman run`, and killing an attached run does not reliably take
+    # the container down with it — so `--rm` never fires, the container
+    # keeps running unsupervised, and it keeps its published ports and
+    # its NAT rules. The next thing to want those ports then fails to
+    # bind, at runtime, with no hint that a stopped unit is the cause.
+    #
+    # `ExecStopPost=` rather than `ExecStop=`: it runs after every stop,
+    # including a failed start and each cycle of `Restart=`, which is
+    # exactly the set of moments the name has to be free again. The
+    # runner already reclaims the same name on the way *up*; this closes
+    # the same hole on the way down, where nothing was watching.
+    lines.append(
+        "ExecStopPost=/bin/sh -c "
+        + _sh_quote(reap_command(container_name(testbed, service_name)))
+    )
 
     lines.append("")
     lines.append("[Install]")

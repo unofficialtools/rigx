@@ -311,6 +311,59 @@ class SecondDeployOnlyRestartsChanged(ActivateHarness):
         self.assertIn("disable --now rigx-app-web.service", self.systemctl_calls())
         self.assertFalse((self.systemd_dir / "rigx-app-web.service").exists())
 
+    def test_removed_service_has_its_container_reaped(self):
+        # The unit is gone, so nothing is left to reap the container it
+        # started — it would keep running, unsupervised, still holding
+        # the ports of a service the config no longer declares.
+        m1 = {
+            "testbed": "app", "start_order": ["db", "web"],
+            "services": {"db": _service(), "web": _service(depends_on=["db"])},
+            "volumes": [], "secrets": [],
+        }
+        plan1 = _plan_dir(self.root, "plan1", m1)
+        self.run_script(plan1 / "bin" / "activate")
+        self.engine_log.write_text("")
+
+        m2 = {
+            "testbed": "app", "start_order": ["db"],
+            "services": {"db": _service()},
+            "volumes": [], "secrets": [],
+        }
+        plan2 = _plan_dir(self.root, "plan2", m2, previous=m1)
+        r2 = self.run_script(plan2 / "bin" / "activate")
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+
+        self.assertIn("rm -f rigx-app-web", self.engine_calls())
+        # db is still declared; its container must not be touched.
+        self.assertNotIn("rm -f rigx-app-db", self.engine_calls())
+
+
+class FailedGateReapsContainers(ActivateHarness):
+    """A container that outlives a *failed* deploy is the worst version
+    of the problem: it holds the ports the next attempt needs while
+    still answering the host-side health probe that decides whether that
+    attempt worked."""
+
+    def test_first_deploy_health_failure_reaps_the_container(self):
+        manifest = {
+            "testbed": "app", "start_order": ["web"],
+            "services": {
+                "web": _service(healthcheck={
+                    "command": "false", "interval": 0, "retries": 2,
+                }),
+            },
+            "volumes": [], "secrets": [],
+        }
+        plan = _plan_dir(self.root, "plan1", manifest)
+        result = self.run_script(plan / "bin" / "activate")
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("failed healthcheck", result.stderr)
+        # No previous generation to fall back to, so the unit is stopped
+        # outright — and the container has to go with it.
+        self.assertIn("stop rigx-app-web.service", self.systemctl_calls())
+        self.assertIn("rm -f rigx-app-web", self.engine_calls())
+
 
 class Rollback(ActivateHarness):
     def test_rollback_reverts_to_previous_generation(self):

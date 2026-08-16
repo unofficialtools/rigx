@@ -109,6 +109,18 @@ def render_activate(manifest: dict, previous_manifest: dict | None = None) -> st
     lines.append('      systemctl restart "$u" || true')
     lines.append("    else")
     lines.append('      systemctl stop "$u" || true')
+    # Nothing is left to supervise this service, so nothing is left to
+    # notice if its container outlived the stop — and a container that
+    # outlives a *failed* deploy is the worst version of the problem:
+    # it holds the ports the next attempt needs while answering the
+    # health probe that decides whether that attempt worked.
+    #
+    # Units this generation installs reap themselves via ExecStopPost=,
+    # but a rollback stops whatever is on disk, which may be an older
+    # generation's unit that predates it. Reaping here covers that.
+    lines.append(
+        "      " + units.reap_command(f'"rigx-{testbed}-$s"')
+    )
     lines.append("    fi")
     lines.append("  done")
     lines.append("}")
@@ -171,6 +183,10 @@ def render_activate(manifest: dict, previous_manifest: dict | None = None) -> st
                     f"systemctl disable --now {_quote(unit)} 2>/dev/null || true"
                 )
                 lines.append(f'rm -f "$RIGX_SYSTEMD_DIR/{unit}"')
+            # The unit is gone; without this the container it started
+            # would keep running with no unit left to name it, holding
+            # ports for a service that no longer exists in the config.
+            lines.append(units.reap_command(f"rigx-{testbed}-{sname}"))
         if removed:
             lines.append("")
 

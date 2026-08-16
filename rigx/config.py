@@ -477,6 +477,21 @@ class Target:
     # rather than retyped per invocation; `rigx remote <target> <action>
     # [ssh_url]` overrides it, and is required when this is unset.
     ssh_url: str = ""
+    # `host_exclusive` — this testbed owns the whole host, so deploying
+    # it evicts every *other* rigx testbed found there.
+    #
+    # Off by default, and deliberately declared in `rigx.toml` rather
+    # than passed as a `--force`-style flag. `deploy` is the most-run
+    # command there is; making it destructive to things it doesn't
+    # recognise would mean one mistyped target name silently deletes a
+    # peer deployment, and a host legitimately running app + worker + db
+    # as separate testbeds would be cut down to one. As a declared
+    # property of the deployment it is reviewable, versioned, and can't
+    # be forgotten the way a flag is — the machines that really are
+    # single-tenant say so once, and everyone else keeps a `deploy` that
+    # only ever touches its own testbed. Evicting preserves the other
+    # testbeds' persistent volumes; see `rigx.deploy.hostinv.teardown`.
+    host_exclusive: bool = False
 
     def variant_names(self) -> list[str]:
         return sorted(self.variants.keys())
@@ -1123,6 +1138,21 @@ def _parse_testbed_ssh_url(tconf: dict, tctx: str) -> str:
     return raw
 
 
+def _parse_host_exclusive(tconf: dict, tctx: str) -> bool:
+    """Parse `host_exclusive` on a `kind = "testbed"` target.
+
+    Strictly a bool — no truthy-string coercion. The field authorises a
+    deploy to delete other deployments off the host, so
+    `host_exclusive = "no"` must not quietly mean yes.
+    """
+    raw = tconf.get("host_exclusive", False)
+    if not isinstance(raw, bool):
+        raise ConfigError(
+            f"{tctx}: 'host_exclusive' must be a boolean (got {raw!r})"
+        )
+    return raw
+
+
 def _infer_language(sources: list[str], explicit: str, ctx: str) -> str:
     """Resolve a target's `language` field.
 
@@ -1356,6 +1386,7 @@ def _build_target(
         testbed_volumes = _parse_testbed_volumes(tconf, tctx)
         testbed_secrets = _parse_testbed_secrets(tconf, tctx)
         testbed_ssh_url = _parse_testbed_ssh_url(tconf, tctx)
+        testbed_host_exclusive = _parse_host_exclusive(tconf, tctx)
     else:
         volumes = _parse_volumes(
             tconf.get("volumes"), tctx, path_prefix=path_prefix,
@@ -1364,6 +1395,7 @@ def _build_target(
         testbed_volumes = []
         testbed_secrets = {}
         testbed_ssh_url = ""
+        testbed_host_exclusive = False
     user = str(tconf.get("user", "") or "")
 
     return Target(
@@ -1413,6 +1445,7 @@ def _build_target(
         testbed_volumes=testbed_volumes,
         testbed_secrets=testbed_secrets,
         ssh_url=testbed_ssh_url,
+        host_exclusive=testbed_host_exclusive,
     )
 
 

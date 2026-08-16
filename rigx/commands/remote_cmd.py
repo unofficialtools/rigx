@@ -28,8 +28,12 @@ import sys
 
 from rigx import config
 from rigx.config import Project, Target
-from rigx.deploy import bootstrap, pack, plan, secrets
+from rigx.deploy import bootstrap, hostinv, pack, plan, secrets, units
 from rigx.deploy.bootstrap import DeployError, SSHTarget
+
+
+def _sh_quote(s: str) -> str:
+    return "'" + s.replace("'", "'\\''") + "'"
 
 
 def _resolve_target(project: Project, target_name: str) -> Target:
@@ -88,6 +92,52 @@ def _fetch_previous_manifest(ssh_target: SSHTarget, testbed_name: str) -> dict |
         return None
 
 
+def _evict_other_testbeds(ssh_target: SSHTarget, testbed: Target) -> None:
+    """`host_exclusive = true`: take every *other* rigx testbed on the
+    host down before deploying this one.
+
+    Reads the host's own list of testbeds rather than anything local, so
+    it evicts deployments this project has never heard of — which is the
+    only interesting case, since a testbed you still have the config for
+    you could already stop by name. Persistent volumes are left behind
+    (see `hostinv.teardown`), so an eviction is reversible by
+    redeploying whatever was evicted.
+    """
+    others = [n for n in hostinv.list_testbeds(ssh_target) if n != testbed.name]
+    if not others:
+        return
+    print(
+        f"[rigx remote deploy] host_exclusive: evicting {len(others)} other "
+        f"testbed(s) from {ssh_target.destination}: {', '.join(others)}"
+    )
+    for name in others:
+        hostinv.teardown(ssh_target, name)
+        print(f"[rigx remote deploy] evicted {name!r} (volumes kept)")
+
+
+def _check_port_conflicts(ssh_target: SSHTarget, testbed: Target) -> None:
+    """Fail before building anything if a container that isn't ours
+    already holds a host port this testbed publishes.
+
+    This is a preflight rather than something `activate` discovers,
+    because of how badly the engine reports it: a port collision only
+    surfaces when the container tries to bind, which is after `activate`
+    has restarted the unit, so the operator sees `Restart=always` cycle
+    and the health gate exhaust its retries against a service that never
+    got far enough to be unhealthy. The port is the cause; the health
+    check is what happens to notice. Saying so up front is the entire
+    improvement.
+    """
+    wanted = hostinv.declared_host_ports(testbed)
+    if not wanted:
+        return
+    conflicts = hostinv.find_port_conflicts(
+        hostinv.list_containers(ssh_target), testbed.name, wanted,
+    )
+    if conflicts:
+        raise DeployError(hostinv.format_conflicts(testbed.name, conflicts))
+
+
 def cmd_remote_deploy(args: argparse.Namespace) -> int:
     from rigx import cli
     try:
@@ -111,6 +161,14 @@ def cmd_remote_deploy(args: argparse.Namespace) -> int:
             print(f"rigx remote deploy: warning: {info.dns_warning}", file=sys.stderr)
 
         ssh_target = bootstrap.parse_ssh_url(ssh_url)
+
+        # Both of these run before anything is built or copied: a host
+        # that can't accept this testbed should say so in seconds, not
+        # after a full capsule build and a `nix copy`.
+        if testbed.host_exclusive:
+            _evict_other_testbeds(ssh_target, testbed)
+        _check_port_conflicts(ssh_target, testbed)
+
         previous_manifest = _fetch_previous_manifest(ssh_target, testbed.name)
 
         print(f"[rigx remote deploy] building capsules + compiling plan for {testbed.name!r}")
@@ -166,6 +224,24 @@ def _lifecycle(args: argparse.Namespace, action: str) -> int:
             unit = f"rigx-{testbed.name}-{sname}.service"
             print(f"[rigx remote {action}] {unit}")
             bootstrap.run_remote(ssh_target, f"sudo systemctl {action} {unit}")
+            if action == "stop":
+                # `stop` has to mean the container is gone, not just its
+                # supervisor. Units rendered from this version reap
+                # themselves via ExecStopPost=, but a host deployed by an
+                # older rigx is running units that don't — and reporting
+                # "done" while the container still holds port 80 is how a
+                # later deploy of a *different* testbed ends up failing a
+                # health check it was never going to pass.
+                bootstrap.run_remote(
+                    ssh_target,
+                    "sudo sh -c "
+                    + _sh_quote(
+                        units.reap_command(
+                            units.container_name(testbed.name, sname)
+                        )
+                    ),
+                    check=False,
+                )
     except DeployError as e:
         print(f"rigx remote {action}: {e}", file=sys.stderr)
         return 1

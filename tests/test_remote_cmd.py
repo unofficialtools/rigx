@@ -276,6 +276,186 @@ class FetchPreviousManifest(unittest.TestCase):
         self.assertIsNone(result)
 
 
+_TESTBED_WITH_PORT = """
+    [project]
+    name = "p"
+
+    [targets.web_capsule]
+    kind       = "capsule"
+    backend    = "lite"
+    entrypoint = "/bin/true"
+
+    [targets.app]
+    kind = "testbed"
+
+    [targets.app.services.web]
+    capsule = "web_capsule"
+    ports   = [{ host = 80, container = 8000 }]
+"""
+
+
+def _with_host_exclusive(toml_body: str) -> str:
+    """Add `host_exclusive = true` to the `app` testbed. Matches the
+    indented form the fixtures are written in (TempProject dedents)."""
+    marker = '    [targets.app]\n    kind = "testbed"'
+    assert marker in toml_body
+    return toml_body.replace(marker, marker + "\n    host_exclusive = true")
+
+
+def _running(name, ports="0.0.0.0:80->8080/tcp"):
+    from rigx.deploy import hostinv
+    return hostinv.Container(
+        name=name, state="running", published=hostinv.parse_published(ports),
+    )
+
+
+class PortConflictPreflight(unittest.TestCase):
+    """A port collision only surfaces when the container tries to bind,
+    which is *after* activate has restarted the unit — so without this
+    the operator sees a health gate exhaust its retries against a
+    service that never got far enough to be unhealthy."""
+
+    def _deploy(self, toml_body, containers, host_exclusive_toml=""):
+        body = toml_body + host_exclusive_toml
+        with TempProject(body) as root:
+            with mock.patch.object(
+                remote_cmd.bootstrap, "bootstrap", return_value=_HOST_INFO,
+            ), mock.patch.object(
+                remote_cmd.bootstrap, "run_remote",
+                return_value=mock.Mock(returncode=1, stdout=""),
+            ), mock.patch.object(
+                remote_cmd.hostinv, "list_containers", return_value=containers,
+            ), mock.patch.object(
+                remote_cmd.hostinv, "list_testbeds", return_value=[],
+            ), mock.patch.object(
+                remote_cmd.pack, "build_and_push_plan",
+                return_value="/nix/store/plan",
+            ) as fake_push:
+                out, err = io.StringIO(), io.StringIO()
+                with redirect_stdout(out), redirect_stderr(err):
+                    rc = remote_cmd.cmd_remote_deploy(_args(root))
+        return rc, out.getvalue(), err.getvalue(), fake_push
+
+    def test_conflict_fails_before_anything_is_built(self):
+        rc, out, err, fake_push = self._deploy(
+            _TESTBED_WITH_PORT, [_running("rigx-other-web")],
+        )
+        self.assertEqual(rc, 1)
+        self.assertIn("port 80", err)
+        self.assertIn("rigx-other-web", err)
+        # The whole point of a preflight: no capsule build, no nix copy.
+        fake_push.assert_not_called()
+
+    def test_our_own_container_is_not_a_conflict(self):
+        rc, out, err, fake_push = self._deploy(
+            _TESTBED_WITH_PORT, [_running("rigx-app-web")],
+        )
+        self.assertEqual(rc, 0, err)
+        fake_push.assert_called_once()
+
+    def test_clean_host_deploys(self):
+        rc, out, err, fake_push = self._deploy(_TESTBED_WITH_PORT, [])
+        self.assertEqual(rc, 0, err)
+        fake_push.assert_called_once()
+
+    def test_testbed_with_no_published_ports_skips_the_check(self):
+        with TempProject(_ONE_TESTBED) as root:
+            with mock.patch.object(
+                remote_cmd.bootstrap, "bootstrap", return_value=_HOST_INFO,
+            ), mock.patch.object(
+                remote_cmd.bootstrap, "run_remote",
+                return_value=mock.Mock(returncode=1, stdout=""),
+            ), mock.patch.object(
+                remote_cmd.hostinv, "list_containers",
+            ) as fake_list, mock.patch.object(
+                remote_cmd.pack, "build_and_push_plan", return_value="/nix/store/p",
+            ):
+                with redirect_stdout(io.StringIO()):
+                    rc = remote_cmd.cmd_remote_deploy(_args(root))
+        self.assertEqual(rc, 0)
+        fake_list.assert_not_called()
+
+
+class HostExclusive(unittest.TestCase):
+    """`host_exclusive = true` is opt-in, declared in rigx.toml rather
+    than passed as a flag: `deploy` is the most-run command there is,
+    and one mistyped target name must not silently delete a peer
+    deployment."""
+
+    _exclusive = staticmethod(_with_host_exclusive)
+
+    def _deploy(self, toml_body, other_testbeds):
+        with TempProject(toml_body) as root:
+            with mock.patch.object(
+                remote_cmd.bootstrap, "bootstrap", return_value=_HOST_INFO,
+            ), mock.patch.object(
+                remote_cmd.bootstrap, "run_remote",
+                return_value=mock.Mock(returncode=1, stdout=""),
+            ), mock.patch.object(
+                remote_cmd.hostinv, "list_testbeds", return_value=other_testbeds,
+            ), mock.patch.object(
+                remote_cmd.hostinv, "list_containers", return_value=[],
+            ), mock.patch.object(
+                remote_cmd.hostinv, "teardown",
+            ) as fake_teardown, mock.patch.object(
+                remote_cmd.pack, "build_and_push_plan", return_value="/nix/store/p",
+            ):
+                out = io.StringIO()
+                with redirect_stdout(out), redirect_stderr(io.StringIO()):
+                    rc = remote_cmd.cmd_remote_deploy(_args(root))
+        return rc, out.getvalue(), fake_teardown
+
+    def test_off_by_default_nothing_is_evicted(self):
+        rc, out, fake = self._deploy(_TESTBED_WITH_PORT, ["app", "other"])
+        self.assertEqual(rc, 0)
+        fake.assert_not_called()
+
+    def test_evicts_other_testbeds_but_never_itself(self):
+        rc, out, fake = self._deploy(
+            self._exclusive(_TESTBED_WITH_PORT), ["app", "other", "legacy"],
+        )
+        self.assertEqual(rc, 0)
+        evicted = sorted(c.args[1] for c in fake.call_args_list)
+        self.assertEqual(evicted, ["legacy", "other"])
+        self.assertIn("evicting 2 other testbed(s)", out)
+
+    def test_eviction_keeps_persistent_volumes(self):
+        rc, out, fake = self._deploy(self._exclusive(_TESTBED_WITH_PORT), ["other"])
+        # Evicting a deployment says nothing about whether its database
+        # was wanted — purge is never implied.
+        for call in fake.call_args_list:
+            self.assertNotEqual(call.kwargs.get("purge"), True)
+        self.assertIn("volumes kept", out)
+
+    def test_exclusive_host_with_nothing_else_on_it_is_a_no_op(self):
+        rc, out, fake = self._deploy(self._exclusive(_TESTBED_WITH_PORT), ["app"])
+        self.assertEqual(rc, 0)
+        fake.assert_not_called()
+        self.assertNotIn("evicting", out)
+
+
+class HostExclusiveSchema(unittest.TestCase):
+    def test_defaults_to_false(self):
+        with TempProject(_ONE_TESTBED) as root:
+            self.assertFalse(config.load(root).targets["app"].host_exclusive)
+
+    def test_accepts_true(self):
+        with TempProject(_with_host_exclusive(_ONE_TESTBED)) as root:
+            self.assertTrue(config.load(root).targets["app"].host_exclusive)
+
+    def test_rejects_non_boolean(self):
+        # The field authorises deleting other deployments off a host, so
+        # `host_exclusive = "no"` must not quietly mean yes.
+        for value in ('"no"', '"true"', "1"):
+            body = _with_host_exclusive(_ONE_TESTBED).replace(
+                "host_exclusive = true", f"host_exclusive = {value}",
+            )
+            with TempProject(body) as root:
+                with self.assertRaises(config.ConfigError, msg=value) as cm:
+                    config.load(root)
+                self.assertIn("host_exclusive", str(cm.exception))
+
+
 class CmdRemoteDeploy(unittest.TestCase):
     def test_happy_path_no_secrets(self):
         with TempProject(_ONE_TESTBED) as root:
@@ -413,10 +593,34 @@ class Lifecycle(unittest.TestCase):
                 rc, out, err = self._run(remote_cmd.cmd_remote_stop, root)
         self.assertEqual(rc, 0, err)
         calls = [c.args[1] for c in fake_run.call_args_list]
+        # Each stop is followed by reaping that service's container:
+        # `systemctl stop` alone leaves an attached `podman run`'s
+        # container alive, still holding its published ports.
         self.assertEqual(calls, [
             "sudo systemctl stop rigx-app-web.service",
+            "sudo sh -c 'podman rm -f rigx-app-web >/dev/null 2>&1 || "
+            "docker rm -f rigx-app-web >/dev/null 2>&1 || true'",
             "sudo systemctl stop rigx-app-db.service",
+            "sudo sh -c 'podman rm -f rigx-app-db >/dev/null 2>&1 || "
+            "docker rm -f rigx-app-db >/dev/null 2>&1 || true'",
         ])
+
+    def test_start_and_restart_do_not_reap_containers(self):
+        # Reaping belongs to `stop` only — doing it on restart would
+        # remove the container systemd is about to bring back, and on
+        # start there is nothing to reap in the first place.
+        for func in (remote_cmd.cmd_remote_start, remote_cmd.cmd_remote_restart):
+            with TempProject(_ONE_TESTBED) as root:
+                with mock.patch.object(
+                    remote_cmd, "_fetch_previous_manifest",
+                    return_value=_TWO_SERVICE_MANIFEST,
+                ), mock.patch.object(
+                    remote_cmd.bootstrap, "run_remote",
+                ) as fake_run:
+                    rc, out, err = self._run(func, root)
+            self.assertEqual(rc, 0, err)
+            calls = [c.args[1] for c in fake_run.call_args_list]
+            self.assertFalse([c for c in calls if "rm -f" in c], calls)
 
     def test_restart_uses_manifest_order(self):
         with TempProject(_ONE_TESTBED) as root:

@@ -129,13 +129,54 @@ class Confinement(unittest.TestCase):
             )
             self.assertNotIn("DynamicUser", text, f"backend={backend!r}")
             self.assertNotIn("SupplementaryGroups", text, f"backend={backend!r}")
-            self.assertNotIn("docker", text, f"backend={backend!r}")
+            # "docker" on its own appears legitimately in ExecStopPost=,
+            # which names both engines to reap the container. What must
+            # not come back is joining the socket group.
+            self.assertNotIn("=docker", text, f"backend={backend!r}")
 
     def test_missing_backend_key_still_renders(self):
         svc = _svc()
         svc.pop("capsule_backend", None)
         text = units.render_unit("app", "web", svc)
         self.assertNotIn("DynamicUser", text)
+
+
+class ContainerReaping(unittest.TestCase):
+    """Stopping the unit has to stop the container. `ExecStart` is an
+    attached `podman run`, and killing an attached run does not
+    reliably take its container down — so without this the container
+    outlives the unit and keeps its published ports."""
+
+    def test_unit_reaps_its_own_container_on_stop(self):
+        text = units.render_unit("app", "web", _svc())
+        self.assertIn("ExecStopPost=", text)
+        self.assertIn("rigx-app-web", text.split("ExecStopPost=")[1])
+
+    def test_reaping_is_present_on_the_secrets_path_too(self):
+        text = units.render_unit(
+            "app", "web", _svc(secrets={"api_key": "/run/secrets/api_key"}),
+        )
+        self.assertIn("ExecStopPost=", text)
+
+    def test_reap_command_contains_no_dollar_sign(self):
+        # systemd expands $VAR/${VAR} inside Exec* lines before the shell
+        # sees them, and an unset name expands to EMPTY rather than
+        # erroring — so a "$ENGINE" here would silently become `"" rm -f`.
+        self.assertNotIn("$", units.reap_command("rigx-app-web"))
+
+    def test_reap_tries_both_engines(self):
+        cmd = units.reap_command("c")
+        self.assertIn("podman rm -f c", cmd)
+        self.assertIn("docker rm -f c", cmd)
+        # Never fail the stop over it: a missing container is the normal
+        # case, and a failing ExecStopPost= would mark the unit failed.
+        self.assertTrue(cmd.rstrip().endswith("|| true"))
+
+    def test_container_name_matches_the_name_the_runner_is_given(self):
+        text = units.render_unit("app", "web", _svc())
+        self.assertIn(
+            f'Environment="RIGX_NAME={units.container_name("app", "web")}"', text,
+        )
 
 
 class Supervision(unittest.TestCase):

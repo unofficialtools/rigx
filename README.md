@@ -2531,6 +2531,93 @@ started talking to a host. If a testbed declares no `ssh_url` and none
 is given on the command line, the command fails before touching the
 network.
 
+#### Sharing a host: port conflicts, `host_exclusive`, and `rigx host`
+
+Each testbed is its own namespace on the target — its own systemd
+units, state directory, container network and Nix profile — so one host
+can carry several of them. The one thing they genuinely compete for is
+*host ports*.
+
+`rigx remote deploy` therefore checks, before it builds or copies
+anything, whether a container that isn't part of this testbed already
+holds a port the testbed publishes:
+
+```
+rigx remote deploy: testbed 'myapp' cannot deploy: host port(s) already in use on the target
+  port 80 (service 'web') is held by container 'rigx-oldapp-web' — testbed 'oldapp'
+
+Free the port by taking the other deployment down (`rigx host destroy <ssh_url> oldapp`),
+or set `host_exclusive = true` on [targets.myapp] to have deploys evict other rigx
+testbeds automatically.
+```
+
+Without the check the same situation reports itself as `web failed
+healthcheck after 20 tries` — the container engine only discovers a
+port collision when the container tries to bind, which is after
+`activate` has restarted the unit, so what you actually see is
+`Restart=always` cycling and the health gate exhausting its retries
+against a service that never got far enough to be unhealthy. The
+testbed's own containers are ignored by the check, since a redeploy
+always finds the generation it is replacing still holding the port.
+
+A machine that is meant to run exactly one testbed can say so:
+
+```toml
+[targets.myapp]
+kind           = "testbed"
+ssh_url        = "ssh://deploy@example.com"
+host_exclusive = true      # deploying evicts every other rigx testbed here
+```
+
+This is off by default and deliberately lives in `rigx.toml` rather
+than being a `--force`-style flag. `deploy` is the most-run command
+there is; making it destructive to anything it doesn't recognise would
+mean one mistyped target name silently deleting a peer deployment, and
+a host legitimately running app + worker + db as separate testbeds
+would be cut down to one. As a declared property of the deployment it
+is reviewable, versioned with the thing it applies to, and can't be
+forgotten the way a flag is. Eviction keeps the evicted testbeds'
+persistent volumes, so it is reversible by redeploying them.
+
+**Inspecting a host directly.** `rigx host` answers questions about a
+*machine* rather than a target, and needs no `rigx.toml` at all:
+
+```sh
+rigx host ls ssh://root@example.com
+rigx host destroy ssh://root@example.com oldapp             # keeps its volumes
+rigx host destroy ssh://root@example.com oldapp --purge     # deletes them too
+```
+
+`ls` reads the host's own record of itself — each testbed's Nix
+profile, the manifest of whichever generation is live, and what the
+container engine is actually running:
+
+```
+root@example.com: 2 testbed(s)
+
+oldapp
+  generation  /nix/store/…-oldapp
+  web         running     80->8080
+myapp
+  generation  /nix/store/…-myapp
+  db          running
+  web         no container 80->8000
+```
+
+It also lists *orphaned* `rigx-*` containers — ones no testbed profile
+claims, which is the shape a half-removed deployment leaves behind and
+which hold their published ports whether or not anything supervises
+them.
+
+Doing this without a project is the point rather than a convenience.
+`rigx remote <target> stop` can only address a testbed the local
+project still declares, so a deployment whose checkout has been lost,
+renamed, or moved to another machine could not be shut down through
+rigx at all — which is exactly how hosts end up in the half-removed
+state above. `destroy` keeps `/var/lib/rigx/<testbed>` unless `--purge`
+is given: removing a deployment from a host says nothing about whether
+its database was wanted.
+
 #### Worked example: a bottle.py hello world on example.com
 
 The smallest thing that exercises the whole path — a Python web app,

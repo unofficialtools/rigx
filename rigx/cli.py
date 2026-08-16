@@ -36,6 +36,7 @@ def _load(args):
     from pathlib import Path
     root = Path(args.project) if args.project else _find_project_root(Path.cwd())
     return config.load(root)
+from rigx.commands.host_cmd import cmd_host_destroy, cmd_host_ls
 from rigx.commands.list_cmd import cmd_list
 from rigx.commands.lock import cmd_lock
 from rigx.commands.ls_source import cmd_ls_source
@@ -280,6 +281,48 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_ssh_url_arg(rp)
     rp.set_defaults(func=cmd_remote_rollback)
+
+    # `host` rather than another `remote` action: these address a
+    # machine, not a target, so they take no target name and read no
+    # rigx.toml — which is the point, since the case that needs them is
+    # a host whose project is missing. See rigx.commands.host_cmd.
+    sp = sub.add_parser(
+        "host",
+        help="inspect or clean up a deploy target (no rigx.toml needed)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  rigx host ls ssh://root@example.com\n"
+            "  rigx host destroy ssh://root@example.com old_app\n"
+            "  rigx host destroy ssh://root@example.com old_app --purge"
+        ),
+    )
+    host_sub = sp.add_subparsers(dest="host_command", required=True)
+
+    hp = host_sub.add_parser(
+        "ls",
+        help="list the testbeds and rigx containers a host is carrying",
+    )
+    hp.add_argument("ssh_url", help="ssh://[user@]host[:port]")
+    hp.set_defaults(func=cmd_host_ls)
+
+    hp = host_sub.add_parser(
+        "destroy",
+        help="remove one testbed (units, containers, network, profile) from a host",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Persistent volumes under /var/lib/rigx/<testbed> are kept "
+            "unless --purge is given."
+        ),
+    )
+    hp.add_argument("ssh_url", help="ssh://[user@]host[:port]")
+    hp.add_argument("testbed", help="testbed name as `rigx host ls` reports it")
+    hp.add_argument(
+        "--purge",
+        action="store_true",
+        help="also delete the testbed's persistent volumes (irreversible)",
+    )
+    hp.set_defaults(func=cmd_host_destroy)
 
     return p
 

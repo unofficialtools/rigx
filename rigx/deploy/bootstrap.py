@@ -75,13 +75,20 @@ def parse_ssh_url(url: str) -> SSHTarget:
 
 
 def run_remote(
-    target: SSHTarget, command: str, *, check: bool = True
+    target: SSHTarget, command: str, *, check: bool = True, stdin: str | None = None,
 ) -> subprocess.CompletedProcess:
     """Run `command` on `target` over ssh via the remote login shell,
     return the CompletedProcess. Every caller here passes a fixed
-    string with no target-controlled interpolation."""
+    string with no target-controlled interpolation.
+
+    `stdin` feeds text to the remote command, which is how a multi-line
+    script is run without smuggling it through a shell-quoted argument:
+    `run_remote(t, "sudo sh -s", stdin=script)` leaves the script's own
+    quoting entirely alone. See `rigx.deploy.hostinv.teardown`.
+    """
     proc = subprocess.run(
         target.ssh_argv() + [command],
+        input=stdin,
         capture_output=True,
         text=True,
     )
