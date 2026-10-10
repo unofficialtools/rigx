@@ -56,7 +56,8 @@ def resolve_artifact_paths(project: Project, testbed: Target) -> dict[str, str]:
     built = dict(builder.build(project, names))
     paths: dict[str, str] = {}
     for name in names:
-        link = built.get(name)
+        # build() reports Nix attrs: `frontend.web` builds as `frontend_web`.
+        link = built.get(name.replace(".", "_"))
         if link is None:
             raise DeployError(f"artifact {name!r} did not build (no output link)")
         paths[name] = str(Path(link).resolve())
@@ -73,7 +74,7 @@ def resolve_capsule_paths(project: Project, testbed: Target) -> dict[str, str]:
     built = dict(builder.build(project, capsule_names))
     paths: dict[str, str] = {}
     for name in capsule_names:
-        link = built.get(name)
+        link = built.get(name.replace(".", "_"))
         if link is None:
             raise DeployError(f"capsule {name!r} did not build (no output link)")
         paths[name] = str(Path(link).resolve())
@@ -135,9 +136,15 @@ def copy_to_target(
     already has aren't retransferred.
     """
     paths = [store_path, *extra_paths]
+    env = None
+    if target.port:
+        # The ssh:// store URL takes no port; nix passes NIX_SSHOPTS to ssh.
+        import os
+        opts = os.environ.get("NIX_SSHOPTS", "")
+        env = {**os.environ, "NIX_SSHOPTS": f"{opts} -p {target.port}".strip()}
     proc = subprocess.run(
         ["nix", "copy", "--to", f"ssh://{target.destination}", *paths],
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=env,
     )
     if proc.returncode != 0:
         raise DeployError(f"nix copy to {target.destination}: {proc.stderr.strip()}")

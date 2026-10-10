@@ -130,7 +130,10 @@ _rigx_resolve_volume() {{
         *) echo "{label}: malformed volume spec: $spec" >&2; exit 1;;
     esac
     case "$h" in
-        /*|~*) ;;
+        # Quoted in the spec, so bash never tilde-expanded it; docker
+        # would read a literal `~/x` as a named volume.
+        "~"|"~/"*) h="$HOME${{h#\\~}}" ;;
+        /*) ;;
         *) if [ -z "$RIGX_PROJECT_ROOT" ]; then
                echo "{label}: relative host path '$h' needs RIGX_PROJECT_ROOT or a rigx.toml in \\$PWD or above" >&2
                exit 1
@@ -333,6 +336,9 @@ fi
 # (necessarily unique, necessarily long) --name.
 [ -n "${{RIGX_NETWORK_ALIAS:-}}" ] && RUN_FLAGS+=(--network-alias "$RIGX_NETWORK_ALIAS")
 
+# bash sets UID but not GID, and `set -u` would abort on the documented
+# `user = "$UID:$GID"`.
+GID="${{GID:-$(id -g)}}"
 USER_VAL="${{RIGX_USER:-{user_default}}}"
 [ -n "$USER_VAL" ] && RUN_FLAGS+=(--user "$USER_VAL")
 
@@ -409,7 +415,6 @@ fi
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 
 {runtime_spec_loader}
-CID="${{RIGX_NAME:-rigx-{target.name}-$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid)}}"
 
 echo "[{label}] loading {image_tag}" >&2
 "$ENGINE" load < "$HERE/image/image.tar.gz" >&2

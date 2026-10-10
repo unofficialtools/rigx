@@ -106,9 +106,18 @@ def shell_quote(s: str) -> str:
     Kept hand-rolled (rather than delegating to `shlex.quote`) because
     the exact byte output is part of the flake-eval hash — switching
     would change derivation paths for every C/C++/run target without
-    actually fixing anything. Functionally equivalent to `shlex.quote`."""
-    if not s or any(c in s for c in " \t\n\"'$\\`*?[]{}|&;<>()!#~"):
-        return "'" + s.replace("'", "'\\''") + "'"
+    actually fixing anything. Functionally equivalent to `shlex.quote`.
+
+    The output never contains `''`: every quoted word lands inside a Nix
+    `''…''` indented string, where `''` ends the string. So an empty
+    word is `""`, and an apostrophe is closed-quoted as `'"'"'` with the
+    empty `''` pieces that leaves at the edges dropped. Words without an
+    apostrophe quote exactly as before."""
+    if not s:
+        return '""'
+    if any(c in s for c in " \t\n\"'$\\`*?[]{}|&;<>()!#~"):
+        quoted = "'" + s.replace("'", "'\"'\"'") + "'"
+        return quoted.replace("''", "")
     return s
 
 

@@ -5,7 +5,6 @@ from __future__ import annotations
 from rigx.config import Project, Target
 from rigx.nix.capsule_common import (
     internal_dep_paths_expr,
-    capsule_image_tag,
     capsule_manifest,
     nixos_runner_script,
 )

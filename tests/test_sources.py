@@ -203,6 +203,26 @@ class ProjectBaseline(unittest.TestCase):
         self.assertFalse(any(f.startswith("__pycache__/") for f in base))
 
 
+class ClearCaches(unittest.TestCase):
+    def test_new_files_appear_after_clear_caches(self):
+        """`rigx watch` reloads in one process; without clearing, a file
+        created after the first scan never joins the source set."""
+        body = """
+            [project]
+            name = "p"
+            sources = ["src/*.c"]
+        """
+        with ProjectFixture(body, {"src/x.c": ""}) as root:
+            sources.clear_caches()
+            self.assertEqual(compute_project_files(config.load(root)), ["src/x.c"])
+            (root / "src" / "y.c").write_text("")
+            sources.clear_caches()
+            self.assertEqual(
+                sorted(compute_project_files(config.load(root))),
+                ["src/x.c", "src/y.c"],
+            )
+
+
 class TargetIntersection(unittest.TestCase):
     def test_target_without_sources_inherits_baseline(self):
         body = """

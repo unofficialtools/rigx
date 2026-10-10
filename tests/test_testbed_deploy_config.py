@@ -549,5 +549,25 @@ class HealthcheckScope(unittest.TestCase):
             parse({"command": "true", "scope": "network"}, "x")
 
 
+class DeployNamesAndPaths(unittest.TestCase):
+    """Service, volume and secret names reach generated sh, host paths
+    and a remote command line, and mount paths a `-v` value."""
+
+    def test_names(self):
+        ok = config._check_deploy_name
+        ok("web-1.a_b", "x", "service")
+        for bad in ("a b", "../x", "-x", "a;b", ""):
+            with self.subTest(bad=bad), self.assertRaises(ConfigError):
+                ok(bad, "x", "service")
+
+    def test_service_mount_paths(self):
+        parse = config._parse_testbed_str_map
+        self.assertEqual(parse({"data": "/srv/data"}, "x", field_name="volumes"),
+                         {"data": "/srv/data"})
+        for bad in ("rel/path", "/a:b", "/a,b"):
+            with self.subTest(bad=bad), self.assertRaises(ConfigError):
+                parse({"data": bad}, "x", field_name="volumes")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -2,8 +2,8 @@
 
 Designed for application-protocol integration tests where you have
 multiple processes (capsules) and want to inject faults — packet loss,
-latency, corruption, partitions — between them. Sits at L4 (TCP);
-intentionally not L2/L3.
+latency, corruption, partitions — between them. Sits at L4 (TCP and
+UDP); intentionally not L2/L3.
 
 Typical use:
 
@@ -44,6 +44,7 @@ import heapq
 import ipaddress
 import itertools
 import os
+import queue
 import random
 import re
 import shutil
@@ -226,14 +227,15 @@ class RuleSet:
             data = bytes(ba)
         return data, wait
 
-    def apply(self, data: bytes) -> bytes | None:
-        """Run a chunk through the rule chain, sleeping out its delay in
-        the caller's thread. Returns None if dropped. Used for TCP, where
-        holding up the rest of the stream is what a delay means."""
-        out, wait = self.decide(data)
-        if out is not None and wait > 0:
-            time.sleep(wait)
-        return out
+    def reset_to(self, layers: list[dict]) -> None:
+        """Set every rule to its default overridden by `layers` in order
+        (later wins). In place, so proxy threads holding this object see
+        the change."""
+        merged = {f.name: f.default for f in fields(self)}
+        for layer in layers:
+            merged.update(layer)
+        for name, value in merged.items():
+            setattr(self, name, value)
 
 
 class _DelayQueue:
@@ -363,6 +365,9 @@ class _Link:
     listen_port: int
     proto: str = "tcp"
     rules: RuleSet = field(default_factory=RuleSet)
+    # Active fault()/partition() overrides, oldest first, each tagged
+    # with the context that owns it; `rules` is recomputed from them.
+    fault_layers: list[tuple[object, dict]] = field(default_factory=list)
     # Second listener on the container bridge gateway, for capsules
     # (which can't reach the host's loopback). Same rules, same
     # upstream; None when no usable gateway was found.
@@ -403,9 +408,6 @@ class Network:
       - Topology is fixed at `with`-entry; new links can't be added
         after the testbed is running. Re-enter with a fresh `Network`
         if you need a different shape.
-      - `expose=` external bind on UDP and per-datagram corrupt timing
-        for delayed UDP are partial — see the proxy comments in
-        `_udp_forward` for current behavior.
     """
 
     def __init__(
@@ -440,8 +442,6 @@ class Network:
         self._gateway = _container_gateway() if gateway == "auto" else gateway
         self.verbose = verbose
         self._capsules: dict[str, _CapsuleEntry] = {}
-        # Keyed by (src, dst, dst_port) so multiple ports between the
-        # same pair don't collide.
         # Keyed by (src, dst, dst_port, proto) so a TCP and a UDP link
         # between the same pair on the same port number can coexist.
         self._links: dict[tuple[str, str, int, str], _Link] = {}
@@ -455,6 +455,10 @@ class Network:
         self._conns_lock = threading.Lock()
         self._running = False
         self._stopping = False
+        # Nested `with net:` blocks: only the outermost one stops it.
+        self._depth = 0
+        # Serializes fault-layer changes from concurrent fault() users.
+        self._fault_lock = threading.Lock()
         # Shared volumes — registered up-front via `shared_volume()`,
         # allocated on `__enter__`, deleted on `__exit__`. Stored as
         # a list because handle identity (not name) is what `declare`
@@ -712,11 +716,9 @@ class Network:
                    reachable from inside the capsule's container;
                    otherwise the host loopback endpoint `link()`
                    returned.
-          volumes: host-path → container-path mapping (with mode
-                   recorded as the value when non-default — actually
-                   keyed as `Path(host) -> container_path` in the
-                   default `"rw"` case, or `Path(host) -> (cont,
-                   mode)` if `"ro"`). Always present; empty dict if
+          volumes: `{host_path: container_path}` for read-write
+                   mounts, `{host_path: (container_path, "ro")}` for
+                   read-only ones. Always present; empty dict if
                    the capsule declared no volumes. The testbed must
                    have entered (`__enter__`) so host paths are
                    resolved.
@@ -859,15 +861,8 @@ class Network:
                 f"no link matches src={src!r} dst={dst!r} "
                 f"to_port={to_port!r} proto={proto!r}"
             )
-        snapshots = [(link, _snapshot(link.rules)) for link in affected]
-        for link in affected:
-            for k, v in rules.items():
-                setattr(link.rules, k, v)
-        try:
+        with self._apply_layer(affected, dict(rules)):
             yield
-        finally:
-            for link, snap in snapshots:
-                link.rules = snap
 
     @contextmanager
     def partition(
@@ -886,23 +881,43 @@ class Network:
             raise ValueError(
                 f"no links between {sorted(a)} and {sorted(b)}"
             )
-        snapshots = [(link, _snapshot(link.rules)) for link in affected]
-        for link in affected:
-            link.rules.blocked = True
+        with self._apply_layer(affected, {"blocked": True}):
+            yield
+
+    @contextmanager
+    def _apply_layer(self, links: list[_Link], layer: dict) -> Iterator[None]:
+        """Overlay `layer` on `links` for the duration of the block.
+        Contexts may end in any order (ExitStack, threads): each exit
+        removes only its own layer and recomputes the rules from the
+        layers still active, instead of restoring a snapshot that may
+        undo someone else's fault."""
+        token = object()
+        with self._fault_lock:
+            for link in links:
+                link.fault_layers.append((token, layer))
+                link.rules.reset_to([l for _, l in link.fault_layers])
         try:
             yield
         finally:
-            for link, snap in snapshots:
-                link.rules = snap
+            with self._fault_lock:
+                for link in links:
+                    link.fault_layers = [
+                        (t, l) for t, l in link.fault_layers if t is not token
+                    ]
+                    link.rules.reset_to([l for _, l in link.fault_layers])
 
     # --- Lifecycle ------------------------------------------------------
 
     def __enter__(self) -> "Network":
-        self._start()
+        if self._depth == 0:
+            self._start()
+        self._depth += 1
         return self
 
     def __exit__(self, *exc) -> None:
-        self._stop()
+        self._depth -= 1
+        if self._depth == 0:
+            self._stop()
 
     def _start(self) -> None:
         if self._running:
@@ -1056,8 +1071,19 @@ class Network:
                 client, _ = listener.accept()
             except (socket.timeout, BlockingIOError):
                 continue
-            except OSError:
-                return
+            except OSError as e:
+                if self._stopping:
+                    return  # listener closed by _stop()
+                # Transient (EMFILE, ENOBUFS, …): returning would leave
+                # the port bound with nobody accepting, and clients
+                # would hang in the backlog.
+                if self.verbose:
+                    print(
+                        f"[testbed] {link.src}→{link.dst}: accept failed: {e}",
+                        file=sys.stderr,
+                    )
+                time.sleep(0.1)
+                continue
             t = threading.Thread(
                 target=self._proxy_one,
                 args=(client, link),
@@ -1112,23 +1138,41 @@ class Network:
             return
 
         def pump(src: socket.socket, dst: socket.socket, label: str) -> None:
+            # Each chunk is stamped with the time it may leave, and a
+            # writer sends in order once that time comes. So `delay_ms`
+            # is latency (every byte arrives that much later) rather
+            # than a sleep per recv() that would add up under load and
+            # cap throughput at one chunk per delay.
+            outbox: queue.SimpleQueue = queue.SimpleQueue()
+
+            def writer() -> None:
+                try:
+                    while (item := outbox.get()) is not None:
+                        due, out = item
+                        pause = due - time.monotonic()
+                        if pause > 0:
+                            time.sleep(pause)
+                        dst.sendall(out)
+                except OSError:
+                    pass
+                finally:
+                    try:
+                        dst.shutdown(socket.SHUT_WR)
+                    except OSError:
+                        pass
+
+            w = threading.Thread(target=writer, daemon=True)
+            w.start()
             try:
-                while True:
-                    data = src.recv(4096)
-                    if not data:
-                        break
-                    out = link.rules.apply(data)
-                    if out is None:
-                        # Dropped chunk; keep pumping subsequent chunks.
-                        continue
-                    dst.sendall(out)
+                while data := src.recv(4096):
+                    out, wait = link.rules.decide(data)
+                    if out is not None:  # None: dropped; keep pumping
+                        outbox.put((time.monotonic() + wait, out))
             except OSError:
                 pass
             finally:
-                try:
-                    dst.shutdown(socket.SHUT_WR)
-                except OSError:
-                    pass
+                outbox.put(None)
+                w.join()
 
         t1 = threading.Thread(
             target=pump,
@@ -1262,13 +1306,15 @@ class Network:
                         # listener's address as their source; symmetric
                         # src-IP visibility on the reply path is option
                         # (2) territory and not in v1.
-                        t = threading.Thread(
+                        # Not tracked in _threads: it exits on its own
+                        # once the session's socket closes (GC or
+                        # teardown), and tracking every session would
+                        # grow the list for the testbed's lifetime.
+                        threading.Thread(
                             target=self._udp_reply_pump,
                             args=(listener, sess, link),
                             daemon=True,
-                        )
-                        t.start()
-                        self._threads.append(t)
+                        ).start()
                     else:
                         sess.last_seen = time.monotonic()
                     upstream = sess.upstream
@@ -1331,14 +1377,3 @@ class _UdpSession:
     peer: tuple[str, int]
     upstream: socket.socket
     last_seen: float
-
-
-def _snapshot(rules: RuleSet) -> RuleSet:
-    """Shallow copy of a RuleSet for fault-context save/restore."""
-    return RuleSet(
-        drop_rate=rules.drop_rate,
-        delay_ms=rules.delay_ms,
-        jitter_ms=rules.jitter_ms,
-        corrupt_rate=rules.corrupt_rate,
-        blocked=rules.blocked,
-    )

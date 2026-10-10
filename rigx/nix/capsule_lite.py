@@ -7,7 +7,6 @@ from rigx.nix.capsule_common import (
     internal_dep_paths_expr,
     PLACEHOLDER_BASH_BIN,
     PLACEHOLDER_PATH,
-    capsule_image_tag,
     capsule_manifest,
     capsule_runner_script,
 )

@@ -12,6 +12,7 @@ import socket
 import stat
 import subprocess
 import tempfile
+import time
 import threading
 import unittest
 from contextlib import contextmanager
@@ -410,6 +411,57 @@ class PreYieldCleanup(unittest.TestCase):
             self.assertFalse(spec_path.exists())
 
 
+class FailedStartStopsWhatStarted(unittest.TestCase):
+    """A start that fails before yielding must not leave a container or
+    a runner child behind: nothing else would ever stop them."""
+
+    def test_runner_failure_removes_the_container(self):
+        with fake_capsule("svc", runner_body="#!/bin/sh\nexit 3\n") as root, \
+             mock.patch("rigx.capsule._remove_container") as rm:
+            with self.assertRaises(RuntimeError):
+                with capsule.start("svc", output_dir=root / "output",
+                                   container_name="c1"):
+                    pass
+        rm.assert_called_once_with("c1")
+
+    def test_timeout_kills_the_runners_children(self):
+        runner_body = (
+            '#!/bin/sh\n'
+            'sleep 30 &\n'
+            'echo $! > "$DUMP"\n'
+            'wait\n'
+        )
+        with fake_capsule("svc", runner_body=runner_body) as root, \
+             mock.patch("rigx.capsule._remove_container"):
+            dump = root / "child-pid"
+            with mock.patch.dict(os.environ, {"DUMP": str(dump)}):
+                with self.assertRaises(RuntimeError):
+                    with capsule.start("svc", output_dir=root / "output",
+                                       timeout=0.5):
+                        pass
+            child = int(dump.read_text())
+        time.sleep(0.2)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(child, 0)
+
+    def test_numeric_env_values_become_strings(self):
+        runner_body = '#!/bin/sh\ncat "$RIGX_RUNTIME_SPEC" > "$DUMP"\n'
+        with fake_capsule("svc", runner_body=runner_body) as root:
+            dump = root / "spec"
+            with mock.patch.dict(os.environ, {"DUMP": str(dump)}):
+                with capsule.start("svc", output_dir=root / "output",
+                                   env={"PORT": 5000}):
+                    pass
+            self.assertEqual(json.loads(dump.read_text())["env"], {"PORT": "5000"})
+
+    def test_other_env_values_are_rejected(self):
+        with fake_capsule("svc") as root:
+            with self.assertRaises(TypeError):
+                with capsule.start("svc", output_dir=root / "output",
+                                   env={"X": ["a"]}):
+                    pass
+
+
 class PublishTupleForm(unittest.TestCase):
     """`publish={cont: (addr, host)}` — the form `rigx.testbed`
     produces when capsules have distinct loopback addresses. Renders
@@ -575,7 +627,9 @@ class CapsuleHandle(unittest.TestCase):
         (the runner exec's qemu in foreground, so signaling the runner
         signals qemu)."""
         from unittest.mock import MagicMock
+        import signal
         proc = MagicMock(spec=subprocess.Popen)
+        proc.pid = 4242
         proc.poll.return_value = None  # still running at first
         cap = capsule.Capsule(
             name="svc", container_name="x",
@@ -583,8 +637,10 @@ class CapsuleHandle(unittest.TestCase):
             manifest={"backend": "qemu"},
             _proc=proc,
         )
-        cap.stop()
-        proc.terminate.assert_called_once()
+        # The runner has its own session; its whole group is signaled.
+        with mock.patch("rigx.capsule.os.killpg") as killpg:
+            cap.stop()
+        killpg.assert_called_once_with(4242, signal.SIGTERM)
         proc.wait.assert_called()
         self.assertTrue(cap._stopped)
 
@@ -599,15 +655,20 @@ class CapsuleHandle(unittest.TestCase):
             subprocess.TimeoutExpired(cmd="qemu", timeout=5),
             None,
         ]
+        proc.pid = 4242
         cap = capsule.Capsule(
             name="svc", container_name="x",
             capsule_dir=Path("/nowhere"),
             manifest={"backend": "qemu"},
             _proc=proc,
         )
-        cap.stop()
-        proc.terminate.assert_called_once()
-        proc.kill.assert_called_once()
+        import signal
+        with mock.patch("rigx.capsule.os.killpg") as killpg:
+            cap.stop()
+        self.assertEqual(
+            [c.args for c in killpg.call_args_list],
+            [(4242, signal.SIGTERM), (4242, signal.SIGKILL)],
+        )
 
     def test_qemu_logs_reads_temp_file(self):
         with tempfile.NamedTemporaryFile(

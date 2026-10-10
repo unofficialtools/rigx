@@ -800,6 +800,57 @@ class UdpForwarding(unittest.TestCase):
         self.assertIn("FC_5001_UDP_ADDR", env)   # UDP — suffixed
 
 
+class LifecycleAndFaultLayers(unittest.TestCase):
+    def test_nested_with_keeps_the_outer_testbed_running(self):
+        net = testbed.Network(gateway=None)
+        listen_port, dst_port = _two_capsules(net)
+        with echo_server(dst_port), net:
+            with net:
+                pass
+            # The inner exit must not have stopped the proxies.
+            self.assertEqual(_send_recv("127.0.0.1", listen_port, b"hi\n"), b"hi\n")
+        self.assertFalse(net._running)
+
+    def test_faults_can_end_in_any_order(self):
+        net = testbed.Network(gateway=None)
+        _two_capsules(net)
+        rules = next(iter(net._links.values())).rules
+        f1 = net.fault("sim", "fc", drop_rate=0.5)
+        f2 = net.fault("sim", "fc", drop_rate=0.9, delay_ms=10)
+        f1.__enter__()
+        f2.__enter__()
+        self.assertEqual((rules.drop_rate, rules.delay_ms), (0.9, 10))
+        f1.__exit__(None, None, None)       # f2 is still active
+        self.assertEqual((rules.drop_rate, rules.delay_ms), (0.9, 10))
+        f2.__exit__(None, None, None)
+        self.assertEqual((rules.drop_rate, rules.delay_ms), (0.0, 0.0))
+
+    def test_partition_inside_a_fault_restores_the_fault(self):
+        net = testbed.Network(gateway=None)
+        _two_capsules(net)
+        rules = next(iter(net._links.values())).rules
+        with net.fault("sim", "fc", delay_ms=5):
+            with net.partition(["sim"], ["fc"]):
+                self.assertTrue(rules.blocked)
+            self.assertFalse(rules.blocked)
+            self.assertEqual(rules.delay_ms, 5)
+
+    def test_tcp_delay_is_latency_not_a_stall_per_chunk(self):
+        """1 MB through a 100 ms delay: one chunk per delay would take
+        ~25 s; as latency it takes about 0.1 s more than without."""
+        net = testbed.Network(gateway=None)
+        listen_port, dst_port = _two_capsules(net)
+        payload = b"x" * (1 << 20)
+        with echo_server(dst_port), net:
+            with net.fault("sim", "fc", delay_ms=100):
+                t0 = time.monotonic()
+                got = _send_recv("127.0.0.1", listen_port, payload, timeout=10)
+                elapsed = time.monotonic() - t0
+        self.assertEqual(len(got), len(payload))
+        self.assertGreaterEqual(elapsed, 0.19)   # 100 ms each way
+        self.assertLess(elapsed, 3.0)
+
+
 class ContainerGateway(unittest.TestCase):
     """Capsules run on the container bridge, where 127.0.0.1 is the
     container itself, so each link also listens on the bridge gateway
@@ -878,22 +929,22 @@ class RuleSet(unittest.TestCase):
 
     def test_drop_rate_zero_passes_through(self):
         rs = testbed.RuleSet()
-        self.assertEqual(rs.apply(b"hi"), b"hi")
+        self.assertEqual(rs.decide(b"hi")[0], b"hi")
 
     def test_blocked_returns_none(self):
         rs = testbed.RuleSet(blocked=True)
-        self.assertIsNone(rs.apply(b"hi"))
+        self.assertIsNone(rs.decide(b"hi")[0])
 
     def test_corrupt_rate_one_flips_a_byte(self):
         random.seed(42)
         rs = testbed.RuleSet(corrupt_rate=1.0)
-        out = rs.apply(b"hello")
+        out = rs.decide(b"hello")[0]
         self.assertEqual(len(out), len(b"hello"))
         self.assertNotEqual(out, b"hello")
 
     def test_drop_rate_one_returns_none(self):
         rs = testbed.RuleSet(drop_rate=1.0)
-        self.assertIsNone(rs.apply(b"hi"))
+        self.assertIsNone(rs.decide(b"hi")[0])
 
 
 class WhoHasPort(unittest.TestCase):

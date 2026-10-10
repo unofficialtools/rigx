@@ -26,7 +26,7 @@ import argparse
 import json
 import sys
 
-from rigx import config
+from rigx import builder, config
 from rigx.config import Project, Target
 from rigx.deploy import bootstrap, hostinv, pack, plan, secrets, units
 from rigx.deploy.bootstrap import DeployError, SSHTarget
@@ -186,7 +186,7 @@ def cmd_remote_deploy(args: argparse.Namespace) -> int:
 
         print("[rigx remote deploy] activating")
         bootstrap.run_remote(ssh_target, f"sudo {store_path}/bin/activate")
-    except (DeployError, plan.PlanError) as e:
+    except (DeployError, plan.PlanError, builder.BuildError) as e:
         print(f"rigx remote deploy: {e}", file=sys.stderr)
         return 1
 

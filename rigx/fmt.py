@@ -2,7 +2,7 @@
 
 Renders a TOML document in a stable shape: top-level sections in a fixed
 order, fields within each section grouped into a known schema order, `=`
-aligned within each table for readability, two blank lines between
+aligned within each table for readability, one blank line between
 sections.
 
 **Comments are NOT preserved** — `tomllib` discards them on parse and

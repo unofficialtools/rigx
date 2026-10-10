@@ -481,7 +481,7 @@ rigx build hello@release  # build a specific variant
 rigx build 'hello*'       # glob over target names (variants expanded)
 rigx build -j 8           # up to 8 targets concurrently (one nix-build each)
 rigx build --json         # machine-readable output for CI / scripts
-rigx watch [target]       # rebuild on source change (Ctrl-C to stop)
+rigx watch [target…]      # rebuild on source change (Ctrl-C to stop)
 rigx test                 # discover & run all kind=test targets, sequentially
 rigx test smoke perf      # run only the named tests (literal names)
 rigx test 'unit_*'        # filters are fnmatch patterns — globs work too
@@ -495,6 +495,8 @@ rigx clean                # remove output/
 rigx run publish          # execute a script-kind target (publish/deploy/etc.)
 rigx run deploy -- --dry-run prod   # forward args after `--` as $1, $2, …
 rigx pkg uv -- lock       # run any nixpkgs binary (uv, jq, ripgrep, …) from pinned nixpkgs
+rigx remote app deploy    # deploy a testbed's services over SSH (also start/stop/restart/rollback)
+rigx host ls ssh://h      # list what rigx runs on a host (also: rigx host destroy ssh://h <testbed>)
 ```
 
 If rigx isn't installed, invoke it as a module:
@@ -688,7 +690,7 @@ cxxflags = ["$vars.opt_release", "-DNDEBUG"]
 - An undefined `$vars.<name>` is a config error.
 - Works in every list field of a target or variant: `sources`, `includes`,
   `public_headers`, `cxxflags`, `ldflags`, `nim_flags`, `args`, `outputs`,
-  `native_build_inputs`, and all three `deps.*` lists.
+  `native_build_inputs`, and all four `deps.*` lists.
 
 **Sharing vars across files** — the reserved key `extends` pulls in `[vars]`
 from another TOML file, useful when independent rigx projects (e.g. siblings
@@ -1781,7 +1783,7 @@ between host and container.
 ```toml
 [targets.greeter]
 kind          = "capsule"
-backend       = "lite"                # `lite` (container) or `qemu` (NixOS VM)
+backend       = "lite"                # `lite` (container), `nixos` (systemd container) or `qemu` (NixOS VM)
 deps.internal = ["hello_go"]          # rigx-built deps reachable as ${name}
 deps.nixpkgs  = ["coreutils"]         # PATH inside the container; opt-in
 entrypoint    = "${hello_go}/bin/hello_go --port $PORT"
@@ -1817,6 +1819,9 @@ The runner inherits a few env knobs that orchestrators set:
 | `RIGX_NETWORK`      | join an existing container network               |
 | `RIGX_NETWORK_ALIAS`| extra name the container answers to on `RIGX_NETWORK` (`--network-alias`), so peers can use a short stable name instead of the unique container name in `RIGX_NAME`. Ignored without `RIGX_NETWORK`. |
 | `RIGX_PUBLISH`      | `host:cont,host:cont,…` port forwards            |
+| `RIGX_PUBLISH_UDP`  | same, for UDP (the runner adds `/udp`)           |
+| `RIGX_RUNTIME_SPEC` | path to a JSON file carrying the same settings (name, publish, env, volumes, …) as structured data, so values with commas survive; `rigx.capsule.start()` writes it. Needs `jq`; the variables above remain the fallback. |
+| `RIGX_KEEP_STATE`   | `1` = keep the per-container Nix profile/gcroot dirs after exit (lite) |
 | `RIGX_ENV`          | `K=V,K=V,…` extra env vars                       |
 | `RIGX_VOLUMES`      | `host:cont[:mode],…` extra bind-mounts (`mode`: `rw` / `ro`, default `rw`). Relative `host` paths resolve against `RIGX_PROJECT_ROOT`. Appended to any `volumes` declared in `rigx.toml`; an entry whose container path matches a TOML one replaces it (the engine rejects two mounts on one path). |
 | `RIGX_PROJECT_ROOT` | absolute project root used to resolve relative `host` paths in `RIGX_VOLUMES` and TOML-declared volumes. Default: walk up from `$PWD` to find `rigx.toml`. |
@@ -1879,7 +1884,7 @@ A nixos capsule runs a real NixOS userspace inside a docker/podman
 container with **systemd as PID 1** — so declarative services from
 `nixos_modules` actually run, units start in dependency order, journald
 collects logs. Same FROM-scratch-ish image and host-store mount as
-`lite`, but the user's entrypoint runs as a systemd one-shot service
+`lite`, but the user's entrypoint runs as a systemd service
 rather than the container's `Cmd`.
 
 ```toml
@@ -1922,7 +1927,7 @@ NixOS module files to splice into the system evaluation.
 ### `backend = "qemu"` — full NixOS VM
 
 A qemu capsule boots a real NixOS VM under qemu. The user's entrypoint
-runs as a systemd one-shot service inside the VM, `deps.nixpkgs` land in
+runs as a systemd service inside the VM, `deps.nixpkgs` land in
 `environment.systemPackages`, declared `ports` are forwarded host→guest
 via qemu user-mode networking. Use this when you need a real kernel,
 real init, or a different CPU architecture from the host.
@@ -1956,9 +1961,9 @@ v1 uses NixOS's `system.build.vm`, which 9p-mounts the host's
 `/nix/store` rather than baking a standalone qcow2 — fast iteration,
 host-store-tied, requires KVM on Linux. A self-contained qcow2 layout
 is reserved for follow-on work when mixed-backend labs need the VM to
-run on a different host. The Python `rigx.capsule.start()` orchestrator
-and `rigx.testbed` integration are also deferred — for v1, qemu
-capsules work via `rigx build` + `output/<name>/bin/run-<name>`.
+run on a different host. `rigx.capsule.start()` and `rigx.testbed`
+drive qemu capsules like the others; `start()` keeps the VM as a child
+process and stops it on exit.
 
 #### Customizing the VM with `nixos_modules`
 
@@ -2563,7 +2568,12 @@ checked. If the container isn't running, the check fails.
 ```toml
 [targets.myapp.services.web.healthcheck]
 command = "curl -f http://127.0.0.1:8080/healthz"   # the container's port
-scope   = "host"    # optional: run on the host instead, against published ports
+```
+
+```toml
+[targets.myapp.services.web.healthcheck]
+command = "curl -f http://127.0.0.1:80/healthz"     # a published host port
+scope   = "host"
 ```
 
 Use `scope = "host"` only to check that a published port is reachable

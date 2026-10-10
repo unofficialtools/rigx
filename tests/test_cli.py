@@ -103,6 +103,14 @@ class SplitPkgPassthrough(unittest.TestCase):
         self.assertEqual(args, [".foo"])
 
 
+class ScaffoldRunEscaping(unittest.TestCase):
+    def test_run_value_is_escaped(self):
+        import tomllib
+        from rigx import scaffold
+        block = scaffold._run("x", 'foo "bar\\').toml_block
+        self.assertEqual(tomllib.loads(block)["targets"]["x"]["run"], 'foo "bar\\')
+
+
 class MainKeyboardInterrupt(unittest.TestCase):
     def test_keyboard_interrupt_returns_130(self):
         # `rigx version` is dispatch-only with no I/O; raise KeyboardInterrupt

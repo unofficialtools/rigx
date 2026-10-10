@@ -13,7 +13,7 @@ from rigx.nix.render import nix_id, nix_interp_str, nix_str, nix_value, rewrite_
 
 def mk_qemu_capsule_derivation(target: Target, project: Project) -> str:
     """qemu capsule (kind = "capsule", backend = "qemu"): a full NixOS VM
-    booted under qemu. The user's entrypoint runs as a systemd one-shot
+    booted under qemu. The user's entrypoint runs as a systemd
     service inside the VM; `deps.nixpkgs` go into `environment.systemPackages`;
     declared `ports` are forwarded host→guest via qemu user-mode networking.
 

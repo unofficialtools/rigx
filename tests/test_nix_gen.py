@@ -41,7 +41,20 @@ class Helpers(unittest.TestCase):
         self.assertEqual(nix_gen._shell_quote("${x}/y"), "'${x}/y'")
 
     def test_shell_quote_embedded_single_quote(self):
-        self.assertEqual(nix_gen._shell_quote("it's"), "'it'\\''s'")
+        self.assertEqual(nix_gen._shell_quote("it's"), "'it'\"'\"'s'")
+
+    def test_shell_quote_never_emits_two_apostrophes(self):
+        """Quoted words land inside Nix `''…''` strings, where `''`
+        ends the string."""
+        import shutil
+        import subprocess
+        bash = shutil.which("bash")
+        for word in ("", "it's", "'x", "x'", "''", "a'b'c"):
+            q = nix_gen._shell_quote(word)
+            self.assertNotIn("''", q, word)
+            out = subprocess.run([bash, "-c", f"printf %s {q}"],
+                                 capture_output=True, text=True).stdout
+            self.assertEqual(out, word)
 
     def test_python_pkg_attr(self):
         self.assertEqual(nix_gen._python_pkg_attr("3.12"), "python312")

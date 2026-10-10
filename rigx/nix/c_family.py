@@ -46,8 +46,7 @@ def effective_ldflags(target: Target, variant: Variant | None) -> list[str]:
 
 
 def _internal_includes(target: Target, project: Project) -> list[str]:
-    # Inlined here (rather than importing from flake.py) to keep the
-    # c-family module dependency-free against flake assembly.
+    # Imported late: rigx.nix.flake imports this module.
     from rigx.nix.flake import internal_include_args
     return internal_include_args(target, project)
 
@@ -170,6 +169,9 @@ def build_phase_cxx_shared_library(
     parts += includes
     parts += internal_includes
     parts += target.sources
+    # Internal static libs are built -fPIC, so they can go into a .so;
+    # without them the .so has undefined symbols.
+    parts += _internal_links(target, project)
     parts += ldflags
     parts += ["-o", f"lib{target.name}.so"]
     cmd = "$CXX " + sh_join(parts[1:])
@@ -192,6 +194,9 @@ def build_phase_c_shared_library(
     parts += includes
     parts += internal_includes
     parts += target.sources
+    # Internal static libs are built -fPIC, so they can go into a .so;
+    # without them the .so has undefined symbols.
+    parts += _internal_links(target, project)
     parts += ldflags
     parts += ["-o", f"lib{target.name}.so"]
     cmd = "$CC " + sh_join(parts[1:])

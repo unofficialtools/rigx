@@ -538,6 +538,9 @@ def run_named_script(
             f"target {name!r} (kind={target.kind!r}) is not a script or "
             f"testbed target; use `rigx build {name}` instead"
         )
+    # `${dep}` in the script resolves to output/<dep>, which has to be
+    # built (and current) first, as run_tests does for host tests.
+    _ensure_host_test_deps_built(project, [(name, target)], None)
     print(f"[rigx] running {name}")
     rc = run_script_target(project, target, extra_args)
     if rc != 0:
@@ -609,8 +612,10 @@ def run_tests(
 def _ensure_host_test_deps_built(
     project: Project, host_tests: list[tuple[str, object]], jobs: int | None,
 ) -> None:
-    """Build host tests' `deps.internal` so the `output/<dep>/` symlinks
-    exist before the test scripts reference them. Test/script deps are
+    """Build the `deps.internal` of host-side targets (sandbox = false
+    tests, and the script or testbed `rigx run` starts) so the
+    `output/<dep>/` symlinks exist and are current before the script
+    references them. Test/script deps are
     skipped — `kind = "test"` / `kind = "script"` aren't buildable
     (`build()` would error)."""
     seen: set[str] = set()
@@ -631,7 +636,7 @@ def _ensure_host_test_deps_built(
             to_build.append(dep)
     if not to_build:
         return
-    print(f"[rigx test] building host-test deps: {', '.join(to_build)}")
+    print(f"[rigx] building deps: {', '.join(to_build)}")
     build(project, to_build, jobs=jobs)
 
 
@@ -909,7 +914,7 @@ def _expand_build_spec(project: Project, spec: str) -> list[str]:
         attrs: list[str] = []
         for name in names:
             target = project.targets[name]
-            if target.kind in ("script", "test", "testbed", "check"):
+            if target.kind in ("script", "test", "testbed"):
                 continue
             attr_base = _nix_id(name) if "." in name else name
             if not target.variants:
@@ -920,7 +925,7 @@ def _expand_build_spec(project: Project, spec: str) -> list[str]:
         if not attrs:
             raise BuildError(
                 f"glob {spec!r} matched only non-buildable targets "
-                f"(script/test)"
+                f"(script/test/testbed)"
             )
         return attrs
     name = base
@@ -951,7 +956,7 @@ def build(
                              ignored when matching; matched targets expand
                              all variants automatically.
 
-    `script` and `test` targets are NOT buildable — naming one literally
+    `script`, `test` and `testbed` targets are NOT buildable — naming one literally
     errors with a pointer at `rigx run` / `rigx test`; globs skip them
     silently.
     """
@@ -959,6 +964,8 @@ def build(
         attrs: list[str] = []
         for spec in specs:
             attrs.extend(_expand_build_spec(project, spec))
+        # `rigx build hello 'hel*'` names hello twice; build it once.
+        attrs = list(dict.fromkeys(attrs))
     else:
         attrs = _all_attrs(project)
 

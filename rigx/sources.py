@@ -198,6 +198,15 @@ def _project_files_cached(root_str: str) -> tuple[str, ...]:
     return tuple(_walk_files(Path(root_str)))
 
 
+def clear_caches() -> None:
+    """Forget the cached file lists. They're cached for one process,
+    which is right for a single build but not for `rigx watch`, which
+    must see files created while it runs."""
+    _git_tracked_or_unignored_cached.cache_clear()
+    _project_files_cached.cache_clear()
+    _compute_project_files_cached.cache_clear()
+
+
 def _project_files(project: Project) -> list[str]:
     return list(_project_files_cached(str(project.root.resolve())))
 

@@ -208,6 +208,8 @@ def cmd_watch(args: argparse.Namespace) -> int:
         def scan() -> Signature:
             # Reload after a rigx.toml edit so rebuilds use the new config.
             nonlocal project, last_toml_mtime
+            # New files must be able to enter the target file sets.
+            sources.clear_caches()
             project, last_toml_mtime = _refresh_project(project, last_toml_mtime)
             return _scan_all(project.root)
     else:
@@ -215,6 +217,8 @@ def cmd_watch(args: argparse.Namespace) -> int:
             # If rigx.toml changed, reload the project so rebuilds use
             # the new config (not the stale in-memory project).
             nonlocal project, last_toml_mtime
+            # New files must be able to enter the target file sets.
+            sources.clear_caches()
             project, last_toml_mtime = _refresh_project(project, last_toml_mtime)
             # Re-resolve the tracked set every scan (same cost class as
             # watch-all's rglob) so files newly matching a target's globs

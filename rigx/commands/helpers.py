@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import argparse
 import os
 import sys
 from pathlib import Path
@@ -18,11 +17,6 @@ def find_project_root(start: Path) -> Path:
     raise SystemExit(
         "rigx.toml not found in the current directory or any parent"
     )
-
-
-def load(args: argparse.Namespace) -> config.Project:
-    root = Path(args.project) if args.project else find_project_root(Path.cwd())
-    return config.load(root)
 
 
 def report_build_error(e: builder.BuildError) -> None:
@@ -74,4 +68,3 @@ def format_bytes(n: int) -> str:
         if n < 1024 or unit == "GB":
             return f"{n:.1f} {unit}" if unit != "B" else f"{n} B"
         n /= 1024
-    return f"{n} B"

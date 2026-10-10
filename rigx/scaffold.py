@@ -167,7 +167,10 @@ def _script(name: str) -> Scaffold:
 
 
 def _run(name: str, run_target: str | None) -> Scaffold:
-    run_field = run_target or "tool_or_command_name"
+    from rigx.fmt import _escape_basic
+    # Escaped: a `"` or `\` in --run would otherwise write invalid TOML
+    # into rigx.toml and break every later command.
+    run_field = _escape_basic(run_target or "tool_or_command_name")
     block = (
         f'\n[targets.{name}]\n'
         f'kind    = "run"\n'

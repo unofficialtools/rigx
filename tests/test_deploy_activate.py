@@ -14,6 +14,7 @@ Mirrors the fake-binary approach in test_capsule_runner_exec.py.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import tempfile
@@ -204,6 +205,10 @@ class FirstDeploySucceeds(ActivateHarness):
         self.assertIn("daemon-reload", calls)
         self.assertIn("restart rigx-app-web.service", calls)
         self.assertEqual(self.profile_target("app"), str(plan.resolve()))
+        # Enabled for boot, as `systemctl enable` would.
+        wants = self.systemd_dir / "multi-user.target.wants" / "rigx-app-web.service"
+        self.assertTrue(wants.is_symlink())
+        self.assertEqual(Path(os.readlink(wants)), unit_link)
 
     def test_no_healthcheck_uses_is_active_fallback(self):
         manifest = {
@@ -248,6 +253,9 @@ class FirstDeployFails(ActivateHarness):
         # first-ever deploy: nothing to fall back to -> unit removed, stopped
         self.assertFalse((self.systemd_dir / "rigx-app-web.service").exists())
         self.assertIn("stop rigx-app-web.service", self.systemctl_calls())
+        self.assertFalse(os.path.lexists(
+            self.systemd_dir / "multi-user.target.wants" / "rigx-app-web.service"
+        ))
         # profile pointer never advances on failure
         self.assertIsNone(self.profile_target("app"))
 

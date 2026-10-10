@@ -370,6 +370,35 @@ class HostScriptsInterpolateDeps(unittest.TestCase):
         self.assertIn("echo ${HOME} $app", cmd)
 
 
+class BuildAndRunDetails(unittest.TestCase):
+    def test_a_target_named_twice_builds_once(self):
+        proj = _project_with(app=Target(name="app", kind="executable", sources=["m.c"]))
+        with tempfile.TemporaryDirectory() as d:
+            proj.root = Path(d)
+            with mock.patch("rigx.builder.write_flake"), \
+                 mock.patch("rigx.builder._nix_bin", return_value="/usr/bin/nix"), \
+                 mock.patch("rigx.builder._flake_is_tracked", return_value=False), \
+                 mock.patch("rigx.builder.subprocess.run") as run:
+                run.return_value.returncode = 0
+                builder.build(proj, ["app", "a*"])
+        self.assertEqual(run.call_count, 1)
+
+    def test_rigx_run_builds_the_scripts_deps_first(self):
+        from rigx.config import TargetDeps
+        proj = _project_with(
+            app=Target(name="app", kind="executable", sources=["m.c"]),
+            go=Target(name="go", kind="script", script="${app}/bin/app",
+                      deps=TargetDeps(internal=["app"])),
+        )
+        order = []
+        with mock.patch("rigx.builder.build",
+                        side_effect=lambda p, specs, jobs=None: order.append(("build", specs))), \
+             mock.patch("rigx.builder.run_script_target",
+                        side_effect=lambda *a: order.append(("run",)) or 0):
+            builder.run_named_script(proj, "go")
+        self.assertEqual(order, [("build", ["app"]), ("run",)])
+
+
 class OfflineMode(unittest.TestCase):
     """`rigx --offline` / RIGX_OFFLINE=1 adds `--offline` to every nix
     call, so a missing path fails at once instead of timing out."""

@@ -19,6 +19,34 @@
 
 ### Bug fixes
 
+- **Fixes from a code review.**
+  - **Deploy.** Services are now enabled for boot, so they come back after
+    a reboot. systemd no longer expands `$`/`${…}`/`%` inside health
+    commands and `env` values. `nix copy` honors the port in
+    `ssh://host:port`. Host-scope health commands run in their own shell.
+    Service, volume and secret names are validated, and service mount
+    paths must be absolute. A capsule that fails to build now gives an
+    error instead of a traceback. Dotted (module) capsules deploy.
+  - **Testbed.** A nested `with net:` no longer shuts the testbed down.
+    Overlapping `fault()`/`partition()` contexts can end in any order.
+    TCP `delay_ms` is latency rather than a per-chunk stall that capped
+    throughput. Transient accept errors no longer silently stop a link.
+    UDP sessions no longer leak thread handles.
+  - **`rigx.capsule.start()`.** A failed or timed-out start removes the
+    container or VM it began. Numeric `env` values are accepted.
+  - **Generated Nix.** An empty or apostrophe-containing argument, flag
+    or volume path no longer produces an unparsable flake. `user =
+    "$UID:$GID"` works (bash has no `GID`). `~` in volume host paths is
+    expanded. C/C++ shared libraries link their internal static libraries.
+  - **Config.** Booleans are strict (`sandbox = "false"` is now an error,
+    not true). Ports must be 1-65535. An invalid `ssh_url` port fails at
+    load. A git and a local dependency can't share a name. Testbed
+    services in a module can name sibling capsules.
+  - **CLI.** `rigx run` builds a script's `deps.internal` before running
+    it. `rigx watch` sees newly created files when `[project].sources`
+    is set. `rigx new run --run` escapes its value. A target named twice
+    builds once.
+
 - **Testbed capsules can reach their links.** A link's proxy listened only on
   the host's `127.0.0.1`, which inside a container is the container itself,
   so a capsule started with `start(name, **net.bindings(name))` couldn't

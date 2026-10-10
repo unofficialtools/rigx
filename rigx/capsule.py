@@ -55,6 +55,36 @@ def _container_engine() -> str:
     )
 
 
+def _terminate(proc: subprocess.Popen) -> None:
+    """SIGTERM `proc`'s process group (it was started in a session of
+    its own, so the group is the runner plus everything it spawned),
+    then SIGKILL if it hasn't exited within 5s."""
+    import signal
+    if proc.poll() is not None:
+        return
+    for sig, wait in ((signal.SIGTERM, 5), (signal.SIGKILL, 2)):
+        try:
+            os.killpg(proc.pid, sig)
+        except OSError:
+            proc.send_signal(sig)
+        try:
+            proc.wait(timeout=wait)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
+def _remove_container(name: str) -> None:
+    """Best-effort `rm -f` of a container that may have been started."""
+    try:
+        engine = _container_engine()
+    except RuntimeError:
+        return
+    subprocess.run(
+        [engine, "rm", "-f", name], capture_output=True, check=False,
+    )
+
+
 def _find_output_dir(start_dir: Path | None = None) -> Path:
     """Locate the project's `output/` directory by walking up from
     `start_dir` (default: cwd) until we find a `rigx.toml`. Tests
@@ -161,10 +191,6 @@ class Capsule:
     # plus a log path so `stop()` and `logs()` know where to look.
     _proc: subprocess.Popen | None = None
     _log_path: Path | None = None
-    # Path to the JSON runtime-spec tempfile, if one was written. The
-    # runner reads `RIGX_RUNTIME_SPEC` at startup; we delete the file
-    # in `stop()` to keep /tmp tidy.
-    _runtime_spec_path: Path | None = None
     _stopped: bool = False
 
     @property
@@ -311,17 +337,7 @@ class Capsule:
             # qemu path: signal the runner subprocess (and therefore
             # qemu, which runs as its child via `exec`). SIGTERM gives
             # qemu a chance to flush; if it ignores us, escalate.
-            proc = self._proc
-            if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    try:
-                        proc.wait(timeout=2)
-                    except subprocess.TimeoutExpired:
-                        pass
+            _terminate(self._proc)
             return
         try:
             engine = _container_engine()
@@ -350,9 +366,9 @@ def start(
 ) -> Iterator[Capsule]:
     """Start a built capsule as a detached container; stop on context exit.
 
-    Supports `backend = "lite"` and `backend = "nixos"` — both share the
-    docker/podman runner contract. `backend = "qemu"` uses a different
-    transport and isn't supported here yet.
+    Supports `backend = "lite"` and `backend = "nixos"`, which share the
+    docker/podman runner contract, and `backend = "qemu"`, whose runner
+    stays in the foreground as a child of this process.
 
     Args:
       name: capsule target name (matches `[targets.<name>]` in rigx.toml).
@@ -502,6 +518,16 @@ def start(
     if udp_parts:
         runner_env["RIGX_PUBLISH_UDP"] = ",".join(udp_parts)
     if env:
+        # Numbers are common (`PORT=5000`); anything else is a mistake.
+        bad = [k for k, v in env.items()
+               if not isinstance(k, str) or not isinstance(v, (str, int, float))
+               or isinstance(v, bool)]
+        if bad:
+            raise TypeError(
+                f"env[{bad[0]!r}]: capsule env keys must be strings and "
+                f"values strings or numbers"
+            )
+        env = {k: str(v) for k, v in env.items()}
         for k, v in env.items():
             if "\n" in k or "\n" in v:
                 raise ValueError(
@@ -617,31 +643,45 @@ def start(
                     f"(exit {proc.returncode})\n--- output ---\n{tail}"
                 )
         else:
+            # Own session, so a timeout can kill the runner's whole
+            # process group: killing only the runner would leave its
+            # `docker load` / `docker run -d` free to start the
+            # container after we've given up on it.
+            runner_proc = subprocess.Popen(
+                [str(runner)],
+                env=runner_env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
             try:
-                result = subprocess.run(
-                    [str(runner)],
-                    env=runner_env,
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                    timeout=timeout,
-                )
-            except subprocess.TimeoutExpired as e:
+                stdout, stderr = runner_proc.communicate(timeout=timeout)
+            except BaseException as e:
+                _terminate(runner_proc)
+                if not isinstance(e, subprocess.TimeoutExpired):
+                    raise
                 raise RuntimeError(
                     f"capsule {name!r}: runner did not finish within "
                     f"{timeout:.0f}s (a large image can make `docker load` "
                     f"slow — pass start(..., timeout=…) to allow longer)"
                 ) from e
-            if result.returncode != 0:
+            if runner_proc.returncode != 0:
                 raise RuntimeError(
-                    f"capsule {name!r}: runner failed (exit {result.returncode})\n"
-                    f"--- stdout ---\n{result.stdout}\n"
-                    f"--- stderr ---\n{result.stderr}"
+                    f"capsule {name!r}: runner failed "
+                    f"(exit {runner_proc.returncode})\n"
+                    f"--- stdout ---\n{stdout}\n"
+                    f"--- stderr ---\n{stderr}"
                 )
     except BaseException:
         # Pre-yield failure: no Capsule was handed out, so the context-
-        # exit cleanup below never runs. Remove the tempfiles ourselves
-        # (best-effort) before propagating.
+        # exit cleanup below never runs. Stop whatever did start (a VM,
+        # or a container the runner got as far as creating) and remove
+        # the tempfiles ourselves (best-effort) before propagating.
+        if proc is not None:
+            _terminate(proc)
+        elif backend != "qemu":
+            _remove_container(container_name)
         for tmp in (log_path, spec_path):
             if tmp is not None:
                 try:
@@ -660,7 +700,6 @@ def start(
         volumes=list(vols),
         _proc=proc,
         _log_path=log_path,
-        _runtime_spec_path=spec_path,
     )
     try:
         yield cap

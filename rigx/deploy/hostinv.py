@@ -371,6 +371,7 @@ def teardown_script(testbed_name: str, *, purge: bool = False) -> str:
         '  systemctl disable --now "$n" >/dev/null 2>&1 || true',
         '  rm -f "$u"',
         "done",
+        'rm -f "/etc/systemd/system/multi-user.target.wants/rigx-$T-"*.service',
         "systemctl daemon-reload >/dev/null 2>&1 || true",
         # Reaped by name rather than by `--rm`: the container can outlive
         # the runner that started it, which is the whole reason this

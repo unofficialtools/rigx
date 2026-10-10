@@ -162,12 +162,14 @@ def probe_command(testbed: str, service_name: str, hc: dict) -> str:
     that isn't running has no PID, and the probe fails. Host tools
     (`curl`) stay available because only the network namespace changes.
 
-    Written without `${`: systemd expands `${VAR}` anywhere in
-    `ExecStart=`, even inside quotes. `$pid` embedded in a word is left
-    alone, as `$i` is in the retry loop. Manifests compiled before
-    `scope` existed probe on the host, as they did then."""
+    The health unit escapes `$` and `%` for systemd when it embeds this.
+    Manifests compiled before `scope` existed probe on the host, as they
+    did then."""
     if hc.get("scope", "host") != "container":
-        return hc["command"]
+        # Through its own shell, like the container form: pasted raw, a
+        # trailing `# comment` would swallow the caller's `; do`, and an
+        # `exit` would end the caller (bin/activate) itself.
+        return f"/bin/sh -c {_sh_quote(hc['command'])}"
     name = container_name(testbed, service_name)
     inspect = "inspect -f '{{.State.Pid}}' " + name + " 2>/dev/null"
     return (
@@ -196,6 +198,8 @@ def _env_line(key: str, value: str) -> str:
     be quoted, and there is no cost to quoting the rest.
     """
     escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    # `%` starts a specifier (`%n`, `%h`, …) in Environment= too.
+    escaped = escaped.replace("%", "%%")
     return f'Environment="{key}={escaped}"'
 
 
@@ -351,9 +355,12 @@ def render_health_unit(testbed: str, service_name: str, service: dict) -> str:
         "",
         "[Service]",
         "Type=oneshot",
-        # `%` starts a systemd specifier (`%n`, `%i`, …); a command
-        # like `curl -w '%{http_code}'` must reach the shell intact.
-        "ExecStart=/bin/sh -c " + _sh_quote(probe).replace("%", "%%"),
+        # systemd expands `$VAR`/`${VAR}` and `%` specifiers in
+        # ExecStart= before the shell sees it; `$$` and `%%` are its
+        # escapes for a literal `$` and `%`, so the probe (and the
+        # user's command inside it) reaches /bin/sh exactly as written.
+        "ExecStart=/bin/sh -c "
+        + _sh_quote(probe).replace("$", "$$").replace("%", "%%"),
         "",
     ])
 

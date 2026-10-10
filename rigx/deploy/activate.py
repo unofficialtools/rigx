@@ -78,6 +78,10 @@ def render_activate(manifest: dict, previous_manifest: dict | None = None) -> st
     lines.append(f'PROFILE="$RIGX_PROFILE_DIR/rigx-{testbed}"')
     lines.append('SELF="$(cd "$(dirname "$0")/.." && pwd)"')
     lines.append('PREV="$(readlink -f "$PROFILE" 2>/dev/null || true)"')
+    # Where `systemctl enable` would put the boot-time link. Done by hand
+    # because the units are themselves symlinks into the store, which
+    # `systemctl enable` treats as linked units with their own rules.
+    lines.append('WANTS="$RIGX_SYSTEMD_DIR/multi-user.target.wants"')
     lines.extend(_RESOLVE_NIX_ENV)
     lines.append("")
     # Reverts just the services this run has already restarted, back
@@ -98,7 +102,7 @@ def render_activate(manifest: dict, previous_manifest: dict | None = None) -> st
     lines.append('      if [ -n "$PREV" ] && [ -e "$PREV/units/$u" ]; then')
     lines.append('        ln -sf "$PREV/units/$u" "$RIGX_SYSTEMD_DIR/$u"')
     lines.append("      else")
-    lines.append('        rm -f "$RIGX_SYSTEMD_DIR/$u"')
+    lines.append('        rm -f "$RIGX_SYSTEMD_DIR/$u" "$WANTS/$u"')
     lines.append("      fi")
     lines.append("    done")
     lines.append("  done")
@@ -182,7 +186,7 @@ def render_activate(manifest: dict, previous_manifest: dict | None = None) -> st
                 lines.append(
                     f"systemctl disable --now {_quote(unit)} 2>/dev/null || true"
                 )
-                lines.append(f'rm -f "$RIGX_SYSTEMD_DIR/{unit}"')
+                lines.append(f'rm -f "$RIGX_SYSTEMD_DIR/{unit}" "$WANTS/{unit}"')
             # The unit is gone; without this the container it started
             # would keep running with no unit left to name it, holding
             # ports for a service that no longer exists in the config.
@@ -223,6 +227,12 @@ def render_activate(manifest: dict, previous_manifest: dict | None = None) -> st
                 lines.append(f'  rm -f "$RIGX_SYSTEMD_DIR/{unit}"')
                 lines.append("  _changed=1")
                 lines.append("fi")
+        # Started at boot, as `WantedBy=multi-user.target` asks; without
+        # this link a reboot leaves every service (and its health timer,
+        # pulled in by the service's Wants=) down.
+        main = units.unit_name(testbed, sname)
+        lines.append('mkdir -p "$WANTS"')
+        lines.append(f'ln -sf "$RIGX_SYSTEMD_DIR/{main}" "$WANTS/{main}"')
         lines.append('if [ -n "$_changed" ]; then')
         lines.append(f'  CHANGED="$CHANGED {sname}"')
         lines.append("fi")

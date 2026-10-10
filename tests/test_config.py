@@ -1148,6 +1148,33 @@ class Modules(unittest.TestCase):
         self.assertEqual(proj.targets["frontend.app"].name, "app")
         self.assertEqual(proj.targets["frontend.app"].qualified_name, "frontend.app")
 
+    def test_module_testbed_service_names_a_sibling_capsule(self):
+        root = self._setup({
+            "rigx.toml": """
+                [project]
+                name = "p"
+
+                [modules]
+                include = ["frontend"]
+            """,
+            "frontend/rigx.toml": """
+                [targets.web]
+                kind = "capsule"
+                backend = "lite"
+                entrypoint = "/bin/true"
+
+                [targets.tb]
+                kind = "testbed"
+
+                [targets.tb.services.s]
+                capsule = "web"
+            """,
+        })
+        proj = config.load(root)
+        self.assertEqual(
+            proj.targets["frontend.tb"].services["s"].capsule, "frontend.web",
+        )
+
     def test_module_globs_resolve_against_module_root(self):
         root = self._setup({
             "rigx.toml": """
@@ -2080,6 +2107,36 @@ class RigxMinVersion(unittest.TestCase):
             _check_rigx_version("99.0.0")
         finally:
             rigx.__version__ = saved
+
+
+
+class StrictValues(unittest.TestCase):
+    """Values that used to be coerced or accepted and fail later."""
+
+    def _load(self, body):
+        with TempProject(body) as root:
+            return config.load(root)
+
+    def test_booleans_are_not_coerced(self):
+        for body in (
+            '[project]\nname = "p"\n[targets.t]\nkind = "test"\nscript = "true"\nsandbox = "false"\n',
+            '[project]\nname = "p"\nrespect_gitignore = "false"\n',
+            '[project]\nname = "p"\n[dependencies.git.g]\nurl = "github:a/b"\nflake = "false"\n',
+        ):
+            with self.subTest(body=body), self.assertRaises(ConfigError):
+                self._load(body)
+
+    def test_ports_must_be_in_range(self):
+        body = (
+            '[project]\nname = "p"\n[targets.c]\nkind = "capsule"\n'
+            'backend = "lite"\nentrypoint = "/bin/true"\nports = [0]\n'
+        )
+        with self.assertRaises(ConfigError):
+            self._load(body)
+
+    def test_ssh_url_port_is_checked_at_load(self):
+        with self.assertRaises(ConfigError):
+            config._parse_testbed_ssh_url({"ssh_url": "ssh://h:abc"}, "x")
 
 
 if __name__ == "__main__":

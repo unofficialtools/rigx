@@ -420,7 +420,7 @@ class HealthUnits(unittest.TestCase):
         self.assertIn("Type=oneshot", text)
         exec_line = next(l for l in _lines(text) if l.startswith("ExecStart="))
         self.assertIn("curl -f http://127.0.0.1:8080/healthz", exec_line)
-        self.assertIn('[ "$i" -ge 3 ]', exec_line)
+        self.assertIn('[ "$$i" -ge 3 ]', exec_line)
         self.assertIn("sleep 2", exec_line)
         # --no-block: a synchronous restart from inside a unit can
         # deadlock against the job it would be waiting on.
@@ -503,12 +503,28 @@ class InContainerProbe(unittest.TestCase):
         self.assertNotIn("${", probe)
 
     def test_host_scope_and_old_manifests_run_the_command_as_is(self):
+        # In a shell of its own: a `# comment` or `exit` in the command
+        # must not reach the caller's `until …; do`.
+        expected = "/bin/sh -c 'curl -f http://127.0.0.1:8000/'"
         self.assertEqual(
             units.probe_command("app", "web", {**self.HC, "scope": "host"}),
-            self.HC["command"],
+            expected,
         )
         old = {k: v for k, v in self.HC.items() if k != "scope"}
-        self.assertEqual(units.probe_command("app", "web", old), old["command"])
+        self.assertEqual(units.probe_command("app", "web", old), expected)
+
+    def test_health_unit_escapes_dollars_for_systemd(self):
+        hc = {**self.HC, "command": "curl http://127.0.0.1:${PORT}/"}
+        text = units.render_health_unit("app", "web", _svc(healthcheck=hc))
+        exec_line = next(l for l in text.splitlines() if l.startswith("ExecStart="))
+        # systemd turns `$$` into `$`; no lone `$` may reach it.
+        import re
+        self.assertIsNone(re.search(r"(?<!\$)\$(?!\$)", exec_line.replace("$$", "")))
+        self.assertIn("$${PORT}", exec_line)
+
+    def test_environment_escapes_specifiers(self):
+        text = units.render_unit("app", "web", _svc(env={"FMT": "%Y-%m"}))
+        self.assertIn("FMT=%%Y-%%m", text)
 
     def test_health_unit_uses_the_probe_and_escapes_specifiers(self):
         hc = {**self.HC, "command": "curl -s -w '%{http_code}' http://127.0.0.1:8000/"}

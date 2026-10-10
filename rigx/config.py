@@ -971,21 +971,48 @@ def _parse_testbed_ports(raw, ctx: str) -> list[TestbedPort]:
         container = entry.get("container")
         if not isinstance(container, int) or isinstance(container, bool):
             raise ConfigError(f"{ectx}: 'container' must be an integer")
+        _check_port(host, ectx, "host port")
+        _check_port(container, ectx, "container port")
         out.append(
             TestbedPort(host=host, container=container, host_addr=host_addr)
         )
     return out
 
 
+# Service, volume and secret names end up in generated sh, unit names,
+# host paths (`/var/lib/rigx/<testbed>/volumes/<name>`) and a remote
+# `systemd-creds --name=<name>` command line, so they are limited to
+# characters that need no quoting anywhere (same set as testbed names in
+# `rigx.deploy.hostinv`).
+_DEPLOY_NAME_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
+
+
+def _check_deploy_name(name: str, ctx: str, what: str) -> None:
+    if not _DEPLOY_NAME_RE.match(name):
+        raise ConfigError(
+            f"{ctx}: invalid {what} name {name!r} (letters, digits, '_', "
+            f"'.' and '-'; must start with a letter or digit)"
+        )
+
+
 def _parse_testbed_str_map(raw, ctx: str, *, field_name: str) -> dict[str, str]:
     """Parse a `[targets.<t>.services.<s>.{volumes,secrets}]` table:
-    name -> string value (mount path / exposed path)."""
+    name -> absolute path inside the container (mount path / exposed
+    path). The path is spliced into a `-v host:container:mode` value, so
+    it can't contain `:` or `,`."""
     if raw is None:
         return {}
     if not isinstance(raw, dict) or not all(
         isinstance(k, str) and isinstance(v, str) for k, v in raw.items()
     ):
         raise ConfigError(f"{ctx}: {field_name} must be a table of name -> string")
+    for name, path in raw.items():
+        _check_deploy_name(name, f"{ctx}.{field_name}", field_name.rstrip("s"))
+        if not path.startswith("/") or ":" in path or "," in path:
+            raise ConfigError(
+                f"{ctx}.{field_name}.{name}: path must be absolute and "
+                f"contain no ':' or ',' (got {path!r})"
+            )
     return dict(raw)
 
 
@@ -1039,6 +1066,7 @@ def _parse_testbed_services(tconf: dict, tctx: str) -> dict[str, TestbedService]
     out: dict[str, TestbedService] = {}
     for sname, sconf in raw.items():
         sctx = f"{tctx}.services.{sname}"
+        _check_deploy_name(sname, f"{tctx}.services", "service")
         if not isinstance(sconf, dict):
             raise ConfigError(f"{sctx}: must be a table")
         unknown = set(sconf.keys()) - {
@@ -1104,6 +1132,8 @@ def _parse_testbed_volumes(tconf: dict, tctx: str) -> list[str]:
             f"{tctx}: volumes must be a table of "
             f"`[targets.<testbed>.volumes.<name>]` declarations"
         )
+    for name in raw:
+        _check_deploy_name(name, f"{tctx}.volumes", "volume")
     return sorted(raw.keys())
 
 
@@ -1116,6 +1146,7 @@ def _parse_testbed_secrets(tconf: dict, tctx: str) -> dict[str, str]:
     out: dict[str, str] = {}
     for name, sconf in raw.items():
         sctx = f"{tctx}.secrets.{name}"
+        _check_deploy_name(name, f"{tctx}.secrets", "secret")
         if not isinstance(sconf, dict):
             raise ConfigError(f"{sctx}: must be a table")
         source = sconf.get("source")
@@ -1155,7 +1186,24 @@ def _parse_testbed_ssh_url(tconf: dict, tctx: str) -> str:
         )
     if not parts.hostname:
         raise ConfigError(f"{tctx}: 'ssh_url' is missing a host (got {raw!r})")
+    try:
+        parts.port  # urlsplit only validates the port when it's read
+    except ValueError:
+        raise ConfigError(f"{tctx}: 'ssh_url' has an invalid port (got {raw!r})")
     return raw
+
+
+def _parse_bool(raw, ctx: str, name: str) -> bool:
+    """A TOML boolean, strictly: `sandbox = "false"` is a mistake, and
+    `bool("false")` would quietly read it as true."""
+    if not isinstance(raw, bool):
+        raise ConfigError(f"{ctx}: {name!r} must be true or false (got {raw!r})")
+    return raw
+
+
+def _check_port(value: int, ctx: str, name: str) -> None:
+    if not 1 <= value <= 65535:
+        raise ConfigError(f"{ctx}: {name} {value} is not a port (1-65535)")
 
 
 def _parse_host_exclusive(tconf: dict, tctx: str) -> bool:
@@ -1384,6 +1432,8 @@ def _build_target(
         isinstance(x, int) and not isinstance(x, bool) for x in ports_raw
     ):
         raise ConfigError(f"{tctx}: ports must be a list of integers")
+    for p in ports_raw:
+        _check_port(p, tctx, "ports entry")
     ports = list(ports_raw)
 
     # `nixos_modules`: project-relative paths to NixOS module files for
@@ -1449,8 +1499,8 @@ def _build_target(
             tconf.get("native_build_inputs", []), vars_table, f"{tctx}.native_build_inputs"
         ),
         script=tconf.get("script"),
-        sandbox=bool(tconf.get("sandbox", True)),
-        exclusive=bool(tconf.get("exclusive", False)),
+        sandbox=_parse_bool(tconf.get("sandbox", True), tctx, "sandbox"),
+        exclusive=_parse_bool(tconf.get("exclusive", False), tctx, "exclusive"),
         backend=backend,
         entrypoint=entrypoint,
         env=env,
@@ -1530,7 +1580,10 @@ def _parse_git_deps(section: dict, source_label: str) -> dict[str, GitDep]:
             name=gname,
             url=gconf["url"],
             rev=gconf.get("rev", "HEAD"),
-            flake=gconf.get("flake", True),
+            flake=_parse_bool(
+                gconf.get("flake", True),
+                f"{source_label}dependencies.git.{gname}", "flake",
+            ),
             attr=gconf.get("attr"),
         )
     return out
@@ -1567,7 +1620,10 @@ def _parse_local_deps(
         out[lname] = LocalDep(
             name=lname,
             path=sub_root,
-            flake=lconf.get("flake", True),
+            flake=_parse_bool(
+                lconf.get("flake", True),
+                f"{source_label}dependencies.local.{lname}", "flake",
+            ),
             sub_project=sub_project,
         )
     return out
@@ -1934,7 +1990,9 @@ def _load(root: Path, _visited: set[Path]) -> Project:
         isinstance(x, str) for x in proj_excludes_raw
     ):
         raise ConfigError("[project].excludes must be a list of glob strings")
-    respect_gitignore = bool(proj.get("respect_gitignore", True))
+    respect_gitignore = _parse_bool(
+        proj.get("respect_gitignore", True), "[project]", "respect_gitignore",
+    )
 
     nixpkgs = data.get("nixpkgs", {})
     if not isinstance(nixpkgs, dict):
@@ -1995,6 +2053,14 @@ def _load(root: Path, _visited: set[Path]) -> Project:
                 mod_data.get("external_inputs", {}), f"{label}: "
             ),
             "external_inputs", label,
+        )
+
+    # Both become flake inputs of the same name.
+    clash = sorted(git_deps.keys() & local_deps.keys())
+    if clash:
+        raise ConfigError(
+            f"dependency {clash[0]!r} is declared as both a git and a local "
+            f"dependency (across the root rigx.toml and its modules)"
         )
 
     # Phase 3: build targets. Parent's first (no namespace), then each module
@@ -2091,6 +2157,13 @@ def _load(root: Path, _visited: set[Path]) -> Project:
                 )
             for sname, svc in target.services.items():
                 sctx = f"target {qname}: services.{sname}"
+                # Inside a module, a bare name means the sibling target,
+                # as it does for deps.internal and `run`.
+                svc.capsule = _qualify_ref(svc.capsule, target.namespace, targets)
+                svc.artifacts = {
+                    _qualify_ref(a, target.namespace, targets): path
+                    for a, path in svc.artifacts.items()
+                }
                 capsule_target = targets.get(svc.capsule)
                 if capsule_target is None:
                     raise ConfigError(
