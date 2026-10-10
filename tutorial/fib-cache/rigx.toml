@@ -1,0 +1,49 @@
+[project]
+name    = "fib-cache"
+version = "0.1.0"
+
+[nixpkgs]
+ref = "nixos-24.11"
+
+[targets.kvstore]
+kind     = "executable"
+sources  = ["src/kvstore.cpp"]
+compiler = "clang18"
+cxxflags = ["-std=c++17", "-O2"]
+
+[targets.test_kvstore]
+kind          = "test"
+deps.internal = ["kvstore"]
+deps.nixpkgs  = ["socat", "gnugrep"]
+script = """
+${kvstore}/bin/kvstore &
+socat - TCP:127.0.0.1:7000,retry=50 < data/session.txt | grep -qx world
+"""
+
+[targets.fib]
+kind           = "custom"
+sources        = ["src/fib.js"]
+deps.nixpkgs   = ["nodejs"]
+build_script   = "node --check src/fib.js"
+install_script = "install -D src/fib.js $out/fib.js"
+
+[targets.kv_server]
+kind          = "capsule"
+backend       = "lite"
+deps.internal = ["kvstore"]
+entrypoint    = "${kvstore}/bin/kvstore"
+ports         = [7000]
+
+[targets.fib_server]
+kind          = "capsule"
+backend       = "lite"
+deps.internal = ["fib"]
+deps.nixpkgs  = ["nodejs"]
+entrypoint    = "node ${fib}/fib.js"
+env           = { PORT = "8000" }
+
+[targets.check]
+kind          = "testbed"
+deps.internal = ["kv_server", "fib_server"]
+deps.nixpkgs  = ["python3"]
+script        = "python3 testbeds/check.py"

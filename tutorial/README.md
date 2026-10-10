@@ -106,3 +106,27 @@ behind. [`matmul-cluster/`](matmul-cluster/) is the finished project,
 generated from the same content.
 Every file, command, and output shown was run for real against rigx
 0.12.0 / nixos-24.11 (clang 18.1.8, Eigen 3.4.0).
+
+# rigx-fib-cache — third composition
+
+Same design as `rigx-matmul-cluster`: the same sidebar, explainer pages,
+one-file editor slides with callouts, and terminal slides. It solves a
+different problem:
+
+1. Start a project
+2. Write the key-value store (C++, `compiler = "clang18"`)
+3. Lock it in with a sandboxed `kind = "test"` (socat against the store)
+4. Write the Fibonacci service (JavaScript, `kind = "custom"`, Node.js from nixpkgs)
+5. Package each program as a `lite` capsule
+6. Write the Python orchestrator (`net.link` from the service to the store)
+7. Run the `kind = "testbed"` that checks fib(0)..fib(99)
+
+The "going further" slide applies UDP links and fault injection to the
+service → store link.
+
+```bash
+npm run studio            # pick "rigx-fib-cache"
+npm run render:fibcache   # writes out/rigx-fib-cache.mp4
+```
+
+The finished project is in `fib-cache/`.
