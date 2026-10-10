@@ -2,7 +2,7 @@
 
 <p align="center"><img src="rigx.png" alt="rigx logo" width="320"></p>
 
-[VIDEO TUTORIAL - CPP DEMO](https://vimeo.com/1187129074) · [TESTBED VIDEO EXAMPLE](https://www.youtube.com/watch?v=scHcUO_asbo)
+[WEBSITE & VIDEO TUTORIALS](https://unofficialtools.github.io/rigx/) · [TESTBED VIDEO EXAMPLE](https://www.youtube.com/watch?v=scHcUO_asbo)
 
 We wanted a modern build system for humans — one that is *even easier* than
 Make, using the intuitive, purely declarative syntax of TOML, yet *as powerful*

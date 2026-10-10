@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rigx</title>
+<meta name="description" content="rigx is a hermetic build system built on Nix. One rigx.toml, the same build on every machine, no Nix knowledge required.">
+<link rel="icon" href="rigx.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet">
+<style>
+  :root { --text: #141414; --dim: #5c5c5c; --line: #e6e6e6; --accent: #ff5f05; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #fff; color: var(--text); font: 18px/1.6 Inter, system-ui, sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 32px 16px 64px; }
+  .logo { display: block; width: min(440px, 100%); margin: 0 auto; mix-blend-mode: multiply; }
+  .lead { font-size: 22px; text-align: center; margin: 8px 0 40px; }
+  h2 { font-size: 14px; font-weight: 800; letter-spacing: 2px; text-transform: uppercase; color: var(--dim); margin: 48px 0 16px; }
+  ul.points { list-style: none; padding: 0; margin: 0; }
+  ul.points li { padding: 14px 0; border-top: 1px solid var(--line); }
+  ul.points b { display: block; }
+  code, pre { font-family: "JetBrains Mono", monospace; font-size: 15px; }
+  pre { background: #f6f6f6; border-radius: 8px; padding: 14px 16px; overflow-x: auto; margin: 0; }
+  p.note { color: var(--dim); font-size: 16px; margin: 10px 0 0; }
+  .tutorials { display: grid; gap: 12px; }
+  .tutorials a { display: block; color: inherit; text-decoration: none; border: 1px solid var(--line); border-left: 4px solid var(--accent); border-radius: 8px; padding: 14px 18px; }
+  .tutorials a:hover { border-color: var(--accent); }
+  .tutorials span { display: block; color: var(--dim); font-size: 16px; }
+  a { color: var(--accent); }
+  footer { margin-top: 56px; text-align: center; font-size: 16px; }
+</style>
+</head>
+<body>
+<main>
+  <img class="logo" src="rigx.png" alt="rigx: build anything, reproducibly">
+  <p class="lead">A hermetic build system built on Nix.<br>No Nix knowledge required.</p>
+
+  <ul class="points">
+    <li><b>One small file</b>Describe your targets in a plain <code>rigx.toml</code>: programs, libraries, tests, containers.</li>
+    <li><b>Hermetic</b>Every build and test runs in a sandbox that sees only what you declared. Same inputs, same result, on any machine.</li>
+    <li><b>Nothing to install</b>Compilers, libraries and tools come from <a href="https://github.com/NixOS/nixpkgs">nixpkgs</a>, pinned to one release. C, C++, Go, Rust, Zig, Nim, Python and more.</li>
+    <li><b>Capsules and testbeds</b>Package programs as minimal containers, run several together from Python, and inject network faults between them.</li>
+  </ul>
+
+  <h2>Tutorials</h2>
+  <div class="tutorials">
+    <a href="tutorials/hello-cpp/">One C++ program, many targets<span>A library and program using fmt, shipped as a zip, tested, cross-compiled for ARM, and packaged as a capsule.</span></a>
+    <a href="tutorials/matmul-cluster/">A matrix-multiplication cluster<span>Pin clang 18, use Eigen, and drive three copies of one capsule from a Python testbed.</span></a>
+    <a href="tutorials/fib-cache/">A Fibonacci service with a C++ cache<span>A JavaScript service caches results in a C++ key-value store; a testbed links them and checks 100 numbers.</span></a>
+  </div>
+
+  <h2>Install</h2>
+  <pre>nix profile install github:unofficialtools/rigx/stable</pre>
+  <p class="note">rigx needs <a href="https://nixos.org/download/">Nix</a> underneath; everything else it fetches itself.</p>
+
+  <footer><a href="https://github.com/unofficialtools/rigx">github.com/unofficialtools/rigx</a></footer>
+</main>
+</body>
+</html>

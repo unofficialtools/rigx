@@ -33,3 +33,4 @@ papers/
 .idea/
 *.swp
 .DS_Store
+_site/
