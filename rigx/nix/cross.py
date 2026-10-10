@@ -78,6 +78,24 @@ def effective_compiler(target: Target, variant: Variant | None) -> str:
     return target.compiler
 
 
+def _cross_pkgset(target: Target, variant: Variant | None) -> str:
+    """`pkgsCross.<x>` for a cross-compiled c/cxx target, else ""."""
+    triple = effective_target(target, variant)
+    if target.language not in ("c", "cxx") or not triple:
+        return ""
+    return f"pkgsCross.{cross_info(triple).get('pkgsCross', triple)}"
+
+
+def package_set(target: Target, variant: Variant | None) -> str:
+    """The package set a target's `deps.nixpkgs` libraries come from.
+
+    A cross-compiled c/cxx target links against libraries built for the
+    target platform, so `fmt` must resolve to `pkgs.pkgsCross.<x>.fmt`,
+    not the build machine's `pkgs.fmt`."""
+    cross = _cross_pkgset(target, variant)
+    return f"pkgs.{cross}" if cross else "pkgs"
+
+
 def stdenv_attr(target: Target, variant: Variant | None) -> str:
     """Pick the nixpkgs stdenv attr for a c/cxx target.
 
@@ -85,13 +103,11 @@ def stdenv_attr(target: Target, variant: Variant | None) -> str:
     `pkgsCross.<x>.<compiler>Stdenv` for a non-default compiler).
     Otherwise: `compiler = "clang"` → `clangStdenv`; `"gcc13"` →
     `gcc13Stdenv`; empty / non-c/cxx returns the default `stdenv`."""
-    triple = effective_target(target, variant)
-    if target.language in ("c", "cxx") and triple:
-        info = cross_info(triple)
-        cross_attr = info.get("pkgsCross", triple)
+    cross = _cross_pkgset(target, variant)
+    if cross:
         comp = effective_compiler(target, variant)
         sub = "stdenv" if (not comp or comp == "gcc") else f"{comp}Stdenv"
-        return f"pkgsCross.{cross_attr}.{sub}"
+        return f"{cross}.{sub}"
     if target.language not in ("c", "cxx"):
         return "stdenv"
     comp = effective_compiler(target, variant)

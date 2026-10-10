@@ -329,6 +329,47 @@ class ScriptCmdNixShellSkip(unittest.TestCase):
         self.assertEqual(run.call_args.kwargs["cwd"], proj.root)
 
 
+class HostScriptsInterpolateDeps(unittest.TestCase):
+    """Host-side scripts get `${dep}` replaced with the dep's built path,
+    as sandboxed ones do. Left to bash, `${dep}` is an unset variable,
+    so `${app}/bin/app` would run `/bin/app`."""
+
+    def _project(self, root: Path, script: str) -> Project:
+        from rigx.config import TargetDeps
+        proj = _project_with(
+            app=Target(name="app", kind="executable", sources=["m.cpp"]),
+            t=Target(
+                name="t", kind="test", sandbox=False, script=script,
+                deps=TargetDeps(internal=["app"]),
+            ),
+        )
+        proj.root = root
+        return proj
+
+    def test_dep_reference_becomes_built_path(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            store = root / "store-app"
+            (store / "bin").mkdir(parents=True)
+            (root / "output").mkdir()
+            (root / "output" / "app").symlink_to(store)
+            proj = self._project(root, "${app}/bin/app --check")
+            cmd = builder._script_cmd(proj, proj.targets["t"])
+        self.assertIn(f"{store.resolve()}/bin/app --check", cmd)
+
+    def test_unbuilt_dep_is_left_alone(self):
+        with tempfile.TemporaryDirectory() as d:
+            proj = self._project(Path(d), "${app}/bin/app")
+            cmd = builder._script_cmd(proj, proj.targets["t"])
+        self.assertIn("${app}/bin/app", cmd)
+
+    def test_other_shell_variables_are_untouched(self):
+        with tempfile.TemporaryDirectory() as d:
+            proj = self._project(Path(d), "echo ${HOME} $app")
+            cmd = builder._script_cmd(proj, proj.targets["t"])
+        self.assertIn("echo ${HOME} $app", cmd)
+
+
 class ScriptEnvExposesRigx(unittest.TestCase):
     """Host-side scripts can `import rigx` from whatever python3 they
     run — e.g. a testbed's `deps.nixpkgs = ["python3"]` when rigx

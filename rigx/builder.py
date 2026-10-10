@@ -356,6 +356,27 @@ def _script_env() -> Iterator[dict[str, str]]:
         yield env
 
 
+def _interpolate_host_deps(project: Project, target) -> str:
+    """Substitute `${dep}` in a host-side script with the dep's built path.
+
+    Sandboxed targets get this from Nix, which interpolates `${dep}` at
+    eval time. Host-side scripts are handed to bash as-is, where
+    `${dep}` is an unset variable that expands to "" — so
+    `${app}/bin/app` would run `/bin/app`. Resolve each internal dep
+    through its `output/<dep>` link instead (the caller builds deps
+    first). Deps without a link (e.g. a test or script dep) are left
+    alone."""
+    script = target.script
+    for dep in target.deps.internal:
+        token = "${" + dep + "}"
+        if token not in script:
+            continue
+        link = _output_dir(project) / _nix_id(dep)
+        if link.exists():
+            script = script.replace(token, str(link.resolve()))
+    return script
+
+
 def _script_cmd(
     project: Project, target, extra_args: list[str] | None = None
 ) -> list[str]:
@@ -372,7 +393,7 @@ def _script_cmd(
         "-eo",
         "pipefail",
         "-c",
-        target.script,
+        _interpolate_host_deps(project, target),
         target.name,
         *(extra_args or []),
     ]

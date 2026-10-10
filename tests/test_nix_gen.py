@@ -809,6 +809,27 @@ class CrossCompilation(unittest.TestCase):
         out = nix_gen.generate(_project(targets={"hello": t}))
         self.assertIn("pkgs.pkgsCross.aarch64-multiplatform.clangStdenv", out)
 
+    def test_cxx_cross_target_links_nixpkgs_libs_for_the_target(self):
+        # The host's pkgs.fmt is x86_64; linking it into an aarch64
+        # binary fails with "skipping incompatible ... libfmt.so".
+        t = Target(
+            name="hello", kind="executable", language="cxx",
+            sources=["m.cpp"], target="aarch64-linux",
+            deps=TargetDeps(nixpkgs=["fmt"]),
+        )
+        out = nix_gen.generate(_project(targets={"hello": t}))
+        self.assertIn("buildInputs = [ pkgs.pkgsCross.aarch64-multiplatform.fmt ]", out)
+        self.assertNotIn("buildInputs = [ pkgs.fmt ]", out)
+
+    def test_cross_variant_links_nixpkgs_libs_for_the_target(self):
+        t = Target(
+            name="hello", kind="executable", language="cxx",
+            sources=["m.cpp"], deps=TargetDeps(nixpkgs=["fmt"]),
+            variants={"arm": Variant(name="arm", target="aarch64-linux")},
+        )
+        out = nix_gen.generate(_project(targets={"hello": t}))
+        self.assertIn("buildInputs = [ pkgs.pkgsCross.aarch64-multiplatform.fmt ]", out)
+
     def test_go_target_sets_goos_goarch(self):
         t = Target(
             name="hello", kind="executable", language="go",

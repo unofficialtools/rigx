@@ -8,7 +8,7 @@ from rigx.nix import c_family, go, nim, python, rust, zig
 from rigx.nix.capsule_lite import mk_lite_capsule_derivation
 from rigx.nix.capsule_nixos import mk_nixos_capsule_derivation
 from rigx.nix.capsule_qemu import mk_qemu_capsule_derivation
-from rigx.nix.cross import stdenv_attr, toolchain_pkgs
+from rigx.nix.cross import package_set, stdenv_attr, toolchain_pkgs
 from rigx.nix.render import (
     _external_bucket_var,
     indent,
@@ -37,10 +37,12 @@ def is_cross_flake_ref(d: str, project: Project) -> bool:
     return head in project.local_deps
 
 
-def build_inputs(target: Target, project: Project) -> list[str]:
+def build_inputs(
+    target: Target, project: Project, pkgset: str = "pkgs"
+) -> list[str]:
     exprs: list[str] = []
     for d in target.deps.nixpkgs:
-        exprs.append(f"pkgs.{d}")
+        exprs.append(f"{pkgset}.{d}")
     for d in target.deps.git:
         dep = project.git_deps[d]
         attr = dep.attr or "default"
@@ -249,7 +251,7 @@ def mk_derivation(
         if variant is None
         else f"{target.qualified_name}-{variant.name}"
     )
-    inputs = build_inputs(target, project)
+    inputs = build_inputs(target, project, package_set(target, variant))
     extra_native: list[str] = []
 
     language = target.language or "cxx"

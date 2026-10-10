@@ -4,6 +4,18 @@
 
 ### Bug fixes
 
+- **Cross-compiled C/C++ targets link nixpkgs libraries built for the
+  target.** With `target = "aarch64-linux"`, `deps.nixpkgs = ["fmt"]` put the
+  build machine's x86_64 `fmt` on the link line, and the build failed with
+  `skipping incompatible ... libfmt.so` / `cannot find -lfmt`. Libraries now
+  come from the same `pkgsCross.<x>` package set as the cross stdenv.
+
+- **Host-side scripts substitute `${dep}`.** `sandbox = false` tests,
+  `script` and `testbed` targets passed their body to bash untouched, so
+  `${app}` was an unset shell variable and `${app}/bin/app` ran `/bin/app`
+  — although the docs promise `${dep}` works for both test flavors. It now
+  resolves to the dep's built path, as it does in the sandbox.
+
 - **Testbed and script bodies can `import rigx`.** A testbed's `python3`
   comes from `deps.nixpkgs`, which couldn't see rigx when rigx was installed
   the recommended way (`nix profile install`), so `from rigx.capsule import
