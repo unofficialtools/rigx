@@ -1,6 +1,6 @@
 [project]
 name = "rigx"
-version = "0.12.0"
+version = "0.13.0"
 
 # Make rigx installable straight from this repo's flake:
 #   nix profile install github:unofficialtools/rigx/stable
