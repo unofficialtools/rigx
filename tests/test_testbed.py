@@ -15,6 +15,7 @@ import time
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
+from unittest import mock
 
 from rigx import testbed
 
@@ -336,7 +337,7 @@ class LifecycleRobustness(unittest.TestCase):
         """If the Nth link fails to bind, the listeners already started
         (and volume tempdirs) are torn down and `_running` resets, so
         the failure doesn't leak and the Network can be retried."""
-        net = testbed.Network()
+        net = testbed.Network(gateway=None)  # one listener per link
         vol = net.shared_volume("data")
         net.declare("sim", listens_on=[])
         net.declare("fc", listens_on=[5001])
@@ -676,6 +677,44 @@ class UdpForwarding(unittest.TestCase):
         self.assertEqual(len(received), 1)
         self.assertEqual(received[0][0], b"y")
 
+    def test_delay_holds_each_datagram_not_the_link(self):
+        """A UDP delay applies per datagram: five datagrams sent back to
+        back under a 300 ms delay all arrive ~300 ms later, not one every
+        300 ms (1.5 s) as when the forwarder slept head-of-line."""
+        net = testbed.Network()
+        listen_addr, listen_port, dst_port = self._two_capsules_udp(net)
+        fc_addr = net.address("fc")
+        with udp_echo_server(fc_addr, dst_port) as received, net:
+            with net.fault("sim", "fc", delay_ms=300):
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                    t0 = time.monotonic()
+                    for i in range(5):
+                        s.sendto(b"d%d" % i, (listen_addr, listen_port))
+                    deadline = t0 + 3.0
+                    while len(received) < 5 and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    elapsed = time.monotonic() - t0
+        self.assertEqual(sorted(r[0] for r in received),
+                         [b"d0", b"d1", b"d2", b"d3", b"d4"])
+        self.assertGreaterEqual(elapsed, 0.29)
+        self.assertLess(elapsed, 0.9)
+
+    def test_delayed_reply_reaches_the_sender(self):
+        """Replies take the same per-datagram delay path."""
+        net = testbed.Network()
+        listen_addr, listen_port, dst_port = self._two_capsules_udp(net)
+        fc_addr = net.address("fc")
+        with udp_echo_server(fc_addr, dst_port), net:
+            with net.fault("sim", "fc", delay_ms=100):
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                    t0 = time.monotonic()
+                    s.sendto(b"req", (listen_addr, listen_port))
+                    s.settimeout(2.0)
+                    reply, _ = s.recvfrom(4096)
+                    elapsed = time.monotonic() - t0
+        self.assertEqual(reply, b"req")
+        self.assertGreaterEqual(elapsed, 0.19)  # delayed both ways
+
     def test_reply_path_routes_back_to_sender(self):
         """The session table is keyed on the original sender's
         (addr, port). When the destination replies via the upstream
@@ -759,6 +798,79 @@ class UdpForwarding(unittest.TestCase):
         env = net.bindings("sim")["env"]
         self.assertIn("FC_5001_ADDR", env)       # TCP — bare form
         self.assertIn("FC_5001_UDP_ADDR", env)   # UDP — suffixed
+
+
+class ContainerGateway(unittest.TestCase):
+    """Capsules run on the container bridge, where 127.0.0.1 is the
+    container itself, so each link also listens on the bridge gateway
+    and `bindings()` hands capsules that endpoint. These tests use
+    127.0.0.1 as a stand-in gateway so they don't depend on docker."""
+
+    GW = "127.0.0.1"
+
+    def test_capsule_env_gets_the_gateway_endpoint(self):
+        net = testbed.Network(gateway=self.GW)
+        net.declare("sim")
+        net.declare("fc", listens_on=[5001])
+        host_ep = net.link("sim", "fc", to_port=5001)
+        link = next(iter(net._links.values()))
+        env = net.bindings("sim")["env"]
+        self.assertEqual(env["FC_5001_ADDR"], f"{self.GW}:{link.gateway_port}")
+        # link() still returns the host-side endpoint.
+        self.assertEqual(host_ep, f"127.0.0.1:{link.listen_port}")
+        self.assertNotEqual(link.gateway_port, link.listen_port)
+
+    def test_without_a_gateway_env_is_the_loopback_endpoint(self):
+        net = testbed.Network(gateway=None)
+        net.declare("sim")
+        net.declare("fc", listens_on=[5001])
+        host_ep = net.link("sim", "fc", to_port=5001)
+        self.assertEqual(net.bindings("sim")["env"]["FC_5001_ADDR"], host_ep)
+
+    def test_gateway_endpoint_forwards_under_the_same_rules(self):
+        net = testbed.Network(gateway=self.GW)
+        _, dst_port = _two_capsules(net)
+        link = next(iter(net._links.values()))
+        with echo_server(dst_port), net:
+            self.assertEqual(
+                _send_recv(self.GW, link.gateway_port, b"hi\n"), b"hi\n",
+            )
+            with net.partition(["sim"], ["fc"]):
+                self.assertEqual(
+                    _send_recv(self.GW, link.gateway_port, b"x\n", timeout=0.3),
+                    b"",
+                )
+
+    def test_udp_gateway_endpoint_replies_to_the_sender(self):
+        net = testbed.Network(gateway=self.GW)
+        net.declare("sim")
+        net.declare("fc", udp_listens_on=[5001])
+        net.link("sim", "fc", to_port=5001, proto="udp")
+        link = next(iter(net._links.values()))
+        _, dst_port = net.bindings("fc")["publish_udp"][5001]
+        with udp_echo_server(net.address("fc"), dst_port), net:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.settimeout(2.0)
+                s.sendto(b"ping", (self.GW, link.gateway_port))
+                reply, _ = s.recvfrom(4096)
+        self.assertEqual(reply, b"ping")
+
+    def test_environment_override(self):
+        with mock.patch.dict(os.environ, {"RIGX_TESTBED_GATEWAY": "10.1.2.3"}):
+            self.assertEqual(testbed._container_gateway(), "10.1.2.3")
+        with mock.patch.dict(os.environ, {"RIGX_TESTBED_GATEWAY": ""}):
+            self.assertIsNone(testbed._container_gateway())
+
+    def test_discovery_skips_addresses_it_cannot_bind(self):
+        testbed._discover_gateway.cache_clear()
+        self.addCleanup(testbed._discover_gateway.cache_clear)
+        out = mock.Mock(stdout="192.0.2.1 127.0.0.1\n")
+        with mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch("rigx.testbed.shutil.which",
+                        side_effect=lambda b: "/usr/bin/docker" if b == "docker" else None), \
+             mock.patch("rigx.testbed.subprocess.run", return_value=out):
+            # 192.0.2.1 (TEST-NET) isn't on this host; 127.0.0.1 is.
+            self.assertEqual(testbed._container_gateway(), "127.0.0.1")
 
 
 class RuleSet(unittest.TestCase):

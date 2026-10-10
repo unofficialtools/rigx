@@ -60,9 +60,9 @@ means. It is only about the host: peers never need it. A service with
 no `ports` is reachable by its peers and invisible from outside — the
 equivalent of compose's `expose:`, with nothing to declare. Publishing
 is therefore an explicit act, and a bind address (`host =
-"127.0.0.1:8000"`) narrows it further: the canonical use is exposing a
-health endpoint to `activate`'s host-side probe without exposing it to
-the world.
+"127.0.0.1:8000"`) narrows it further. Health probes need neither: by
+default they run inside the service container's own network namespace
+(see `probe_command`).
 
 Name resolution needs the engine's DNS backend — netavark/aardvark-dns
 on podman, which is standard on current distros but **fails silently
@@ -146,6 +146,34 @@ def reap_command(container: str) -> str:
     return (
         f"podman rm -f {container} >/dev/null 2>&1 || "
         f"docker rm -f {container} >/dev/null 2>&1 || true"
+    )
+
+
+def probe_command(testbed: str, service_name: str, hc: dict) -> str:
+    """Shell for one attempt of a service's health probe; exit 0 means
+    healthy. Shared by the deploy gate in `bin/activate` and the
+    `-health.service` below, so both check the same thing.
+
+    With `scope = "container"` the command runs on the host but inside
+    the network namespace of the service's own container, found by its
+    name: `127.0.0.1:<port>` then means that container and nothing else,
+    so a squatter on a published port can't answer for it, and a
+    service with no published port can still be checked. A container
+    that isn't running has no PID, and the probe fails. Host tools
+    (`curl`) stay available because only the network namespace changes.
+
+    Written without `${`: systemd expands `${VAR}` anywhere in
+    `ExecStart=`, even inside quotes. `$pid` embedded in a word is left
+    alone, as `$i` is in the retry loop. Manifests compiled before
+    `scope` existed probe on the host, as they did then."""
+    if hc.get("scope", "host") != "container":
+        return hc["command"]
+    name = container_name(testbed, service_name)
+    inspect = "inspect -f '{{.State.Pid}}' " + name + " 2>/dev/null"
+    return (
+        f"pid=$(podman {inspect} || docker {inspect}) && "
+        f'[ "$pid" -gt 0 ] 2>/dev/null && '
+        f"nsenter -t \"$pid\" -n /bin/sh -c {_sh_quote(hc['command'])}"
     )
 
 
@@ -307,7 +335,7 @@ def render_health_unit(testbed: str, service_name: str, service: dict) -> str:
     target_unit = unit_name(testbed, service_name)
     probe = (
         f"i=0; "
-        f"until {hc['command']}; do "
+        f"until {probe_command(testbed, service_name, hc)}; do "
         f"i=$((i + 1)); "
         f'if [ "$i" -ge {hc["retries"]} ]; then '
         f'echo "rigx: {service_name} failed healthcheck after '
@@ -323,7 +351,9 @@ def render_health_unit(testbed: str, service_name: str, service: dict) -> str:
         "",
         "[Service]",
         "Type=oneshot",
-        "ExecStart=/bin/sh -c " + _sh_quote(probe),
+        # `%` starts a systemd specifier (`%n`, `%i`, …); a command
+        # like `curl -w '%{http_code}'` must reach the shell intact.
+        "ExecStart=/bin/sh -c " + _sh_quote(probe).replace("%", "%%"),
         "",
     ])
 

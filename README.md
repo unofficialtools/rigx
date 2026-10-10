@@ -1287,7 +1287,17 @@ python_venv_extra = ["vendor", "wheels/*.whl"]
                got:    sha256-<real-hash>
    ```
 3. Paste the `got:` hash into `python_venv_hash` and rebuild.
-4. When `uv.lock` changes, the hash changes — repeat.
+4. When `uv.lock` changes, the hash changes — repeat. The venv's store
+   name includes a hash of `pyproject.toml` and `uv.lock`, so a stale
+   `python_venv_hash` always fails with a hash mismatch rather than
+   quietly reusing an old venv that is still in the store. When a
+   Python target fails because its venv isn't built yet, rigx says
+   whether that's a dependency change (update the hash), a missing
+   network (offline mode: run `rigx prefetch` while online), or an unset
+   hash.
+
+Building the venv downloads from PyPI, so it needs the network each
+time the dependencies change, even when everything else is cached.
 
 If omitted, every build fails deterministically on hash mismatch.
 
@@ -2076,8 +2086,17 @@ with net:
   list and `start()` emits one `-p` flag per entry.
 - `publish_udp`: the same shape, for UDP listening ports.
 - `env` exposes peer endpoints as `<DST>_<PORT>_ADDR` env vars (e.g.
-  `FC_5001_ADDR=127.0.0.1:5023`). The capsule's entrypoint reads
-  these to know where to connect.
+  `FC_5001_ADDR=172.17.0.1:5023`). The capsule's entrypoint reads
+  these to know where to connect. Inside a container, `127.0.0.1` is
+  the container itself, so each link also listens on the container
+  bridge's gateway (docker's `172.17.0.1`, or the `podman` network's
+  under rootful podman), and that is the address capsules get. It works
+  with the default bridge network and with `network="host"` alike.
+  `link()` still returns the host-side `127.0.0.1` endpoint, for
+  clients running on the host. Pass `Network(gateway=None)` to turn
+  this off, or `gateway="<addr>"` (or `RIGX_TESTBED_GATEWAY`) to choose
+  the address; rootless podman has no gateway address on the host, so
+  there capsules still need `network="host"`.
 - `volumes` resolves any `shared_volume()` handles attached to the
   capsule into a host-path → container-path mapping. Empty if no
   shared volumes were declared.
@@ -2336,9 +2355,10 @@ Then `rigx test flight_loop` runs the suite.
   belong in their own simulator process running as another capsule,
   not in `rigx.testbed`. Real L2/L3 simulation needs Linux netns +
   veth pairs (option 3 in TODO).
-- UDP `delay_ms` is head-of-line on the listener thread — a delayed
-  datagram blocks subsequent ones. Acceptable for moderate delays;
-  a heap-based scheduler would eliminate this.
+- UDP `delay_ms` delays each datagram on its own; later datagrams
+  aren't held up behind it. With `jitter_ms`, datagrams can arrive out
+  of order, as on a real network. (TCP delays the stream, so order is
+  kept.)
 - Mixed-backend topologies are supported in principle (the testbed
   is L4-only and doesn't care what's behind a port) but mixing has
   not been heavily exercised in practice — file an issue if you hit
@@ -2501,11 +2521,10 @@ A bind address narrows it further:
 ports = [{ host = "127.0.0.1:8000", container = 8000 }]   # or "[::1]:8000"
 ```
 
-The canonical use is a health endpoint. `activate`'s gate probes over
-host loopback, so binding the port to `127.0.0.1` keeps the probe
-working while leaving the service unreachable from the network — no
-need to expose it publicly, and no need to put `curl` inside the
-capsule.
+Use it for a port that should be reachable from the host but not from
+the network. A health endpoint doesn't need it: the healthcheck runs
+inside the service's own container network (see below), so it needs no
+published port at all.
 
 `container` is checked against the capsule's declared `ports` at config
 load, so publishing a port the capsule never listens on fails
@@ -2531,6 +2550,24 @@ ten seconds". The tradeoff is that a permanently broken service
 retries forever instead of parking; a broken *deployment* is already
 caught at deploy time by the health gate, so a failure appearing later
 is treated as a runtime fault worth continuing to recover from.
+
+**The healthcheck runs inside the service's container.** By default
+(`scope = "container"`) `command` runs on the host, with the host's
+tools such as `curl`, but inside the network namespace of the service's
+own container (`nsenter`). So `127.0.0.1:<port>` is the *container*
+port, and only that container can answer: a stale container or any
+other process holding the published host port can't make a broken
+deploy look healthy, and a service with no published port can still be
+checked. If the container isn't running, the check fails.
+
+```toml
+[targets.myapp.services.web.healthcheck]
+command = "curl -f http://127.0.0.1:8080/healthz"   # the container's port
+scope   = "host"    # optional: run on the host instead, against published ports
+```
+
+Use `scope = "host"` only to check that a published port is reachable
+from outside; any process bound to that port answers the probe too.
 
 **`healthcheck` is a runtime probe, not just a deploy gate.** Each
 healthchecked service gets a `rigx-<testbed>-<service>-health.timer`
@@ -2738,8 +2775,8 @@ python_venv_hash = "sha256-AAAA…"   # see below — the first build tells you 
 
 # 2. Package it as a container. `deps.nixpkgs` is strict opt-in and
 #    controls PATH inside the container; the entrypoint doesn't need it
-#    because Nix interpolates absolute store paths, but the healthcheck
-#    below runs on the *host*, not in here.
+#    because Nix interpolates absolute store paths, and the healthcheck
+#    below uses the *host's* curl (inside this container's network).
 [targets.hello_web_capsule]
 kind          = "capsule"
 backend       = "lite"
@@ -2758,7 +2795,7 @@ restart = "always"
 ports   = [{ host = 80, container = 8080 }]
 
 [targets.hello_web_prod.services.web.healthcheck]
-command  = "curl -f http://127.0.0.1/healthz"
+command  = "curl -f http://127.0.0.1:8080/healthz"   # the container's port
 interval = 2
 retries  = 10
 ```
@@ -2805,11 +2842,11 @@ Three things worth knowing before you copy this:
 - **Port 80 works because services run rootful** (see the status note
   above). Under the rootless model that's still on the roadmap, host
   ports below 1024 would need a different approach.
-- **`curl` must exist on the target.** The healthcheck runs on the host
-  as a plain shell command, not inside the container. In practice
-  bootstrap already needs `curl` to install Nix, so this is safe — but
-  a check invoking something more exotic would need that tool present
-  independently.
+- **`curl` must exist on the target.** The healthcheck uses the host's
+  tools, run inside the container's network namespace, not tools from
+  the capsule. In practice bootstrap already needs `curl` to install
+  Nix, so this is safe, but a check invoking something more exotic
+  would need that tool present independently.
 - **The SSH user needs sudo**, unscoped, today — bootstrap installs
   packages and every activation step runs through `sudo`.
 

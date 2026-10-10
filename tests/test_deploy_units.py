@@ -486,5 +486,68 @@ class RenderUnits(unittest.TestCase):
         )
 
 
+
+class InContainerProbe(unittest.TestCase):
+    """`scope = "container"` runs the healthcheck inside the service
+    container's network namespace, so only that container can answer."""
+
+    HC = {"command": "curl -f http://127.0.0.1:8000/", "interval": 2,
+          "retries": 3, "scope": "container"}
+
+    def test_container_scope_enters_the_service_netns(self):
+        probe = units.probe_command("app", "web", self.HC)
+        self.assertIn("inspect -f '{{.State.Pid}}' rigx-app-web", probe)
+        self.assertIn("nsenter -t \"$pid\" -n /bin/sh -c "
+                      "'curl -f http://127.0.0.1:8000/'", probe)
+        # systemd expands `${VAR}` even inside quotes.
+        self.assertNotIn("${", probe)
+
+    def test_host_scope_and_old_manifests_run_the_command_as_is(self):
+        self.assertEqual(
+            units.probe_command("app", "web", {**self.HC, "scope": "host"}),
+            self.HC["command"],
+        )
+        old = {k: v for k, v in self.HC.items() if k != "scope"}
+        self.assertEqual(units.probe_command("app", "web", old), old["command"])
+
+    def test_health_unit_uses_the_probe_and_escapes_specifiers(self):
+        hc = {**self.HC, "command": "curl -s -w '%{http_code}' http://127.0.0.1:8000/"}
+        text = units.render_health_unit("app", "web", _svc(healthcheck=hc))
+        self.assertIn("nsenter", text)
+        self.assertIn("%%{http_code}", text)
+        self.assertNotIn("'%{http_code}", text.replace("%%", ""))
+
+    def _run_probe(self, pid: str) -> int:
+        """Run the rendered probe with stand-ins: `podman inspect` prints
+        `pid`, and `nsenter -t PID -n /bin/sh -c CMD` runs CMD."""
+        import shutil
+        import subprocess
+        import tempfile
+        from pathlib import Path
+        sh = shutil.which("sh") or shutil.which("bash")
+        with tempfile.TemporaryDirectory() as d:
+            bindir = Path(d)
+            for name, body in {
+                "podman": f'echo "{pid}"\n',
+                "docker": "exit 1\n",
+                # Drop `-t PID -n /bin/sh` (the sandbox has no /bin/sh).
+                "nsenter": 'shift 4\nexec sh "$@"\n',
+            }.items():
+                (bindir / name).write_text(f"#!{sh}\n{body}")
+                (bindir / name).chmod(0o755)
+            probe = units.probe_command(
+                "app", "web", {**self.HC, "command": "exit 0"},
+            )
+            env = {"PATH": f"{bindir}:{Path(sh).parent}"}
+            return subprocess.run([sh, "-c", probe], env=env).returncode
+
+    def test_probe_passes_when_the_container_runs(self):
+        self.assertEqual(self._run_probe("4242"), 0)
+
+    def test_probe_fails_when_the_container_is_stopped(self):
+        # A stopped container reports PID 0; the command must not run.
+        self.assertNotEqual(self._run_probe("0"), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

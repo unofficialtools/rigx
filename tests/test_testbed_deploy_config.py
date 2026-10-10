@@ -137,6 +137,7 @@ class ServiceParsing(unittest.TestCase):
         self.assertEqual(web.healthcheck.command, "curl -f http://127.0.0.1:8080/healthz")
         self.assertEqual(web.healthcheck.interval, 2)
         self.assertEqual(web.healthcheck.retries, 5)
+        self.assertEqual(web.healthcheck.scope, "container")  # the default
 
         db = app.services["db"]
         self.assertEqual(db.depends_on, [])
@@ -536,6 +537,16 @@ class ServicePortsMatchCapsule(unittest.TestCase):
                 config.load(root).targets["app"].services["web"].ports[0].container,
                 8080,
             )
+
+
+
+class HealthcheckScope(unittest.TestCase):
+    def test_scope_values(self):
+        parse = config._parse_testbed_healthcheck
+        self.assertEqual(parse({"command": "true"}, "x").scope, "container")
+        self.assertEqual(parse({"command": "true", "scope": "host"}, "x").scope, "host")
+        with self.assertRaises(ConfigError):
+            parse({"command": "true", "scope": "network"}, "x")
 
 
 if __name__ == "__main__":

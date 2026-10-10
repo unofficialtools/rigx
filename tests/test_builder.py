@@ -440,6 +440,54 @@ class NetworkHint(unittest.TestCase):
         self.assertIn("NET", str(cm.exception))
 
 
+class PythonVenvHint(unittest.TestCase):
+    """A failed python_script build whose venv isn't in the store gets a
+    note saying why (dependencies changed, offline, no hash yet)."""
+
+    def _project(self, venv_hash):
+        return _project_with(greet=Target(
+            name="greet", kind="python_script", sources=["g.py"],
+            python_venv_hash=venv_hash,
+        ))
+
+    def _hint(self, proj, venv_path, env=None):
+        with mock.patch.dict(os.environ, env or {}, clear=True), \
+             mock.patch("rigx.builder._nix_bin", return_value="/usr/bin/nix"), \
+             mock.patch("rigx.builder._flake_is_tracked", return_value=False), \
+             mock.patch("rigx.builder.subprocess.run") as run:
+            run.return_value = mock.Mock(returncode=0, stdout=venv_path)
+            hint = builder._python_venv_hint(proj, ["greet"])
+        self.assertTrue(run.call_args.args[0][-1].endswith("#greet.venv.outPath"))
+        return hint
+
+    def test_changed_dependencies_point_at_the_hash(self):
+        hint = self._hint(self._project("sha256-x"), "/nonexistent/venv")
+        self.assertIn("dependencies changed", hint)
+        self.assertIn("python_venv_hash", hint)
+
+    def test_offline_says_the_network_is_needed(self):
+        hint = self._hint(
+            self._project("sha256-x"), "/nonexistent/venv",
+            env={"RIGX_OFFLINE": "1"},
+        )
+        self.assertIn("needs the network", hint)
+        self.assertIn("rigx prefetch", hint)
+
+    def test_missing_hash(self):
+        hint = self._hint(self._project(None), "/nonexistent/venv")
+        self.assertIn("python_venv_hash is not set", hint)
+
+    def test_silent_when_the_venv_is_present(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(self._hint(self._project("sha256-x"), d), "")
+
+    def test_other_targets_are_ignored(self):
+        proj = _project_with(app=Target(name="app", kind="executable", sources=["m.c"]))
+        with mock.patch("rigx.builder.subprocess.run") as run:
+            self.assertEqual(builder._python_venv_hint(proj, ["app"]), "")
+        run.assert_not_called()
+
+
 class InputInstallables(unittest.TestCase):
     def test_current_nix_json(self):
         doc = {"version": 4, "derivations": {"aaa-app.drv": {"inputs": {

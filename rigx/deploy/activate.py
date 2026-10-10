@@ -248,12 +248,18 @@ def render_activate(manifest: dict, previous_manifest: dict | None = None) -> st
         hc = svc["healthcheck"]
         if hc is not None:
             lines.append("    i=0")
-            lines.append(f'    until {hc["command"]}; do')
+            lines.append(
+                f"    until {units.probe_command(testbed, sname, hc)}; do"
+            )
             lines.append("      i=$((i + 1))")
             lines.append(f'      if [ "$i" -ge {hc["retries"]} ]; then')
+            where = (
+                " (probed inside its container)"
+                if hc.get("scope", "host") == "container" else ""
+            )
             lines.append(
                 f'        echo "rigx: {sname} failed healthcheck after '
-                f'{hc["retries"]} tries" >&2'
+                f'{hc["retries"]} tries{where}" >&2'
             )
             lines.append("        rigx_rollback_partial $CHANGED")
             lines.append("        exit 1")

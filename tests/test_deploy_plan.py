@@ -127,6 +127,7 @@ class CompileManifest(unittest.TestCase):
             "command": "curl -f http://127.0.0.1:8080/healthz",
             "interval": 2,
             "retries": 5,
+            "scope": "container",
         })
 
     def test_capsule_backend_defaults_to_empty_string(self):

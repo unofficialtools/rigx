@@ -44,6 +44,13 @@ def mk_python_derivation(target: Target, project: Project) -> str:
     The venv is produced by a fixed-output derivation that runs
     `uv sync --frozen` against the user's pyproject.toml + uv.lock. Network is
     permitted (FODs can fetch); reproducibility is pinned by the outputHash.
+
+    A FOD's store path depends only on its name and outputHash, so the name
+    carries a hash of the venv's inputs (pyproject.toml, uv.lock, extras).
+    Without it, editing uv.lock but not `python_venv_hash` reused the old
+    venv wherever it was already built, while fresh machines failed with a
+    hash mismatch. The venv is also exposed as `passthru.venv`, so rigx can
+    tell after a failed build whether the venv is what's missing.
     """
     if not target.sources:
         raise ValueError(f"python_script {target.name!r} needs at least one source")
@@ -95,7 +102,12 @@ def mk_python_derivation(target: Target, project: Project) -> str:
         lines.append(f"    cp -r ${{./{src_rel}}} $out/{dest_rel}")
     lines.append("  '';")
     lines.append("  pythonVenv = pkgs.stdenv.mkDerivation {")
-    lines.append(f"    name = \"{target.name}-venv\";")
+    # unsafeDiscardStringContext: a derivation name may not carry a store
+    # path's context; only the hash text is wanted.
+    lines.append(
+        f"    name = \"{target.name}-venv-${{builtins.substring 0 12 "
+        "(builtins.unsafeDiscardStringContext (baseNameOf venvSrc))}\";"
+    )
     lines.append("    src = venvSrc;")
     lines.append("    nativeBuildInputs = [ pkgs.uv pythonPkg pkgs.cacert ];")
     lines.append("    dontConfigure = true;")
@@ -146,6 +158,7 @@ def mk_python_derivation(target: Target, project: Project) -> str:
     lines.append("  buildInputs = [ pythonPkg ];")
     lines.append("  dontConfigure = true;")
     lines.append("  dontBuild = true;")
+    lines.append("  passthru.venv = pythonVenv;")
     lines.append("  installPhase = ''")
     lines.append(indent(install_phase, 4).rstrip() + "\n")
     lines.append("  '';")

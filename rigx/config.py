@@ -265,10 +265,19 @@ class TestbedHealthcheck:
     """`[targets.<testbed>.services.<name>.healthcheck]` — exit-code
     based, one shape only (design decision #7): a command plus a
     retry interval/count. No liveness/readiness split, no HTTP-
-    specific fields."""
+    specific fields.
+
+    `scope` says where the command runs. `"container"` (default): on
+    the host, but inside the service container's network namespace, so
+    `127.0.0.1:<container port>` reaches that container and nothing
+    else, and no host port is needed. `"host"`: a plain host command,
+    which can only probe published ports, where any other process
+    bound to the port answers too; use it to check the port is
+    reachable from outside."""
     command: str
     interval: int = 1
     retries: int = 10
+    scope: str = "container"
 
 
 @dataclass
@@ -278,11 +287,9 @@ class TestbedPort:
     default.
 
     A bind address is how a service stays reachable from the host
-    without being reachable from the world. The canonical use is a
-    health endpoint: `activate`'s gate probes over host loopback, so a
-    service that talks to its peers over the testbed network (and needs
-    no public port at all) can still publish `127.0.0.1:<port>` for the
-    probe alone.
+    without being reachable from the world. Health endpoints don't need
+    one: the default healthcheck scope probes inside the service's own
+    container network, with no published port.
     """
 
     host: int
@@ -878,11 +885,11 @@ def _parse_testbed_healthcheck(raw, ctx: str) -> TestbedHealthcheck | None:
         return None
     if not isinstance(raw, dict):
         raise ConfigError(f"{ctx}: healthcheck must be a table")
-    unknown = set(raw.keys()) - {"command", "interval", "retries"}
+    unknown = set(raw.keys()) - {"command", "interval", "retries", "scope"}
     if unknown:
         raise ConfigError(
             f"{ctx}: unknown keys {sorted(unknown)} "
-            f"(allowed: command, interval, retries)"
+            f"(allowed: command, interval, retries, scope)"
         )
     command = raw.get("command")
     if not isinstance(command, str) or not command:
@@ -893,7 +900,14 @@ def _parse_testbed_healthcheck(raw, ctx: str) -> TestbedHealthcheck | None:
         raise ConfigError(f"{ctx}: 'interval' must be a positive integer")
     if not isinstance(retries, int) or isinstance(retries, bool) or retries <= 0:
         raise ConfigError(f"{ctx}: 'retries' must be a positive integer")
-    return TestbedHealthcheck(command=command, interval=interval, retries=retries)
+    scope = raw.get("scope", "container")
+    if scope not in ("container", "host"):
+        raise ConfigError(
+            f"{ctx}: 'scope' must be \"container\" or \"host\", got {scope!r}"
+        )
+    return TestbedHealthcheck(
+        command=command, interval=interval, retries=retries, scope=scope,
+    )
 
 
 # A host bind address: a bare hostname/IPv4, or a bracketed IPv6

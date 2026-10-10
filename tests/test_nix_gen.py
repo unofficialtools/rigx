@@ -330,6 +330,19 @@ class GeneratePythonScript(unittest.TestCase):
         self.assertIn("makeWrapper", out)
         self.assertIn("lib/python3.12/site-packages", out)
 
+    def test_venv_name_follows_its_inputs(self):
+        """A FOD's store path ignores its inputs, so the venv's name must
+        carry their hash: otherwise a changed uv.lock with an unchanged
+        python_venv_hash silently reuses the old venv."""
+        t = Target(name="greet_py", kind="python_script", sources=["a.py"])
+        out = nix_gen.generate(_project(targets={"greet_py": t}))
+        self.assertIn(
+            'name = "greet_py-venv-${builtins.substring 0 12 '
+            '(builtins.unsafeDiscardStringContext (baseNameOf venvSrc))}";',
+            out,
+        )
+        self.assertIn("passthru.venv = pythonVenv;", out)
+
     def test_fakehash_when_missing(self):
         t = Target(
             name="p",

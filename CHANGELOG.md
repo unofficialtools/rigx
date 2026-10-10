@@ -2,7 +2,49 @@
 
 ## 0.13.0 — 2026-10-09
 
+### Behavior changes
+
+- **Deploy healthchecks run inside the service's container.** A
+  healthcheck's `command` used to run on the host against a published port,
+  so whatever held that port answered for the service: a stale container
+  that happened to respond could make a broken deploy pass the gate and the
+  liveness timer. It now runs with the host's tools inside the service
+  container's network namespace (`nsenter`), so `127.0.0.1:<port>` is the
+  container's own port and nothing else can answer; a container that isn't
+  running fails the check, and services with no published port can be
+  checked at all. **Existing commands that use a host port need the
+  container port instead** (e.g. `ports = [{ host = 80, container = 8080 }]`
+  means probing `127.0.0.1:8080`). `scope = "host"` restores the old
+  behavior.
+
 ### Bug fixes
+
+- **Testbed capsules can reach their links.** A link's proxy listened only on
+  the host's `127.0.0.1`, which inside a container is the container itself,
+  so a capsule started with `start(name, **net.bindings(name))` couldn't
+  reach its peers; it needed `network="host"`. Each link now also listens on
+  the container bridge's gateway (docker's `172.17.0.1`, rootful podman's
+  network gateway), and `bindings()` gives capsules that address. It works on
+  the default bridge and with `network="host"`. `link()` still returns the
+  host endpoint. `Network(gateway=...)` and `RIGX_TESTBED_GATEWAY` override
+  or disable it; rootless podman still needs `network="host"`.
+
+- **A UDP `delay_ms` no longer holds up the whole link.** The forwarder slept
+  out each delayed datagram, so every datagram behind it waited too: five
+  datagrams under a 300 ms delay took 1.5 s. Delayed datagrams are now
+  scheduled individually and all arrive after ~300 ms; with `jitter_ms` they
+  can be reordered, like a real network. TCP is unchanged.
+
+- **Changing Python dependencies can't silently reuse an old venv.** The
+  venv is a fixed-output derivation, whose store path depends only on its
+  name and `python_venv_hash`. Editing `uv.lock` without updating the hash
+  kept using the old venv wherever it was already built, while fresh
+  machines failed. The venv's name now includes a hash of `pyproject.toml`,
+  `uv.lock` and its extra files, so a stale hash always fails with a hash
+  mismatch. Every Python venv rebuilds once after upgrading; the hashes
+  themselves don't change. When a Python target fails because its venv isn't
+  built, rigx now says whether to update `python_venv_hash`, set it, or
+  (offline) run `rigx prefetch` while online.
 
 - **Cross-compiled C/C++ targets link nixpkgs libraries built for the
   target.** With `target = "aarch64-linux"`, `deps.nixpkgs = ["fmt"]` put the

@@ -40,17 +40,21 @@ context managers that mutate the rule chain and restore on exit.
 
 from __future__ import annotations
 
+import heapq
 import ipaddress
+import itertools
 import os
 import random
 import re
 import shutil
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
 import time
 from contextlib import contextmanager
+from functools import lru_cache
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Iterator
@@ -139,6 +143,53 @@ def _free_port(addr: str = "127.0.0.1", proto: str = "tcp") -> int:
         return s.getsockname()[1]
 
 
+def _container_gateway() -> str | None:
+    """The host's address on the container bridge (docker0's
+    172.17.0.1 under docker, the `podman` network's gateway under
+    rootful podman), or None when there is none to use.
+
+    Capsules run on that bridge, where 127.0.0.1 is the container
+    itself, so link proxies bound only on loopback are unreachable from
+    them. A listener on the gateway address is reachable from bridge
+    containers and from `network="host"` ones alike, by IP, with no
+    /etc/hosts entry. `RIGX_TESTBED_GATEWAY` overrides the lookup (empty
+    disables it). The address must be bindable here, which rules out
+    rootless podman, whose gateway lives inside its user namespace."""
+    override = os.environ.get("RIGX_TESTBED_GATEWAY")
+    if override is not None:
+        return override or None
+    return _discover_gateway()
+
+
+@lru_cache(maxsize=None)
+def _discover_gateway() -> str | None:
+    # Same engine preference as the capsule runner.
+    if shutil.which("podman"):
+        cmd = ["podman", "network", "inspect", "podman",
+               "-f", "{{range .Subnets}}{{.Gateway}} {{end}}"]
+    elif shutil.which("docker"):
+        cmd = ["docker", "network", "inspect", "bridge",
+               "-f", "{{range .IPAM.Config}}{{.Gateway}} {{end}}"]
+    else:
+        return None
+    try:
+        out = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=10, check=False,
+        ).stdout.split()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for addr in out:
+        try:
+            if ipaddress.ip_address(addr).version != 4:
+                continue
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.bind((addr, 0))
+            return addr
+        except (ValueError, OSError):
+            continue
+    return None
+
+
 @dataclass
 class RuleSet:
     """Per-link fault rules applied to bytes flowing through the proxy.
@@ -155,23 +206,89 @@ class RuleSet:
     corrupt_rate: float = 0.0       # P(flip one byte) per chunk
     blocked: bool = False           # partition: drop everything
 
-    def apply(self, data: bytes) -> bytes | None:
-        """Run a chunk through the rule chain. Returns None if dropped."""
+    def decide(self, data: bytes) -> tuple[bytes | None, float]:
+        """Run a chunk through the rule chain without waiting. Returns
+        (data or None if dropped, seconds to hold it before sending)."""
         if self.blocked:
-            return None
+            return None, 0.0
         if self.drop_rate > 0 and random.random() < self.drop_rate:
-            return None
+            return None, 0.0
+        wait = 0.0
         if self.delay_ms > 0 or self.jitter_ms > 0:
             wait = self.delay_ms
             if self.jitter_ms > 0:
                 wait += random.uniform(-self.jitter_ms, self.jitter_ms)
-            time.sleep(max(0.0, wait) / 1000.0)
+            wait = max(0.0, wait) / 1000.0
         if self.corrupt_rate > 0 and random.random() < self.corrupt_rate and data:
             ba = bytearray(data)
             idx = random.randrange(len(ba))
             ba[idx] ^= 0xFF
             data = bytes(ba)
-        return data
+        return data, wait
+
+    def apply(self, data: bytes) -> bytes | None:
+        """Run a chunk through the rule chain, sleeping out its delay in
+        the caller's thread. Returns None if dropped. Used for TCP, where
+        holding up the rest of the stream is what a delay means."""
+        out, wait = self.decide(data)
+        if out is not None and wait > 0:
+            time.sleep(wait)
+        return out
+
+
+class _DelayQueue:
+    """Sends delayed UDP datagrams at their due time from one thread, so
+    a delayed datagram never holds up the ones behind it. With jitter,
+    datagrams can overtake each other, as on a real network."""
+
+    def __init__(self) -> None:
+        self._heap: list[tuple[float, int, object]] = []
+        self._seq = itertools.count()  # tie-break: equal due times keep order
+        self._cv = threading.Condition()
+        self._closed = False
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name="rigx-testbed-udp-delay",
+        )
+        self._thread.start()
+
+    def send_later(self, wait: float, send) -> None:
+        """Call `send()` after `wait` seconds (now, inline, when 0)."""
+        if wait <= 0:
+            send()
+            return
+        with self._cv:
+            if self._closed:
+                return
+            heapq.heappush(
+                self._heap, (time.monotonic() + wait, next(self._seq), send)
+            )
+            self._cv.notify()
+
+    def _run(self) -> None:
+        while True:
+            with self._cv:
+                while not self._closed:
+                    if not self._heap:
+                        self._cv.wait()
+                        continue
+                    due = self._heap[0][0] - time.monotonic()
+                    if due <= 0:
+                        break
+                    self._cv.wait(due)
+                if self._closed:
+                    return
+                _, _, send = heapq.heappop(self._heap)
+            try:
+                send()
+            except OSError:
+                pass  # socket closed by session GC or teardown
+
+    def close(self) -> None:
+        with self._cv:
+            self._closed = True
+            self._heap.clear()
+            self._cv.notify()
+        self._thread.join(timeout=1.0)
 
 
 @dataclass
@@ -246,6 +363,17 @@ class _Link:
     listen_port: int
     proto: str = "tcp"
     rules: RuleSet = field(default_factory=RuleSet)
+    # Second listener on the container bridge gateway, for capsules
+    # (which can't reach the host's loopback). Same rules, same
+    # upstream; None when no usable gateway was found.
+    gateway_addr: str | None = None
+    gateway_port: int | None = None
+
+    def endpoints(self) -> list[tuple[str, int]]:
+        eps = [(self.listen_addr, self.listen_port)]
+        if self.gateway_addr is not None and self.gateway_port is not None:
+            eps.append((self.gateway_addr, self.gateway_port))
+        return eps
 
 
 class Network:
@@ -264,9 +392,9 @@ class Network:
     `delay_ms`, …) applies. UDP-specific notes:
       - The proxy is connectionless: it tracks src→dst sessions by
         source `(addr, port)`, with a 60s idle timeout for GC.
-      - `delay_ms` on UDP blocks the forwarding thread for that link
-        (no per-datagram timers in v1) — use sparingly when running
-        many UDP links in parallel.
+      - `delay_ms` on UDP delays each datagram on its own: later
+        datagrams are not held up behind it, and with `jitter_ms` they
+        can arrive out of order, as on a real network.
       - `wait_for_port` is TCP-only (there is no UDP "accept"); for
         UDP, send-and-retry from the test or sleep briefly.
 
@@ -285,6 +413,7 @@ class Network:
         host: str = "127.0.0.1",
         *,
         subnet: str | None = None,
+        gateway: str | None = "auto",
         verbose: bool = False,
     ):
         """Build a testbed.
@@ -300,9 +429,15 @@ class Network:
                 alias <addr>` per address (one-time). Capsules see
                 real distinct peer IPs and code that asserts on
                 source addresses works.
+          gateway: where link proxies also listen for capsules, which
+                run on the container bridge and can't reach the host's
+                loopback. `"auto"` (default) finds the bridge gateway
+                (docker's `172.17.0.1`); an address uses that; None
+                turns it off.
           verbose: stream proxy diagnostics to stderr.
         """
         self.host = host
+        self._gateway = _container_gateway() if gateway == "auto" else gateway
         self.verbose = verbose
         self._capsules: dict[str, _CapsuleEntry] = {}
         # Keyed by (src, dst, dst_port) so multiple ports between the
@@ -325,6 +460,8 @@ class Network:
         # a list because handle identity (not name) is what `declare`
         # references; multiple volumes can share a name.
         self._volumes: list[SharedVolume] = []
+        # Delayed UDP datagrams wait here; created per `with` entry.
+        self._delays: _DelayQueue | None = None
 
         self._subnet: ipaddress.IPv4Network | None = None
         self._addr_pool: Iterator[str] | None = None
@@ -491,8 +628,9 @@ class Network:
         self, src: str, dst: str, *, to_port: int, proto: str = "tcp"
     ) -> str:
         """Create a directional link `src → dst:to_port`. Returns the
-        host:port endpoint that `src` should connect to. Pass it as an
-        env var to the `src` capsule via `bindings()`.
+        host:port endpoint a process on the host connects to. A `src`
+        capsule gets its own endpoint, reachable from inside its
+        container, as an env var through `bindings()`.
 
         `proto` selects the transport: `"tcp"` (default) or `"udp"`.
         For UDP, the destination must be `udp_listens_on` for `to_port`
@@ -536,6 +674,9 @@ class Network:
             listen_port=_free_port(src_addr, proto),
             proto=proto,
         )
+        if self._gateway is not None:
+            link.gateway_addr = self._gateway
+            link.gateway_port = _free_port(self._gateway, proto)
         self._links[key] = link
         return f"{src_addr}:{link.listen_port}"
 
@@ -564,7 +705,13 @@ class Network:
           env: peer addresses for each outbound link the capsule has,
                    named `<DST>_<PORT>[_<PROTO>]_ADDR`. TCP links use
                    the bare form (`FC_5001_ADDR`) for backward compat;
-                   UDP links append `_UDP` (`FC_5001_UDP_ADDR`).
+                   UDP links append `_UDP` (`FC_5001_UDP_ADDR`). With a
+                   container gateway (the default when docker or
+                   rootful podman is present) the value is the
+                   gateway endpoint, e.g. `172.17.0.1:<port>`,
+                   reachable from inside the capsule's container;
+                   otherwise the host loopback endpoint `link()`
+                   returned.
           volumes: host-path → container-path mapping (with mode
                    recorded as the value when non-default — actually
                    keyed as `Path(host) -> container_path` in the
@@ -619,7 +766,10 @@ class Network:
                     f"one of the capsules"
                 )
             env_sources[var] = dst
-            env[var] = f"{link.listen_addr}:{link.listen_port}"
+            if link.gateway_port is not None:
+                env[var] = f"{link.gateway_addr}:{link.gateway_port}"
+            else:
+                env[var] = f"{link.listen_addr}:{link.listen_port}"
 
         volumes: dict[Path | str, str | tuple[str, str]] = {}
         for handle, container, mode in cap.volumes:
@@ -784,6 +934,8 @@ class Network:
         # stays True, so a retry silently no-ops and `__exit__` never
         # runs (the exception aborts the `with` before entry).
         try:
+            if any(link.proto == "udp" for link in self._links.values()):
+                self._delays = _DelayQueue()
             for link in self._links.values():
                 if link.proto == "udp":
                     self._start_udp_link(link)
@@ -794,19 +946,23 @@ class Network:
             raise
 
     def _start_tcp_link(self, link: _Link) -> None:
+        for addr, port in link.endpoints():
+            self._start_tcp_listener(link, addr, port)
+
+    def _start_tcp_listener(self, link: _Link, addr: str, port: int) -> None:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
-            sock.bind((link.listen_addr, link.listen_port))
+            sock.bind((addr, port))
         except OSError as e:
             sock.close()
-            hint = _who_has_port(link.listen_port, "tcp")
+            hint = _who_has_port(port, "tcp")
             hint_msg = f" — {hint}" if hint else ""
             raise RuntimeError(
-                f"testbed: cannot bind {link.listen_addr}:"
-                f"{link.listen_port} for link {link.src!r}→{link.dst!r}: "
+                f"testbed: cannot bind {addr}:"
+                f"{port} for link {link.src!r}→{link.dst!r}: "
                 f"{e}{hint_msg}. On macOS, loopback aliases need "
-                f"`sudo ifconfig lo0 alias {link.listen_addr}` first."
+                f"`sudo ifconfig lo0 alias {addr}` first."
             ) from e
         sock.listen(8)
         self._listeners.append(sock)
@@ -820,17 +976,23 @@ class Network:
         self._threads.append(t)
 
     def _start_udp_link(self, link: _Link) -> None:
+        # One forwarder (and session table) per listener: replies leave
+        # through the socket the request came in on.
+        for addr, port in link.endpoints():
+            self._start_udp_listener(link, addr, port)
+
+    def _start_udp_listener(self, link: _Link, addr: str, port: int) -> None:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
-            sock.bind((link.listen_addr, link.listen_port))
+            sock.bind((addr, port))
         except OSError as e:
             sock.close()
-            hint = _who_has_port(link.listen_port, "udp")
+            hint = _who_has_port(port, "udp")
             hint_msg = f" — {hint}" if hint else ""
             raise RuntimeError(
-                f"testbed: cannot bind UDP {link.listen_addr}:"
-                f"{link.listen_port} for link {link.src!r}→{link.dst!r}: {e}{hint_msg}"
+                f"testbed: cannot bind UDP {addr}:"
+                f"{port} for link {link.src!r}→{link.dst!r}: {e}{hint_msg}"
             ) from e
         self._listeners.append(sock)
         t = threading.Thread(
@@ -865,6 +1027,9 @@ class Network:
                 sock.close()
             except OSError:
                 pass
+        if self._delays is not None:
+            self._delays.close()
+            self._delays = None
         for t in self._threads:
             t.join(timeout=1.0)
         self._listeners.clear()
@@ -995,9 +1160,8 @@ class Network:
     # source capsule's address — same source-IP-visibility trick the
     # TCP path uses.
     #
-    # Limitation acknowledged in v1: a chunk's `delay_ms` blocks the
-    # listener thread head-of-line. Acceptable for tests where delay
-    # is modest; switch to a heap-based scheduler if it bites.
+    # Delayed datagrams go to `_DelayQueue` rather than sleeping here,
+    # so one delayed datagram doesn't stall every sender on the link.
     _UDP_SESSION_IDLE_TIMEOUT = 60.0  # seconds before a quiet session is GC'd
     _UDP_GC_INTERVAL = 1.0            # how often the forwarder sweeps for them
 
@@ -1063,7 +1227,7 @@ class Network:
                     continue
                 except OSError:
                     return
-                out = link.rules.apply(payload)
+                out, wait = link.rules.decide(payload)
                 if out is None:
                     # Dropped (drop_rate or blocked). Don't allocate
                     # a session for traffic we're discarding.
@@ -1109,8 +1273,9 @@ class Network:
                         sess.last_seen = time.monotonic()
                     upstream = sess.upstream
                 try:
-                    upstream.sendto(
-                        out, (dst_cap.address, dst_host_port)
+                    self._send_later(
+                        wait, upstream.sendto,
+                        out, (dst_cap.address, dst_host_port),
                     )
                 except OSError as e:
                     if self.verbose:
@@ -1140,14 +1305,21 @@ class Network:
                 continue
             except OSError:
                 return
-            out = link.rules.apply(payload)
+            out, wait = link.rules.decide(payload)
             if out is None:
                 continue
             sess.last_seen = time.monotonic()
             try:
-                listener.sendto(out, sess.peer)
+                self._send_later(wait, listener.sendto, out, sess.peer)
             except OSError:
                 return
+
+    def _send_later(self, wait: float, send, *args) -> None:
+        delays = self._delays
+        if delays is None or wait <= 0:
+            send(*args)
+        else:
+            delays.send_later(wait, lambda: send(*args))
 
 
 @dataclass

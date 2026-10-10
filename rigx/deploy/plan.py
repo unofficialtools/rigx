@@ -159,6 +159,7 @@ def compile_manifest(
                     "command": svc.healthcheck.command,
                     "interval": svc.healthcheck.interval,
                     "retries": svc.healthcheck.retries,
+                    "scope": svc.healthcheck.scope,
                 }
                 if svc.healthcheck is not None
                 else None

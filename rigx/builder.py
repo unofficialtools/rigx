@@ -677,6 +677,50 @@ def _target_for_attr(project: Project, attr: str):
     return None
 
 
+def _python_venv_hint(project: Project, attrs: list[str]) -> str:
+    """Notes for failed `python_script` targets whose venv isn't in the
+    store. Building a venv runs `uv sync` against PyPI, so this is the
+    one build step that needs the network every time the dependencies
+    change, and nix's own error (a hash mismatch, or uv's fetch
+    retries) doesn't say so. Targets whose venv is present failed for
+    some other reason and get no note."""
+    notes: list[str] = []
+    nix = None
+    for attr in attrs:
+        target = _target_for_attr(project, attr)
+        if target is None or target.kind != "python_script":
+            continue
+        nix = nix or _nix_bin()
+        r = subprocess.run(
+            [nix, *_nix_flags(), "eval", "--raw",
+             _flake_ref(project, f"{attr}.venv.outPath")],
+            cwd=project.root, check=False, capture_output=True, text=True,
+        )
+        if r.returncode != 0 or Path(r.stdout.strip()).exists():
+            continue
+        name = target.name
+        if not target.python_venv_hash:
+            notes.append(
+                f"{name}: python_venv_hash is not set. Copy the `got:` hash "
+                f"nix printed for {name}-venv into python_venv_hash."
+            )
+        elif offline_mode():
+            notes.append(
+                f"{name}: its Python dependencies (pyproject.toml, uv.lock) "
+                "are not in the Nix store, and fetching them from PyPI needs "
+                "the network. Build once online or run `rigx prefetch`, and "
+                "again whenever the dependencies change."
+            )
+        else:
+            notes.append(
+                f"{name}: its Python dependencies changed or were never "
+                "built on this machine, so they were fetched from PyPI. If "
+                f"nix reported a hash mismatch for {name}-venv, copy the "
+                "`got:` hash into python_venv_hash."
+            )
+    return "".join(f"\n\nnote: {n}" for n in notes)
+
+
 def _cross_arch_hint(cross_arch: list[tuple[str, str]]) -> str:
     """Friendly post-failure note for cross-arch qemu capsule builds.
     Stays distro-agnostic — names the *what* (binfmt registration plus
@@ -986,6 +1030,7 @@ def build(
         cross_arch = _cross_arch_qemu_capsules(project, [a for a, _ in failures])
         if cross_arch:
             msg += _cross_arch_hint(cross_arch)
+        msg += _python_venv_hint(project, [a for a, _ in failures])
         msg += network_hint(project)
         # With the `.` ref (flake.nix in the git index), Nix evaluates the
         # git tree — a freshly created source file that isn't `git add`ed
