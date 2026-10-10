@@ -8,9 +8,10 @@ here so existing callers (`rigx.cli.cmd_build`, `rigx.cli._load`,
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
-from rigx import __version__, config
+from rigx import __version__, builder, config
 from rigx.commands.build import cmd_build
 from rigx.commands.clean import cmd_clean
 from rigx.commands.flake_cmd import cmd_flake
@@ -42,6 +43,7 @@ from rigx.commands.lock import cmd_lock
 from rigx.commands.ls_source import cmd_ls_source
 from rigx.commands.new import cmd_new
 from rigx.commands.pkg import cmd_pkg
+from rigx.commands.prefetch import cmd_prefetch
 from rigx.commands.remote_cmd import (
     cmd_remote_deploy,
     cmd_remote_restart,
@@ -62,6 +64,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--project",
         help="path to project root (containing rigx.toml)",
         default=None,
+    )
+    p.add_argument(
+        "--offline",
+        action="store_true",
+        help="never touch the network: nix uses only what is already in "
+             "the store (same as RIGX_OFFLINE=1; see `rigx prefetch`)",
     )
     p.add_argument(
         "-V",
@@ -95,6 +103,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("lock", help="update lock file")
     sp.set_defaults(func=cmd_lock)
+
+    sp = sub.add_parser(
+        "prefetch",
+        help="while online, fetch everything a later `rigx --offline` "
+             "build needs",
+    )
+    sp.set_defaults(func=cmd_prefetch)
 
     sp = sub.add_parser("list", help="list targets")
     sp.add_argument(
@@ -389,6 +404,10 @@ def main(argv: list[str] | None = None) -> int:
     else:
         args = parser.parse_args(raw)
 
+    if args.offline:
+        # Through the environment, so host-side scripts and testbeds that
+        # run rigx (or rigx.capsule) again stay offline too.
+        os.environ[builder.OFFLINE_ENV] = "1"
     try:
         return args.func(args)
     except config.ConfigError as e:

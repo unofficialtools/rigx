@@ -20,6 +20,7 @@ from rigx.config import Project
 OUTPUT_DIR = "output"
 FLAKE_FILE = "flake.nix"
 NIX_EXPERIMENTAL = ["--extra-experimental-features", "nix-command flakes"]
+OFFLINE_ENV = "RIGX_OFFLINE"
 
 
 class BuildError(RuntimeError):
@@ -66,6 +67,70 @@ def _nix_bin() -> str:
     if not nix:
         raise NixNotFoundError(NIX_INSTALL_INSTRUCTIONS)
     return nix
+
+
+def offline_mode() -> bool:
+    """True when `rigx --offline` or `RIGX_OFFLINE=1` is in effect. The CLI
+    flag sets the variable, so host-side scripts and testbeds that call
+    back into rigx inherit it."""
+    return os.environ.get(OFFLINE_ENV, "") not in ("", "0")
+
+
+def _nix_flags() -> list[str]:
+    """Global flags for every `nix` invocation. Offline adds `--offline`:
+    no substituters, and previously fetched flake inputs count as up to
+    date — so a missing path fails at once with nix's own "not available"
+    instead of a DNS timeout and three retries."""
+    return [*NIX_EXPERIMENTAL, *(["--offline"] if offline_mode() else [])]
+
+
+def _network_down(host: str = "cache.nixos.org", timeout: float = 3.0) -> bool:
+    """True when `host` can't be resolved within `timeout` seconds. The
+    lookup runs in a daemon thread because getaddrinfo has no timeout of
+    its own, and a hung resolver is exactly the offline case."""
+    import socket
+    import threading
+    resolved: list[bool] = []
+
+    def probe() -> None:
+        try:
+            socket.getaddrinfo(host, 443)
+            resolved.append(True)
+        except OSError:
+            resolved.append(False)
+
+    t = threading.Thread(target=probe, daemon=True)
+    t.start()
+    t.join(timeout)
+    return not (resolved and resolved[0])
+
+
+def network_hint(project: Project, offline_note: bool = True) -> str:
+    """Note appended to a failed nix invocation when the network is the
+    likely cause. nix's own errors for this (DNS failures, retries,
+    "unable to download") don't say what to do; this does. Empty when
+    the network is fine. `offline_note=False` skips the reminder printed
+    in offline mode, for commands whose failures are usually the user's
+    own (a failing test, a script's exit code)."""
+    if offline_mode():
+        if not offline_note:
+            return ""
+        return (
+            "\n\nnote: running offline (--offline / RIGX_OFFLINE=1), so nix "
+            "only uses what is already in the store. If it reported a path "
+            "or input as unavailable, run `rigx prefetch` once while online."
+        )
+    if not _network_down():
+        return ""
+    no_lock = "" if (project.root / "flake.lock").is_file() else (
+        " This project has no flake.lock yet, so its nixpkgs can't be "
+        "resolved without the network."
+    )
+    return (
+        "\n\nnote: the network looks unreachable (cannot resolve "
+        f"cache.nixos.org).{no_lock} To build offline, run `rigx prefetch` "
+        "while online, then use `rigx --offline ...` (or RIGX_OFFLINE=1)."
+    )
 
 
 def write_flake(project: Project) -> Path:
@@ -216,7 +281,7 @@ def run_nixpkgs_tool(
     nix = _nix_bin()
     cmd = [
         nix,
-        *NIX_EXPERIMENTAL,
+        *_nix_flags(),
         "run",
         _nixpkgs_pkg_ref(project, attr),
         "--",
@@ -231,10 +296,13 @@ def update_lock(project: Project) -> None:
     lock_path = project.root / "flake.lock"
     before = lock_path.read_bytes() if lock_path.is_file() else b""
     nix = _nix_bin()
-    cmd = [nix, *NIX_EXPERIMENTAL, "flake", "lock", _flake_ref(project)]
+    cmd = [nix, *_nix_flags(), "flake", "lock", _flake_ref(project)]
     result = subprocess.run(cmd, cwd=project.root, check=False)
     if result.returncode != 0:
-        raise BuildError(f"nix flake lock failed (exit {result.returncode})")
+        raise BuildError(
+            f"nix flake lock failed (exit {result.returncode})"
+            + network_hint(project)
+        )
     after = lock_path.read_bytes() if lock_path.is_file() else b""
     if before != after:
         _hint_commit_generated(project, ["flake.lock"])
@@ -400,7 +468,7 @@ def _script_cmd(
     if not refs:
         return bash_cmd
     nix = _nix_bin()
-    return [nix, *NIX_EXPERIMENTAL, "shell", *refs, "--command", *bash_cmd]
+    return [nix, *_nix_flags(), "shell", *refs, "--command", *bash_cmd]
 
 
 def run_named_script(
@@ -425,7 +493,10 @@ def run_named_script(
     print(f"[rigx] running {name}")
     rc = run_script_target(project, target, extra_args)
     if rc != 0:
-        err = BuildError(f"{target.kind} target {name!r} failed (exit {rc})")
+        err = BuildError(
+            f"{target.kind} target {name!r} failed (exit {rc})"
+            + network_hint(project, offline_note=False)
+        )
         # Let `rigx run` forward the child's real exit code (like `rigx pkg`).
         err.exit_code = rc
         raise err
@@ -607,7 +678,7 @@ def _run_sandboxed_tests(
         # sanitize it like every other build path so nix gets the attr
         # the flake actually declares instead of parsing an attrpath.
         cmd = [
-            nix, *NIX_EXPERIMENTAL, "build", _flake_ref(project, _nix_id(name)),
+            nix, *_nix_flags(), "build", _flake_ref(project, _nix_id(name)),
             "--no-link",
         ]
         # Capture only when running in parallel — sequential mode streams
@@ -811,7 +882,7 @@ def build(
     def build_one(attr: str) -> tuple[str, Path | None, int]:
         out_link = output_dir / attr
         cmd = [
-            nix, *NIX_EXPERIMENTAL, "build",
+            nix, *_nix_flags(), "build",
             _flake_ref(project, attr),
             "--out-link", str(out_link),
         ]
@@ -867,6 +938,7 @@ def build(
         cross_arch = _cross_arch_qemu_capsules(project, [a for a, _ in failures])
         if cross_arch:
             msg += _cross_arch_hint(cross_arch)
+        msg += network_hint(project)
         # With the `.` ref (flake.nix in the git index), Nix evaluates the
         # git tree — a freshly created source file that isn't `git add`ed
         # is invisible to the build and fails with a baffling
@@ -880,6 +952,116 @@ def build(
         raise BuildError(msg)
 
     return results
+
+
+PREFETCH_ROOTS = ".prefetch"
+
+
+def _input_installables(derivation_json: str) -> list[str]:
+    """`drv^outputs` installables for every input derivation listed in
+    `nix derivation show` output. Handles both JSON shapes: Nix ≥ 2.32
+    (`{"derivations": {name: {"inputs": {"drvs": {...}}}}}`, store
+    basenames) and older Nix (`{path: {"inputDrvs": {...}}}`)."""
+    data = json.loads(derivation_json)
+    drvs = data.get("derivations", data)
+    store = os.environ.get("NIX_STORE_DIR", "/nix/store")
+    out: set[str] = set()
+    for drv in drvs.values():
+        if "inputs" in drv:
+            inputs = drv["inputs"].get("drvs", {})
+        else:
+            inputs = drv.get("inputDrvs", {})
+        for path, spec in inputs.items():
+            outputs = spec.get("outputs", []) if isinstance(spec, dict) else spec
+            if not path.startswith("/"):
+                path = f"{store}/{path}"
+            out.add(f"{path}^{','.join(outputs) if outputs else '*'}")
+    return sorted(out)
+
+
+def prefetch(project: Project) -> int:
+    """Fetch, while online, everything a later `rigx --offline` run needs:
+    the flake inputs (writing flake.lock if there is none), the build
+    inputs of every buildable target and sandboxed test — compilers,
+    libraries, Python venvs — and the `deps.nixpkgs` tools of host-side
+    scripts, testbeds and `sandbox = false` tests.
+
+    Inputs are realized, not the targets themselves, so prefetching never
+    runs a test and an edited source still builds offline. Every realized
+    path gets a GC root under `output/.prefetch/`, so `nix-collect-garbage`
+    doesn't undo the prefetch; `rigx clean` drops the roots. Returns the
+    number of store paths now rooted."""
+    if offline_mode():
+        raise BuildError(
+            "rigx prefetch needs the network: run it without --offline / "
+            f"{OFFLINE_ENV}=1"
+        )
+    write_flake(project)
+    nix = _nix_bin()
+    lock_path = project.root / "flake.lock"
+    before = lock_path.read_bytes() if lock_path.is_file() else b""
+
+    print("[rigx prefetch] flake inputs")
+    r = subprocess.run(
+        [nix, *_nix_flags(), "flake", "archive", _flake_ref(project)],
+        cwd=project.root, check=False, stdout=subprocess.DEVNULL,
+    )
+    if r.returncode != 0:
+        raise BuildError(
+            f"nix flake archive failed (exit {r.returncode})"
+            + network_hint(project)
+        )
+    after = lock_path.read_bytes() if lock_path.is_file() else b""
+    if before != after:
+        _hint_commit_generated(project, ["flake.lock"])
+
+    attrs = _all_attrs(project) + [
+        _nix_id(n) for n, t in project.targets.items()
+        if t.kind == "test" and t.sandbox
+    ]
+    installables: list[str] = []
+    if attrs:
+        r = subprocess.run(
+            [nix, *_nix_flags(), "derivation", "show",
+             *(_flake_ref(project, a) for a in attrs)],
+            cwd=project.root, check=False, stdout=subprocess.PIPE, text=True,
+        )
+        if r.returncode != 0:
+            raise BuildError(
+                f"evaluating the targets failed (exit {r.returncode})"
+                + network_hint(project)
+            )
+        installables.extend(_input_installables(r.stdout))
+
+    host_pkgs = sorted({
+        pkg for t in project.targets.values()
+        if t.kind in ("script", "testbed")
+        or (t.kind == "test" and not t.sandbox)
+        for pkg in t.deps.nixpkgs
+    })
+    installables.extend(_nixpkgs_pkg_ref(project, pkg) for pkg in host_pkgs)
+    if not installables:
+        return 0
+
+    print(
+        f"[rigx prefetch] build inputs of {len(attrs)} target(s), "
+        f"{len(host_pkgs)} host tool(s)"
+    )
+    roots = _output_dir(project) / PREFETCH_ROOTS
+    if roots.is_dir():
+        shutil.rmtree(roots)  # only symlinks: stale roots from a past run
+    roots.mkdir(parents=True)
+    r = subprocess.run(
+        [nix, *_nix_flags(), "build", "--out-link", str(roots / "root"),
+         *installables],
+        cwd=project.root, check=False,
+    )
+    if r.returncode != 0:
+        raise BuildError(
+            f"fetching build inputs failed (exit {r.returncode})"
+            + network_hint(project)
+        )
+    return sum(1 for _ in roots.iterdir())
 
 
 def clean(project: Project) -> None:

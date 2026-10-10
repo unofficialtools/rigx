@@ -32,4 +32,8 @@ def cmd_test(args: argparse.Namespace) -> int:
     for n, rc in failed:
         print(f"  FAIL  {n}  (exit {rc})")
     print(f"\n{len(passed)} passed, {len(failed)} failed")
+    if failed:
+        hint = builder.network_hint(project, offline_note=False)
+        if hint:
+            print(hint.lstrip("\n"), file=sys.stderr)
     return 0 if not failed else max(rc for _, rc in failed)

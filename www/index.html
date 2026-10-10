@@ -10,31 +10,48 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet">
 <style>
-  :root { --text: #141414; --dim: #5c5c5c; --line: #e6e6e6; --accent: #ff5f05; }
+  :root {
+    --bg: #000; --panel: #0d1112; --line: #1f2a2c;
+    --text: #e4e4e4; --dim: #9aa3a5; --accent: #ff5f05;
+    color-scheme: dark;
+  }
   * { box-sizing: border-box; }
-  body { margin: 0; background: #fff; color: var(--text); font: 18px/1.6 Inter, system-ui, sans-serif; }
-  main { max-width: 760px; margin: 0 auto; padding: 32px 16px 64px; }
-  .logo { display: block; width: min(440px, 100%); margin: 0 auto; mix-blend-mode: multiply; }
-  .lead { font-size: 22px; text-align: center; margin: 8px 0 40px; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 18px/1.6 Inter, system-ui, sans-serif; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover, a:focus-visible { text-decoration: underline; }
+  main { max-width: 760px; margin: 0 auto; padding: 56px 16px 64px; }
+  .logo { display: block; width: min(440px, 100%); height: auto; margin: 0 auto; }
+  .lead { font-size: 22px; text-align: center; color: var(--dim); margin: 20px 0 28px; }
+  .github {
+    display: flex; align-items: center; justify-content: center; gap: 12px;
+    max-width: 460px; margin: 0 auto 8px; padding: 16px 20px; border-radius: 14px;
+    background: var(--accent); color: #141414; font-weight: 800; font-size: 20px;
+    transition: transform .12s;
+  }
+  .github:hover, .github:focus-visible { transform: translateY(-3px); text-decoration: none; outline: none; }
+  .github svg { width: 28px; height: 28px; flex: none; }
   h2 { font-size: 14px; font-weight: 800; letter-spacing: 2px; text-transform: uppercase; color: var(--dim); margin: 48px 0 16px; }
-  ul.points { list-style: none; padding: 0; margin: 0; }
-  ul.points li { padding: 14px 0; border-top: 1px solid var(--line); }
-  ul.points b { display: block; }
+  ul.points { list-style: none; padding: 0; margin: 40px 0 0; }
+  ul.points li { padding: 14px 0; border-top: 1px solid var(--line); color: var(--dim); }
+  ul.points b { display: block; color: var(--text); }
   code, pre { font-family: "JetBrains Mono", monospace; font-size: 15px; }
-  pre { background: #f6f6f6; border-radius: 8px; padding: 14px 16px; overflow-x: auto; margin: 0; }
+  code { color: var(--text); }
+  pre { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; overflow-x: auto; margin: 0; }
   p.note { color: var(--dim); font-size: 16px; margin: 10px 0 0; }
   .tutorials { display: grid; gap: 12px; }
-  .tutorials a { display: block; color: inherit; text-decoration: none; border: 1px solid var(--line); border-left: 4px solid var(--accent); border-radius: 8px; padding: 14px 18px; }
-  .tutorials a:hover { border-color: var(--accent); }
+  .tutorials a { display: block; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-left: 4px solid var(--accent); border-radius: 8px; padding: 14px 18px; transition: border-color .12s; }
+  .tutorials a:hover, .tutorials a:focus-visible { border-color: var(--accent); text-decoration: none; }
   .tutorials span { display: block; color: var(--dim); font-size: 16px; }
-  a { color: var(--accent); }
-  footer { margin-top: 56px; text-align: center; font-size: 16px; }
 </style>
 </head>
 <body>
 <main>
-  <img class="logo" src="rigx.png" alt="rigx: build anything, reproducibly">
+  <img class="logo" src="rigx-dark.png" width="1000" height="359" alt="rigx: build anything, reproducibly">
   <p class="lead">A hermetic build system built on Nix.<br>No Nix knowledge required.</p>
+  <a class="github" href="https://github.com/unofficialtools/rigx">
+    <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .5C5.65.5.5 5.65.5 12a11.5 11.5 0 0 0 7.86 10.92c.58.1.79-.25.79-.56v-2c-3.2.7-3.87-1.37-3.87-1.37-.53-1.33-1.28-1.69-1.28-1.69-1.05-.72.08-.7.08-.7 1.16.08 1.77 1.19 1.77 1.19 1.03 1.77 2.7 1.26 3.36.96.1-.75.4-1.26.73-1.55-2.55-.29-5.24-1.28-5.24-5.68 0-1.26.45-2.28 1.19-3.09-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.17 1.18a11 11 0 0 1 5.77 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.76.11 3.05.74.81 1.19 1.83 1.19 3.09 0 4.41-2.69 5.38-5.26 5.67.41.36.78 1.06.78 2.14v3.17c0 .31.21.67.8.56A11.5 11.5 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5Z"/></svg>
+    github.com/unofficialtools/rigx
+  </a>
 
   <ul class="points">
     <li><b>One small file</b>Describe your targets in a plain <code>rigx.toml</code>: programs, libraries, tests, containers.</li>
@@ -53,8 +70,6 @@
   <h2>Install</h2>
   <pre>nix profile install github:unofficialtools/rigx/stable</pre>
   <p class="note">rigx needs <a href="https://nixos.org/download/">Nix</a> underneath; everything else it fetches itself.</p>
-
-  <footer><a href="https://github.com/unofficialtools/rigx">github.com/unofficialtools/rigx</a></footer>
 </main>
 </body>
 </html>

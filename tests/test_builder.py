@@ -370,6 +370,155 @@ class HostScriptsInterpolateDeps(unittest.TestCase):
         self.assertIn("echo ${HOME} $app", cmd)
 
 
+class OfflineMode(unittest.TestCase):
+    """`rigx --offline` / RIGX_OFFLINE=1 adds `--offline` to every nix
+    call, so a missing path fails at once instead of timing out."""
+
+    def test_flags_follow_the_environment(self):
+        with mock.patch.dict(os.environ, {"RIGX_OFFLINE": "1"}):
+            self.assertIn("--offline", builder._nix_flags())
+        with mock.patch.dict(os.environ, {"RIGX_OFFLINE": "0"}):
+            self.assertNotIn("--offline", builder._nix_flags())
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(builder._nix_flags(), builder.NIX_EXPERIMENTAL)
+
+    def test_host_script_nix_shell_runs_offline(self):
+        from rigx.config import TargetDeps
+        proj = _project_with(s=Target(
+            name="s", kind="script", script="jq .",
+            deps=TargetDeps(nixpkgs=["jq"]),
+        ))
+        with mock.patch.dict(os.environ, {"RIGX_OFFLINE": "1"}), \
+             mock.patch("rigx.builder._nix_bin", return_value="/usr/bin/nix"):
+            cmd = builder._script_cmd(proj, proj.targets["s"])
+        self.assertLess(cmd.index("--offline"), cmd.index("shell"))
+
+
+class NetworkHint(unittest.TestCase):
+    def _project(self, root: Path) -> Project:
+        proj = _project_with()
+        proj.root = root
+        return proj
+
+    def test_silent_when_the_network_is_up(self):
+        with mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch("rigx.builder._network_down", return_value=False):
+            self.assertEqual(builder.network_hint(_project_with()), "")
+
+    def test_network_down_points_at_prefetch_and_missing_lock(self):
+        with tempfile.TemporaryDirectory() as d, \
+             mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch("rigx.builder._network_down", return_value=True):
+            hint = builder.network_hint(self._project(Path(d)))
+            (Path(d) / "flake.lock").write_text("{}")
+            locked = builder.network_hint(self._project(Path(d)))
+        self.assertIn("rigx prefetch", hint)
+        self.assertIn("no flake.lock", hint)
+        self.assertNotIn("no flake.lock", locked)
+
+    def test_offline_mode_explains_itself_without_probing(self):
+        with mock.patch.dict(os.environ, {"RIGX_OFFLINE": "1"}), \
+             mock.patch("rigx.builder._network_down") as probe:
+            hint = builder.network_hint(_project_with())
+            quiet = builder.network_hint(_project_with(), offline_note=False)
+        self.assertIn("running offline", hint)
+        self.assertEqual(quiet, "")
+        probe.assert_not_called()
+
+    def test_failed_build_carries_the_hint(self):
+        proj = _project_with(app=Target(name="app", kind="executable", sources=["m.cpp"]))
+        with tempfile.TemporaryDirectory() as d:
+            proj.root = Path(d)
+            with mock.patch("rigx.builder.write_flake"), \
+                 mock.patch("rigx.builder._nix_bin", return_value="/usr/bin/nix"), \
+                 mock.patch("rigx.builder._flake_is_tracked", return_value=False), \
+                 mock.patch("rigx.builder.subprocess.run") as run, \
+                 mock.patch("rigx.builder.network_hint", return_value="\n\nNET"):
+                run.return_value.returncode = 1
+                with self.assertRaises(BuildError) as cm:
+                    builder.build(proj, ["app"])
+        self.assertIn("NET", str(cm.exception))
+
+
+class InputInstallables(unittest.TestCase):
+    def test_current_nix_json(self):
+        doc = {"version": 4, "derivations": {"aaa-app.drv": {"inputs": {
+            "drvs": {
+                "bbb-fmt.drv": {"outputs": ["dev"], "dynamicOutputs": {}},
+                "ccc-stdenv.drv": {"outputs": ["out"], "dynamicOutputs": {}},
+            },
+            "srcs": ["ddd-source"],
+        }}}}
+        import json
+        self.assertEqual(builder._input_installables(json.dumps(doc)), [
+            "/nix/store/bbb-fmt.drv^dev",
+            "/nix/store/ccc-stdenv.drv^out",
+        ])
+
+    def test_older_nix_json(self):
+        doc = {"/nix/store/aaa-app.drv": {"inputDrvs": {
+            "/nix/store/bbb-fmt.drv": ["dev", "out"],
+            "/nix/store/ccc-stdenv.drv": {"outputs": ["out"]},
+        }}}
+        import json
+        self.assertEqual(builder._input_installables(json.dumps(doc)), [
+            "/nix/store/bbb-fmt.drv^dev,out",
+            "/nix/store/ccc-stdenv.drv^out",
+        ])
+
+
+class Prefetch(unittest.TestCase):
+    def _project(self, root: Path) -> Project:
+        from rigx.config import TargetDeps
+        proj = _project_with(
+            app=Target(name="app", kind="executable", sources=["m.cpp"]),
+            unit=Target(name="unit", kind="test", script="true"),
+            smoke=Target(
+                name="smoke", kind="test", sandbox=False, script="jq .",
+                deps=TargetDeps(nixpkgs=["jq"]),
+            ),
+        )
+        proj.root = root
+        return proj
+
+    def test_refuses_to_run_offline(self):
+        with mock.patch.dict(os.environ, {"RIGX_OFFLINE": "1"}):
+            with self.assertRaises(BuildError):
+                builder.prefetch(_project_with())
+
+    def test_archives_inputs_and_roots_build_inputs(self):
+        import json
+        shown = json.dumps({"derivations": {"x-app.drv": {"inputs": {
+            "drvs": {"y-gcc.drv": {"outputs": ["out"]}}, "srcs": [],
+        }}}})
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            if "build" in cmd:
+                link = Path(cmd[cmd.index("--out-link") + 1])
+                link.symlink_to("/nix/store/y-gcc")
+            return mock.Mock(returncode=0, stdout=shown)
+
+        with tempfile.TemporaryDirectory() as d:
+            proj = self._project(Path(d))
+            with mock.patch.dict(os.environ, {}, clear=True), \
+                 mock.patch("rigx.builder.write_flake"), \
+                 mock.patch("rigx.builder._nix_bin", return_value="/usr/bin/nix"), \
+                 mock.patch("rigx.builder._flake_is_tracked", return_value=False), \
+                 mock.patch("rigx.builder.subprocess.run", side_effect=fake_run):
+                n = builder.prefetch(proj)
+        archive, show, build = calls
+        self.assertIn("archive", archive)
+        # Buildable targets and sandboxed tests, never host-side tests.
+        self.assertTrue(any(a.endswith("#app") for a in show))
+        self.assertTrue(any(a.endswith("#unit") for a in show))
+        self.assertFalse(any(a.endswith("#smoke") for a in show))
+        self.assertIn("/nix/store/y-gcc.drv^out", build)
+        self.assertTrue(any(a.endswith("#jq") for a in build))
+        self.assertEqual(n, 1)
+
+
 class ScriptEnvExposesRigx(unittest.TestCase):
     """Host-side scripts can `import rigx` from whatever python3 they
     run — e.g. a testbed's `deps.nixpkgs = ["python3"]` when rigx

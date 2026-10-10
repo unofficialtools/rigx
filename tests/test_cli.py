@@ -115,6 +115,23 @@ class MainKeyboardInterrupt(unittest.TestCase):
         self.assertIn("interrupted", stderr.getvalue())
 
 
+class OfflineFlag(unittest.TestCase):
+    def test_offline_flag_reaches_child_processes(self):
+        import os
+        seen = {}
+
+        def capture(args):
+            seen["env"] = os.environ.get("RIGX_OFFLINE")
+            return 0
+
+        with mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch.object(cli, "cmd_version", side_effect=capture):
+            # build_parser binds cmd_version at parse time, so patch first.
+            rc = cli.main(["--offline", "version"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(seen["env"], "1")
+
+
 class BuildHints(unittest.TestCase):
     """`rigx build` prints a per-kind hint after each successful target —
     `run:` for executable / python_script, `start:` + `shell:` for
