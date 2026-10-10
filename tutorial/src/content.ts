@@ -265,13 +265,14 @@ hostname      = "hellocap"
 from rigx.capsule import start
 from rigx.testbed import Network
 
-with Network() as net:
-    net.declare("hello", listens_on=[])
-    with start("hello_capsule",
-               **net.bindings("hello")) as cap:
-        out = cap.logs()
-        assert "Hello," in out, out
-        print("[testbed] OK:", out.strip())
+net = Network()
+net.declare("hello", listens_on=[])   # before entering the testbed
+
+with net, start("hello_capsule",
+                **net.bindings("hello")) as cap:
+    out = cap.logs()
+    assert "Hello," in out, out
+    print("[testbed] OK:", out.strip())
 
 
 # rigx.toml

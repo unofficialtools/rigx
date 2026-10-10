@@ -53,3 +53,56 @@ To restyle (colors, fonts, panel chrome), touch
 - The testbed example in scene 10 is a minimal one-capsule case; for a richer
   example with fault injection across multiple capsules see the
   README's "Multi-capsule tests with faults" section.
+
+---
+
+# rigx-matmul-cluster — second composition
+
+A longer walkthrough (~7m20s) that grows one project from a hello world
+into a small matrix-multiplication cluster:
+
+1. Start a project
+2. Hello, world (default gcc)
+3. Pin a specific clang (`compiler = "clang18"`)
+4. Multiply matrices with Eigen (`deps.nixpkgs = ["eigen"]`)
+5. Lock it in with a sandboxed `kind = "test"`
+6. Package it as a `lite` capsule (socat → TCP :7000)
+7. Write the Python orchestrator (`rigx.testbed.Network` + `rigx.capsule.start`)
+8. Run the `kind = "testbed"` that drives three copies of the capsule
+
+It opens with a title card, a page introducing rigx (hermetic, built on
+Nix with no Nix knowledge required, dependencies from nixpkgs.org), and
+a "what we're going to build" page with an animated diagram. The video
+stresses that you need only a shell, a text editor, and rigx; the one
+exception, docker or podman for running the containers, is stated where
+it applies. Each step then has:
+
+- an explainer page saying *what* the step achieves (not how);
+- one editor slide per file touched: a black editor window types the
+  file in, with numbered callouts explaining the lines as they appear
+  (typing pauses so each callout can be read); appends show the existing
+  file dimmed with the new lines marked in the gutter;
+- a terminal slide that only runs commands. Files are never written
+  from the terminal.
+
+It closes with a "going further" slide on testbed UDP links and fault
+injection (loss, latency/jitter, corruption, partitions), then a recap.
+
+A sidebar on every page shows the step timeline and a live project
+file tree with new/editing badges.
+
+```bash
+npm run studio           # pick "rigx-matmul-cluster"
+npm run render:cluster   # writes out/rigx-matmul-cluster.mp4
+```
+
+Content lives in [`src/cluster/content.ts`](src/cluster/content.ts):
+each step's explainer text plus its slides, and each editor slide's
+callouts (`notes`, anchored by a substring of the line they explain).
+Scene lengths are derived from it in
+[`src/cluster/timeline.ts`](src/cluster/timeline.ts) (typing speed,
+callout reading time), so editing text never leaves stale durations
+behind. [`matmul-cluster/`](matmul-cluster/) is the finished project,
+generated from the same content.
+Every file, command, and output shown was run for real against rigx
+0.12.0 / nixos-24.11 (clang 18.1.8, Eigen 3.4.0).

@@ -1,0 +1,40 @@
+[project]
+name    = "matmul-cluster"
+version = "0.1.0"
+
+[nixpkgs]
+ref = "nixos-24.11"
+
+[targets.hello]
+kind    = "executable"
+sources = ["src/hello.cpp"]
+compiler = "clang18"
+
+[targets.matmul]
+kind         = "executable"
+sources      = ["src/matmul.cpp"]
+compiler     = "clang18"
+cxxflags     = ["-std=c++17", "-O2", "-march=x86-64-v3"]
+deps.nixpkgs = ["eigen"]
+
+[targets.test_matmul]
+kind          = "test"
+deps.internal = ["matmul"]
+deps.nixpkgs  = ["gnugrep"]
+script = """
+${matmul}/bin/matmul < data/small.txt | grep -qx '43 50'
+"""
+
+[targets.matmul_worker]
+kind          = "capsule"
+backend       = "lite"
+deps.internal = ["matmul"]
+deps.nixpkgs  = ["socat"]
+entrypoint    = "socat TCP-LISTEN:7000,fork EXEC:${matmul}/bin/matmul"
+ports         = [7000]
+
+[targets.cluster]
+kind          = "testbed"
+deps.internal = ["matmul_worker"]
+deps.nixpkgs  = ["python3"]
+script        = "python3 testbeds/orchestrate.py"

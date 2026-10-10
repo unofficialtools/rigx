@@ -6,7 +6,8 @@
   "scripts": {
     "studio": "remotion studio src/index.ts",
     "render": "remotion render src/index.ts rigx-cpp-tutorial out/rigx-cpp-tutorial.mp4",
-    "render:webm": "remotion render src/index.ts rigx-cpp-tutorial out/rigx-cpp-tutorial.webm --codec=vp9"
+    "render:webm": "remotion render src/index.ts rigx-cpp-tutorial out/rigx-cpp-tutorial.webm --codec=vp9",
+    "render:cluster": "remotion render src/index.ts rigx-matmul-cluster out/rigx-matmul-cluster.mp4"
   },
   "dependencies": {
     "@remotion/bundler": "^4.0.0",
