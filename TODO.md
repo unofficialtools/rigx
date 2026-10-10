@@ -253,3 +253,37 @@ Once qemu user-mode lands, capsules of different backends (lite +
 qemu) should talk through the same testbed naturally — both sides
 just expose host ports, and the testbed proxies between them.
 Verification needed once both backends are real.
+
+## Offline operation — what's left
+
+Done in 0.13.0: `rigx prefetch`, `rigx --offline` / `RIGX_OFFLINE=1`
+(`--offline` on every nix call), a network-unreachable hint on failed
+build/lock/test/run/pkg, and README notes (including that a
+`pypi.org/simple/rigx` error is the launcher, e.g. `uvx`, not rigx).
+Verified end to end: after `rigx prefetch`, a source edit rebuilds and
+tests offline (`unshare -rn`), cross target included.
+
+Still open:
+
+- **Pin nixpkgs by rev in `rigx.toml`.** `[nixpkgs]` takes only a
+  branch, so a project without `flake.lock` can't resolve nixpkgs
+  offline at all (even `nix --offline` calls api.github.com), and with
+  no usable lock the host-side paths fall back to the registry ref
+  `nixpkgs/<branch>` (see `_locked_nixpkgs_flakeref`). Accept a `rev`
+  (or full `url`) and have `rigx lock` write the resolved rev back.
+  ~60 lines plus schema and docs.
+- **Python venv FODs.** `mk_python_derivation` runs `uv sync --frozen`
+  in a fixed-output derivation. `prefetch` realizes it, but it needs the
+  network again whenever deps change or the hash is still
+  `FAKE_SHA256`. Give that case a targeted error ("this target's venv is
+  not in the store and building it requires network"); longer term,
+  pre-seeded uv cache, vendored wheels, or uv2nix.
+- **`rigx remote` to a fresh host** curls `install.determinate.systems`
+  on the target. An offline installer (pre-staged tarball copied over
+  SSH) would close it.
+- **`rigx bundle export` / `import`** — `nix copy` a project's closure
+  to a file for air-gapped machines; the machinery exists in the SSH
+  deploy backend. ~150 lines.
+- **Doctor check** — "can this project build offline right now?": lock
+  present, locked rev in store, per-target closures, venv FOD hashes.
+  ~120 lines.

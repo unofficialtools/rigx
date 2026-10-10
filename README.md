@@ -472,6 +472,8 @@ rigx version              # print the rigx version (also: `--version` / `-V`)
 rigx list                 # list targets
 rigx list --kind test     # filter by kind (executable, test, run, …)
 rigx lock                 # generate flake.nix and update flake.lock
+rigx prefetch             # while online, fetch everything an offline build needs
+rigx --offline build      # build without touching the network (also: RIGX_OFFLINE=1)
 rigx build                # build every target (and variant)
 rigx build hello          # build one target
 rigx build hello@release  # build a specific variant
@@ -496,6 +498,31 @@ rigx pkg uv -- lock       # run any nixpkgs binary (uv, jq, ripgrep, …) from p
 
 If rigx isn't installed, invoke it as a module:
 `PYTHONPATH=/path/to/rigx python3 -m rigx -C /path/to/project build`.
+
+### Working offline
+
+Run `rigx prefetch` once while online. It writes `flake.lock` if there
+is none, fetches the flake inputs, and fetches the build inputs of every
+target and sandboxed test (compilers, libraries, Python venvs) plus the
+`deps.nixpkgs` tools of scripts, testbeds and `sandbox = false` tests.
+It doesn't build the targets themselves or run any test, so a source
+you edit later still builds offline. Each fetched path gets a GC root
+under `output/.prefetch/`, so `nix-collect-garbage` keeps them;
+`rigx clean` removes the roots.
+
+After that, `rigx --offline build` (or `test`, `run`, `pkg`) works
+without a network. Offline mode passes `--offline` to every `nix` call,
+so anything missing fails right away instead of after DNS timeouts and
+retries. `RIGX_OFFLINE=1` does the same and reaches scripts and testbeds
+that call rigx themselves. When a build fails and the network looks
+unreachable, rigx says so and points at these two commands. Re-run
+`rigx prefetch` after changing dependencies.
+
+rigx itself never contacts PyPI. An error such as ``Failed to fetch:
+`https://pypi.org/simple/rigx/` `` comes from the launcher, typically
+`uvx rigx`, which looks rigx up on the index on every run. Install it
+once instead: `nix profile install github:unofficialtools/rigx/stable`
+or `uv tool install rigx`. With `uvx`, `UV_OFFLINE=1` also works.
 
 ---
 

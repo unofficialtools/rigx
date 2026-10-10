@@ -58,6 +58,18 @@
 
 ### New features
 
+- **Offline builds: `rigx prefetch` and `rigx --offline`.** `rigx prefetch`,
+  run while online, fetches the flake inputs (writing `flake.lock` if needed),
+  the build inputs of every target and sandboxed test, and the
+  `deps.nixpkgs` tools of host-side scripts, testbeds and tests. It roots
+  them under `output/.prefetch/` so garbage collection keeps them.
+  `rigx --offline ...` (or `RIGX_OFFLINE=1`) then passes `--offline` to every
+  `nix` call, so a missing path fails at once instead of after DNS timeouts.
+  When a build, lock, test, `run` or `pkg` fails and the network looks
+  unreachable, rigx now says so and points at these commands. rigx itself
+  never contacts PyPI; the README explains that a `pypi.org/simple/rigx`
+  error comes from a launcher such as `uvx`.
+
 - **Deploys check for host port conflicts before building anything.** A
   collision on a published host port previously surfaced only when the
   container tried to bind, which is after `activate` had already restarted
