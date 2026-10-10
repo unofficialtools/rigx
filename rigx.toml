@@ -50,7 +50,7 @@ PYTHONPATH=. python3 -m rigx -C example-project build -j 4
 #   1. python3 -m unittest discover tests   (abort the release on failure)
 #   2. git tag v$VERSION                     (version read from pyproject.toml)
 #   3. git tag -f stable                     (move the rolling `stable` tag here)
-#   4. git push origin master || true        (don't fail if nothing to push)
+#   4. git push origin main || true          (don't fail if nothing to push)
 #   5. git push --force --tags               (force: `stable` moved)
 #   6. uv build && uv publish
 #
@@ -101,7 +101,7 @@ git tag -f stable
 
 # 4. Push the branch (tolerate "everything up-to-date"), then the tags.
 #    --force is required because `stable` is an existing tag being moved.
-(git push origin master || true)
+(git push origin main || true)
 git push --force --tags
 
 # 5. Build and upload to PyPI.
