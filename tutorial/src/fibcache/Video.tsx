@@ -1,6 +1,6 @@
 import React from "react";
 import { AbsoluteFill, Sequence, interpolate, useCurrentFrame } from "remotion";
-import { COLORS } from "../components";
+import { COLORS } from "../colors";
 import { Lang, STEPS } from "./content";
 import {
   EditTimeline,

@@ -1,0 +1,71 @@
+[project]
+name    = "hello-cpp"
+version = "0.1.0"
+
+[nixpkgs]
+ref = "nixos-24.11"
+
+[targets.greet]
+kind           = "static_library"
+sources        = ["src/greet.cpp"]
+includes       = ["include"]
+public_headers = ["include"]
+cxxflags       = ["-std=c++17"]
+deps.nixpkgs   = ["fmt"]
+
+[targets.hello]
+kind          = "executable"
+sources       = ["src/main.cpp"]
+cxxflags      = ["-std=c++17"]
+ldflags       = ["-lfmt"]
+deps.internal = ["greet"]
+deps.nixpkgs  = ["fmt"]
+
+[targets.hello_zip]
+kind          = "run"
+run           = "zip"
+deps.nixpkgs  = ["zip"]
+deps.internal = ["hello"]
+args          = ["-j", "hello.zip", "${hello}/bin/hello"]
+outputs       = ["hello.zip"]
+
+[targets.test_hello]
+kind          = "test"
+deps.internal = ["hello"]
+deps.nixpkgs  = ["gnugrep"]
+script = """
+${hello}/bin/hello rigx | grep -qx 'Hello, rigx!'
+"""
+
+[targets.hello_arm64]
+kind         = "executable"
+sources      = ["src/main.cpp", "src/greet.cpp"]
+includes     = ["include"]
+cxxflags     = ["-std=c++17"]
+ldflags      = ["-lfmt"]
+deps.nixpkgs = ["fmt"]
+target       = "aarch64-linux"
+
+[targets.test_arm64]
+kind          = "test"
+deps.internal = ["hello_arm64"]
+deps.nixpkgs  = ["file", "gnugrep"]
+script = """
+file -L ${hello_arm64}/bin/hello_arm64 | grep -q 'ARM aarch64'
+"""
+
+[targets.hello_capsule]
+kind          = "capsule"
+backend       = "lite"
+deps.internal = ["hello"]
+entrypoint    = "${hello}/bin/hello capsule"
+
+[targets.test_capsule]
+kind          = "test"
+sandbox       = false
+deps.internal = ["hello_capsule"]
+deps.nixpkgs  = ["gnugrep"]
+script = """
+RIGX_FOREGROUND=1 ${hello_capsule}/bin/run-hello_capsule \
+  | grep -qx 'Hello, capsule!'
+"""

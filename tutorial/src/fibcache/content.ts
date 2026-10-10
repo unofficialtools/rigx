@@ -68,7 +68,7 @@ export const STEPS: Step[] = [
         kind: "terminal",
         items: [
           { kind: "cmd", text: "rigx --version" },
-          { kind: "out", text: "rigx 0.12.0" },
+          { kind: "out", text: "rigx 0.13.0" },
           { kind: "cmd", text: "mkdir fib-cache && cd fib-cache" },
           { kind: "cmd", text: "mkdir src testbeds data", creates: ["src/", "testbeds/", "data/"] },
         ],
