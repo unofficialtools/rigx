@@ -97,8 +97,8 @@ def _qualify_ref(ref: str, namespace: str, targets: dict[str, "Target"]) -> str:
     """Resolve a possibly-bare target reference written inside a module:
     prefer the namespace-qualified sibling (`gen` → `frontend.gen`),
     falling back to the bare name (a parent-owned target, a cross-flake
-    ref, or — for `run` — a PATH command). Mirrors the deps.internal
-    auto-qualification in `_build_target`."""
+    ref, or — for `run` — a PATH command). Used for deps.internal,
+    `${…}` interpolations, `run`, and testbed service references."""
     if namespace and "." not in ref:
         qualified = f"{namespace}.{ref}"
         if qualified in targets:
@@ -1310,14 +1310,9 @@ def _build_target(
             raise ConfigError(
                 f"target {tname}: deps.git references undefined dependency '{g}'"
             )
-    # Auto-qualify intra-module deps so module-author writes `greet` and the
-    # merged scope sees `frontend.greet`. Already-qualified refs and own-
-    # project parent refs (no namespace) pass through.
-    if namespace:
-        deps.internal = [
-            d if "." in d else f"{namespace}.{d}"
-            for d in deps.internal
-        ]
+    # Bare names inside a module (`greet` → `frontend.greet`) are
+    # qualified in `_load` once every target is known, so that a name
+    # with no sibling can still mean a target of the root project.
 
     variants: dict[str, Variant] = {}
     variants_conf = tconf.get("variants", {})
@@ -1549,6 +1544,11 @@ def _enumerate_modules(
         if not (mod_root / "rigx.toml").is_file():
             raise ConfigError(f"module {ns}: no rigx.toml at {mod_root}")
         mod_data = _read_toml(mod_root / "rigx.toml")
+        # A module's own top-level `include = [...]`, resolved against the
+        # module's directory, as the root file's is against the root's.
+        _load_includes(
+            mod_data, mod_root, frozenset({(mod_root / "rigx.toml").resolve()}),
+        )
         if "project" in mod_data:
             raise ConfigError(
                 f"module {ns}: must not contain [project] (parent owns identity)"
@@ -2021,6 +2021,16 @@ def _load(root: Path, _visited: set[Path]) -> Project:
     # Phase 1: gather modules. Each module's TOML is read and validated for
     # the `no [project]` / `no [nixpkgs]` rules during enumeration.
     modules = list(_enumerate_modules(data, root))
+    # A namespace is the module directory's name, so `a/x` and `b/x`
+    # would silently merge their targets into one `x.*`.
+    seen_ns: dict[str, Path] = {}
+    for ns, mod_root, _ in modules:
+        if ns in seen_ns:
+            raise ConfigError(
+                f"modules {seen_ns[ns]} and {mod_root} would both be "
+                f"namespace {ns!r}; rename one of the directories"
+            )
+        seen_ns[ns] = mod_root
 
     # Phase 2: merge top-level tables (vars, git_deps, local_deps) across the
     # parent and every module. Collisions are config errors so the user
@@ -2095,6 +2105,12 @@ def _load(root: Path, _visited: set[Path]) -> Project:
     # if it names (a) a target in this flake (parent or merged module), or
     # (b) a `<localdep>.<target>` cross-flake ref into a sibling project.
     for qname, target in targets.items():
+        # Inside a module, a bare dep names the sibling if there is one,
+        # else a target of the root project (or a cross-flake ref).
+        target.deps.internal = [
+            _qualify_ref(d, target.namespace, targets)
+            for d in target.deps.internal
+        ]
         # Auto-derive deps.internal from `${<name>}` interpolations in
         # `sources`. Lets the user write `sources = ["${gen}/foo.nim"]`
         # — pointing into a sibling `custom` target's `$out` — without

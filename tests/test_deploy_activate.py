@@ -53,44 +53,43 @@ fi
 exit 0
 """
 
-# Minimal `nix-env --profile P --set T` / `--profile P --rollback`
-# simulation: a `<profile>.history` file tracks every `--set` target in
-# order; `--set` appends + symlinks; `--rollback` pops the last entry
-# and symlinks to the new last one (a simplified two-generation model —
-# enough to exercise rigx's own rollback logic, not a real Nix profile).
+# Minimal Nix profile: `<profile>.history` holds one generation per
+# line (generation N = line N), `<profile>.current` the current number.
+# `--set` appends a generation and makes it current; `--rollback` steps
+# back one; `--switch-generation N` jumps; `--list-generations` prints
+# them with `(current)` marked, like the real thing.
 _FAKE_NIX_ENV = """
 echo "$*" >> "$NIXENV_LOG"
-profile=""
-mode=""
-target=""
+profile=""; mode=""; arg=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --profile) profile="$2"; shift 2 ;;
-    --set) mode="set"; target="$2"; shift 2 ;;
-    --rollback) mode="rollback"; shift ;;
+    --set) mode=set; arg="$2"; shift 2 ;;
+    --rollback) mode=rollback; shift ;;
+    --switch-generation) mode=switch; arg="$2"; shift 2 ;;
+    --list-generations) mode=list; shift ;;
     *) shift ;;
   esac
 done
-hist="$profile.history"
+hist="$profile.history"; cur="$profile.current"
+point() { ln -sfn "$(sed -n "${1}p" "$hist")" "$profile"; echo "$1" > "$cur"; }
 case "$mode" in
-  set)
-    echo "$target" >> "$hist"
-    ln -sfn "$target" "$profile"
-    ;;
-  rollback)
-    n=$(wc -l < "$hist" 2>/dev/null || echo 0)
-    if [ "$n" -ge 2 ]; then
-      sed -i '$d' "$hist"
-      new=$(tail -n1 "$hist")
-      ln -sfn "$new" "$profile"
-    fi
-    ;;
+  set) echo "$arg" >> "$hist"; point "$(wc -l < "$hist")" ;;
+  rollback) c=$(cat "$cur"); [ "$c" -gt 1 ] && point $((c - 1)) ;;
+  switch) point "$arg" ;;
+  list)
+    c=$(cat "$cur" 2>/dev/null || echo 0); n=0
+    while IFS= read -r _; do
+      n=$((n + 1))
+      if [ "$n" = "$c" ]; then echo "   $n   2026-10-10 (current)"
+      else echo "   $n   2026-10-10"; fi
+    done < "$hist" ;;
 esac
 exit 0
 """
 
 
-def _plan_dir(root: Path, name: str, manifest: dict, previous: dict | None = None) -> Path:
+def _plan_dir(root: Path, name: str, manifest: dict) -> Path:
     """Materialize a plan directory (units/ + bin/activate + bin/rollback)
     for `manifest` under `root/name`."""
     plan = root / name
@@ -100,7 +99,7 @@ def _plan_dir(root: Path, name: str, manifest: dict, previous: dict | None = Non
         (plan / "units" / unit_name).write_text(text)
     activate_path = plan / "bin" / "activate"
     rollback_path = plan / "bin" / "rollback"
-    activate_path.write_text(activate.render_activate(manifest, previous))
+    activate_path.write_text(activate.render_activate(manifest))
     rollback_path.write_text(activate.render_rollback(manifest))
     # `rollback` execs `<generation>/bin/activate` directly (relying on
     # its shebang, same as it would on a real deploy target) — needs
@@ -156,6 +155,7 @@ class ActivateHarness(unittest.TestCase):
         env["RIGX_SYSTEMD_DIR"] = str(self.systemd_dir)
         env["RIGX_STATE_ROOT"] = str(self.state_root)
         env["RIGX_PROFILE_DIR"] = str(self.profile_dir)
+        env["RIGX_GCROOTS_DIR"] = str(self.root / "gcroots")
         env["SYSTEMCTL_LOG"] = str(self.systemctl_log)
         env["NIXENV_LOG"] = str(self.nixenv_log)
         env["ENGINE_LOG"] = str(self.engine_log)
@@ -285,7 +285,7 @@ class SecondDeployOnlyRestartsChanged(ActivateHarness):
             },
             "volumes": [], "secrets": [],
         }
-        plan2 = _plan_dir(self.root, "plan2", m2, previous=m1)
+        plan2 = _plan_dir(self.root, "plan2", m2)
         r2 = self.run_script(plan2 / "bin" / "activate")
         self.assertEqual(r2.returncode, 0, r2.stderr)
 
@@ -312,7 +312,7 @@ class SecondDeployOnlyRestartsChanged(ActivateHarness):
             "services": {"db": _service()},
             "volumes": [], "secrets": [],
         }
-        plan2 = _plan_dir(self.root, "plan2", m2, previous=m1)
+        plan2 = _plan_dir(self.root, "plan2", m2)
         r2 = self.run_script(plan2 / "bin" / "activate")
         self.assertEqual(r2.returncode, 0, r2.stderr)
 
@@ -337,7 +337,7 @@ class SecondDeployOnlyRestartsChanged(ActivateHarness):
             "services": {"db": _service()},
             "volumes": [], "secrets": [],
         }
-        plan2 = _plan_dir(self.root, "plan2", m2, previous=m1)
+        plan2 = _plan_dir(self.root, "plan2", m2)
         r2 = self.run_script(plan2 / "bin" / "activate")
         self.assertEqual(r2.returncode, 0, r2.stderr)
 
@@ -389,7 +389,7 @@ class Rollback(ActivateHarness):
             "services": {"web": _service(capsule_path="/nix/store/web-v2")},
             "volumes": [], "secrets": [],
         }
-        plan2 = _plan_dir(self.root, "plan2", m2, previous=m1)
+        plan2 = _plan_dir(self.root, "plan2", m2)
         r2 = self.run_script(plan2 / "bin" / "activate")
         self.assertEqual(r2.returncode, 0, r2.stderr)
         self.assertEqual(self.profile_target("app"), str(plan2.resolve()))
@@ -435,7 +435,7 @@ class NetworkCreation(ActivateHarness):
         self.engine_log.unlink()
 
         r2 = self.run_script(
-            _plan_dir(self.root, "plan2", m, previous=m) / "bin" / "activate"
+            _plan_dir(self.root, "plan2", m) / "bin" / "activate"
         )
         self.assertEqual(r2.returncode, 0, r2.stderr)
         calls = self.engine_calls()
@@ -504,7 +504,7 @@ class HealthUnitLifecycle(ActivateHarness):
         self.assertTrue((self.systemd_dir / "rigx-app-web-health.timer").exists())
 
         m2 = self._manifest(healthcheck=None)
-        plan2 = _plan_dir(self.root, "plan2", m2, previous=m1)
+        plan2 = _plan_dir(self.root, "plan2", m2)
         r2 = self.run_script(plan2 / "bin" / "activate")
         self.assertEqual(r2.returncode, 0, r2.stderr)
 
@@ -534,7 +534,7 @@ class HealthUnitLifecycle(ActivateHarness):
         self.assertTrue((self.systemd_dir / "rigx-app-old-health.timer").exists())
 
         m2 = self._manifest(healthcheck=None)
-        plan2 = _plan_dir(self.root, "plan2", m2, previous=m1)
+        plan2 = _plan_dir(self.root, "plan2", m2)
         r2 = self.run_script(plan2 / "bin" / "activate")
         self.assertEqual(r2.returncode, 0, r2.stderr)
 
@@ -557,7 +557,7 @@ class HealthUnitLifecycle(ActivateHarness):
         # differs, so the extra health units must not make activate
         # think the service changed.
         self.systemctl_log.unlink()
-        plan2 = _plan_dir(self.root, "plan2", m, previous=m)
+        plan2 = _plan_dir(self.root, "plan2", m)
         r2 = self.run_script(plan2 / "bin" / "activate")
         self.assertEqual(r2.returncode, 0, r2.stderr)
         self.assertFalse(
@@ -568,3 +568,119 @@ class HealthUnitLifecycle(ActivateHarness):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _m(services: dict) -> dict:
+    return {
+        "testbed": "app", "start_order": list(services),
+        "services": services, "volumes": [], "secrets": [],
+    }
+
+
+class RemovalsAfterTheGates(ActivateHarness):
+    """Dropped services go only once every gate has passed, and are
+    worked out against the plan that is actually live."""
+
+    def test_failed_deploy_keeps_a_dropped_service(self):
+        plan1 = _plan_dir(self.root, "plan1", _m({
+            "db": _service(capsule_path="/nix/store/db-v1"), "web": _service(),
+        }))
+        self.assertEqual(self.run_script(plan1 / "bin" / "activate").returncode, 0)
+        plan2 = _plan_dir(self.root, "plan2", _m({
+            "db": _service(capsule_path="/nix/store/db-v2", healthcheck={
+                "command": "false", "interval": 0, "retries": 1,
+            }),
+        }))
+        r = self.run_script(plan2 / "bin" / "activate")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertNotIn("disable --now rigx-app-web.service", self.systemctl_calls())
+        self.assertTrue((self.systemd_dir / "rigx-app-web.service").exists())
+        self.assertEqual(self.profile_target("app"), str(plan1.resolve()))
+
+    def test_rollback_removes_services_the_newer_plan_added(self):
+        plan1 = _plan_dir(self.root, "plan1", _m({"web": _service()}))
+        plan2 = _plan_dir(self.root, "plan2", _m({
+            "web": _service(), "worker": _service(capsule_path="/nix/store/w"),
+        }))
+        for plan in (plan1, plan2):
+            self.assertEqual(self.run_script(plan / "bin" / "activate").returncode, 0)
+        self.nixenv_log.write_text("")
+
+        r = self.run_script(plan2 / "bin" / "rollback")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("disable --now rigx-app-worker.service", self.systemctl_calls())
+        self.assertFalse((self.systemd_dir / "rigx-app-worker.service").exists())
+        self.assertIn("rm -f rigx-app-worker", self.engine_calls())
+        self.assertEqual(self.profile_target("app"), str(plan1.resolve()))
+
+    def test_rollback_creates_no_generation_so_a_second_one_goes_further(self):
+        plans = [
+            _plan_dir(self.root, f"plan{i}", _m({
+                "web": _service(capsule_path=f"/nix/store/web-v{i}"),
+            }))
+            for i in (1, 2, 3)
+        ]
+        for plan in plans:
+            self.assertEqual(self.run_script(plan / "bin" / "activate").returncode, 0)
+        self.assertEqual(self.run_script(plans[2] / "bin" / "rollback").returncode, 0)
+        self.assertEqual(self.profile_target("app"), str(plans[1].resolve()))
+        self.assertNotIn("--set", self.nixenv_log.read_text().splitlines()[-1])
+        self.assertEqual(self.run_script(plans[1] / "bin" / "rollback").returncode, 0)
+        self.assertEqual(self.profile_target("app"), str(plans[0].resolve()))
+
+    def test_failed_rollback_moves_the_profile_forward_again(self):
+        plan1 = _plan_dir(self.root, "plan1", _m({"web": _service(healthcheck={
+            "command": f'test -e "{self.root / "v1-ok"}"', "interval": 0, "retries": 1,
+        })}))
+        (self.root / "v1-ok").touch()
+        self.assertEqual(self.run_script(plan1 / "bin" / "activate").returncode, 0)
+        plan2 = _plan_dir(self.root, "plan2", _m({
+            "web": _service(capsule_path="/nix/store/web-v2"),
+        }))
+        self.assertEqual(self.run_script(plan2 / "bin" / "activate").returncode, 0)
+        (self.root / "v1-ok").unlink()  # the old version no longer passes
+
+        r = self.run_script(plan2 / "bin" / "rollback")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(self.profile_target("app"), str(plan2.resolve()))
+
+
+class GcRoots(ActivateHarness):
+    """Capsules are rooted per plan, so garbage collection can't remove
+    what a live or rollback-able generation runs."""
+
+    def roots(self) -> Path:
+        return self.root / "gcroots" / "rigx-app"
+
+    def test_capsules_and_artifacts_are_rooted(self):
+        plan = _plan_dir(self.root, "plan1", _m({"web": _service(
+            capsule_path="/nix/store/web",
+            artifacts=[{"store_path": "/nix/store/site", "mount": "/srv"}],
+        )}))
+        self.assertEqual(self.run_script(plan / "bin" / "activate").returncode, 0)
+        mine = self.roots() / "plan1"
+        targets = {os.readlink(p) for p in mine.iterdir()}
+        self.assertEqual(
+            targets, {"/nix/store/site", "/nix/store/web", str(plan.resolve())},
+        )
+
+    def test_roots_of_unused_plans_are_pruned(self):
+        plans = [
+            _plan_dir(self.root, f"plan{i}", _m({
+                "web": _service(capsule_path=f"/nix/store/web-v{i}"),
+            }))
+            for i in (1, 2, 3)
+        ]
+        # plan1 stays a profile generation; nothing refers to plan2 once
+        # plan3 is live. A generation of `app-staging` must not count.
+        (self.profile_dir / "rigx-app-1-link").symlink_to(plans[0])
+        (self.profile_dir / "rigx-app-staging-2-link").symlink_to(plans[1])
+        for plan in plans:
+            self.assertEqual(self.run_script(plan / "bin" / "activate").returncode, 0)
+        # While plan3 activated, plan2 was still live (plan3's gates
+        # could have failed), so it is pruned on the next activation.
+        self.assertIn("plan2", [p.name for p in self.roots().iterdir()])
+        self.assertEqual(self.run_script(plans[2] / "bin" / "activate").returncode, 0)
+        self.assertEqual(
+            sorted(p.name for p in self.roots().iterdir()), ["plan1", "plan3"],
+        )

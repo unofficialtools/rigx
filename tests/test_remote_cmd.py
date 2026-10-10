@@ -478,8 +478,6 @@ class CmdRemoteDeploy(unittest.TestCase):
         self.assertEqual(rc, 0, err.getvalue())
         fake_bootstrap.assert_called_once_with("ssh://h")
         fake_push.assert_called_once()
-        _, kwargs = fake_push.call_args
-        self.assertIsNone(kwargs["previous_manifest"])
         fake_secrets.assert_not_called()
         # last run_remote call activates the plan via sudo
         last_call = fake_run_remote.call_args_list[-1]

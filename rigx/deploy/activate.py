@@ -4,12 +4,13 @@ Generated as POSIX `sh`, not bash — bootstrap only guarantees Nix +
 systemd on the target (design decision #4), nothing about `/bin/sh`
 beyond it existing. Every service gets its own unrolled block in the
 generated script rather than parsing `manifest.json` at runtime: the
-renderer already has the full manifest (and, for diffing removed
-services, the previous generation's manifest) at generation time, so
-there's no need for a JSON parser (jq/python3) to be present on the
-target — that dependency would otherwise be a gap given this plan
-isn't wired through rigx's own Nix build yet (see the packaging TODO
-in `rigx.deploy.pack`).
+renderer already has the full manifest at generation time, so there's
+no need for a JSON parser (jq/python3) to be present on the target —
+that dependency would otherwise be a gap given this plan isn't wired
+through rigx's own Nix build yet (see the packaging TODO in
+`rigx.deploy.pack`). The one thing it can't know is what it is
+replacing, so dropped services are found at runtime from the units
+directory of the live plan (`/var/lib/rigx/<testbed>/live`).
 
 Algorithm (design decision #3): for each service, compare the new
 rendered unit file against whatever's actually symlinked at
@@ -19,16 +20,26 @@ the changed services in dependency order, health-gating each one
 (design decision #7). Any gate failure re-links just the services this
 run touched back to the previous generation's units (or removes them,
 on a first-ever deploy with nothing to fall back to) and exits
-non-zero. The Nix profile pointer
-(`/nix/var/nix/profiles/rigx-<testbed>`) only advances to this
-generation as the *last* line of a successful run, which is what makes
-it a meaningful "atomic activation" marker rather than just a label.
+non-zero. Services this generation drops are removed only after every
+gate has passed, so a failed deploy leaves them running. The live link
+and the Nix profile pointer (`/nix/var/nix/profiles/rigx-<testbed>`)
+only advance on a successful run, which is what makes the profile a
+meaningful "atomic activation" marker rather than just a label.
+
+Each plan's capsules and artifacts are registered as GC roots under
+`/nix/var/nix/gcroots/rigx-<testbed>/<plan>/`: the plan itself records
+no references (see `rigx.deploy.pack`), so without them a
+`nix-collect-garbage` on the host would delete what the units run.
 
 `bin/rollback` is for explicit operator-triggered rollback to the
 *previous* generation (`nix-env --profile ... --rollback`), then
-re-invokes that generation's own `bin/activate` — which naturally
-converges the running units to match it, reusing the same diff/health-
-gate logic rather than duplicating it.
+re-invokes that generation's own `bin/activate` — which converges the
+running units to match it (including removing services the newer
+generation added), reusing the same diff/health-gate logic rather than
+duplicating it. Since the profile already points at that generation,
+activate doesn't `--set` it again, so no new generation is created and
+a second rollback goes one further back. If the older generation fails
+its gates, the profile is switched forward again.
 """
 
 from __future__ import annotations
@@ -63,7 +74,15 @@ def _quote(s: str) -> str:
     return "'" + s.replace("'", "'\\''") + "'"
 
 
-def render_activate(manifest: dict, previous_manifest: dict | None = None) -> str:
+def render_activate(manifest: dict) -> str:
+    """Render `bin/activate` for one plan.
+
+    Which services this generation drops is worked out when the script
+    runs, against the plan that is actually live on the host
+    (`$RIGX_STATE_ROOT/<testbed>/live`), not when the plan is built:
+    under `bin/rollback`, an older plan's activate runs against a newer
+    live plan its builder never saw. The drops happen only after every
+    health gate has passed, so a failed deploy leaves them running."""
     testbed = manifest["testbed"]
 
     lines: list[str] = [_SH_HEADER.rstrip("\n"), ""]
@@ -74,10 +93,20 @@ def render_activate(manifest: dict, previous_manifest: dict | None = None) -> st
     lines.append(': "${RIGX_SYSTEMD_DIR:=/etc/systemd/system}"')
     lines.append(': "${RIGX_STATE_ROOT:=/var/lib/rigx}"')
     lines.append(': "${RIGX_PROFILE_DIR:=/nix/var/nix/profiles}"')
+    lines.append(': "${RIGX_GCROOTS_DIR:=/nix/var/nix/gcroots}"')
     # `RIGX_ENGINE` overrides container-engine detection (below).
     lines.append(f'PROFILE="$RIGX_PROFILE_DIR/rigx-{testbed}"')
-    lines.append('SELF="$(cd "$(dirname "$0")/.." && pwd)"')
-    lines.append('PREV="$(readlink -f "$PROFILE" 2>/dev/null || true)"')
+    lines.append('SELF="$(cd "$(dirname "$0")/.." && pwd -P)"')
+    # The plan whose units are installed right now. Recorded by the last
+    # successful activation; before that (hosts deployed by an older
+    # rigx), the profile is the best record there is. Not simply the
+    # profile: `bin/rollback` moves the profile back *before* running
+    # the older plan's activate, which must still see the newer plan as
+    # what it is replacing.
+    lines.append(f'LIVE="$RIGX_STATE_ROOT/{testbed}/live"')
+    lines.append('PREV=""')
+    lines.append('if [ -e "$LIVE" ]; then PREV="$(readlink -f "$LIVE")"')
+    lines.append('elif [ -e "$PROFILE" ]; then PREV="$(readlink -f "$PROFILE")"; fi')
     # Where `systemctl enable` would put the boot-time link. Done by hand
     # because the units are themselves symlinks into the store, which
     # `systemctl enable` treats as linked units with their own rules.
@@ -168,31 +197,10 @@ def render_activate(manifest: dict, previous_manifest: dict | None = None) -> st
         )
         lines.append("")
 
-    # Services present in the previous generation but gone from this
-    # one: stop, disable, and remove their unit — computed here at
-    # render time (diffing two manifests) rather than at runtime.
-    if previous_manifest is not None:
-        removed = sorted(set(previous_manifest["services"]) - set(manifest["services"]))
-        for sname in removed:
-            lines.append(f"# removed service: {sname}")
-            # Timer first: it BindsTo= the service, so stopping the
-            # service on its own would already take it down, but a
-            # removed service should not leave a probe behind either way.
-            for unit in (
-                units.health_timer_name(testbed, sname),
-                units.health_unit_name(testbed, sname),
-                units.unit_name(testbed, sname),
-            ):
-                lines.append(
-                    f"systemctl disable --now {_quote(unit)} 2>/dev/null || true"
-                )
-                lines.append(f'rm -f "$RIGX_SYSTEMD_DIR/{unit}" "$WANTS/{unit}"')
-            # The unit is gone; without this the container it started
-            # would keep running with no unit left to name it, holding
-            # ports for a service that no longer exists in the config.
-            lines.append(units.reap_command(f"rigx-{testbed}-{sname}"))
-        if removed:
-            lines.append("")
+    # Before any unit (re)starts, so a GC can't take a capsule away
+    # between linking a unit and running it.
+    lines.extend(_render_gc_roots(testbed, manifest))
+    lines.append("")
 
     # Install/diff each unit; CHANGED tracks which ones actually differ
     # from what's currently on disk.
@@ -288,11 +296,95 @@ def render_activate(manifest: dict, previous_manifest: dict | None = None) -> st
         lines.append("esac")
     lines.append("")
 
-    # Last line, only reached if every gate above passed: advance the
-    # profile pointer to this generation.
-    lines.append('"$RIGX_NIX_ENV" --profile "$PROFILE" --set "$SELF"')
+    lines.extend(_render_removals(testbed, manifest))
+    lines.append("")
+
+    # Only reached if every gate above passed. `--set` only when the
+    # profile isn't already here: under `bin/rollback` it already points
+    # at this (older) generation, and setting it again would create a
+    # new generation, so a second rollback would land on the bad one.
+    lines.append('ln -sfn "$SELF" "$LIVE"')
+    lines.append(
+        'if [ "$(readlink -f "$PROFILE" 2>/dev/null || true)" != "$SELF" ]; then'
+    )
+    lines.append('  "$RIGX_NIX_ENV" --profile "$PROFILE" --set "$SELF"')
+    lines.append("fi")
     lines.append("")
     return "\n".join(lines)
+
+
+def _render_gc_roots(testbed: str, manifest: dict) -> list[str]:
+    """Register this plan's capsules and artifacts as GC roots.
+
+    The plan reaches the store through `nix store add`, which records no
+    references, so the profile keeps only the plan alive and
+    `nix-collect-garbage` would delete the capsules the units run. Each
+    plan gets a root directory; directories for plans that are neither
+    live nor a profile generation are pruned, so deleting generations
+    frees their capsules at the next activation."""
+    paths = sorted({
+        p for svc in manifest["services"].values()
+        for p in [svc["capsule_path"]]
+        + [a["store_path"] for a in svc.get("artifacts") or []]
+    })
+    lines = [
+        f'ROOTS="$RIGX_GCROOTS_DIR/rigx-{testbed}"',
+        'MYROOTS="$ROOTS/${SELF##*/}"',
+        'mkdir -p "$MYROOTS"',
+        'ln -sfn "$SELF" "$MYROOTS/plan"',
+    ]
+    for i, p in enumerate(paths):
+        lines.append(f"ln -sfn {_quote(p)} \"$MYROOTS/{i}\"")
+    lines += [
+        # Plans still in use: this one, the live one, every generation.
+        'KEEP=" ${SELF##*/} ${PREV##*/} "',
+        'for g in "$RIGX_PROFILE_DIR/rigx-$TESTBED-"*-link; do',
+        "  " + _GENERATION_CHECK,
+        '  _t=$(readlink -f "$g"); KEEP="$KEEP ${_t##*/} "',
+        "done",
+        'for d in "$ROOTS"/*; do',
+        '  [ -d "$d" ] || continue',
+        '  case "$KEEP" in *" ${d##*/} "*) ;; *) rm -rf "$d" ;; esac',
+        "done",
+    ]
+    return lines
+
+
+# Inside a loop over `rigx-$TESTBED-*-link`: skip entries whose middle
+# isn't all digits. The glob alone would also match generations of a
+# testbed whose name merely starts with ours (`app` vs `app-staging`).
+_GENERATION_CHECK = (
+    '_n=${g##*/}; _n=${_n#rigx-$TESTBED-}; _n=${_n%-link}; '
+    'case "$_n" in ""|*[!0-9]*) continue ;; esac'
+)
+
+
+def _render_removals(testbed: str, manifest: dict) -> list[str]:
+    """Remove services the live plan has and this one doesn't. Only the
+    live plan's own units directory is globbed, which holds this
+    testbed's units and nothing else."""
+    mine = " ".join(units.unit_name(testbed, s) for s in manifest["services"])
+    return [
+        "# Services this generation drops: stop, disable, unlink, reap.",
+        f"MINE=' {mine} '",
+        "_removed=",
+        'if [ -n "$PREV" ] && [ "$PREV" != "$SELF" ]; then',
+        f'  for f in "$PREV/units/rigx-{testbed}-"*.service; do',
+        '    [ -e "$f" ] || continue',
+        '    u=${f##*/}',
+        '    case "$u" in *-health.service) continue ;; esac',
+        '    case "$MINE" in *" $u "*) continue ;; esac',
+        '    c=${u%.service}',
+        '    for x in "$c-health.timer" "$c-health.service" "$u"; do',
+        '      systemctl disable --now "$x" 2>/dev/null || true',
+        '      rm -f "$RIGX_SYSTEMD_DIR/$x" "$WANTS/$x"',
+        "    done",
+        "    " + units.reap_command('"$c"'),
+        "    _removed=1",
+        "  done",
+        "fi",
+        'if [ -n "$_removed" ]; then systemctl daemon-reload; fi',
+    ]
 
 
 def render_rollback(manifest: dict) -> str:
@@ -307,7 +399,17 @@ def render_rollback(manifest: dict) -> str:
         + ': "${RIGX_PROFILE_DIR:=/nix/var/nix/profiles}"\n'
         + f'PROFILE="$RIGX_PROFILE_DIR/rigx-{testbed}"\n'
         + "\n".join(_RESOLVE_NIX_ENV) + "\n"
+        # Remember where we were, so a failed rollback can come back.
+        + 'GEN="$("$RIGX_NIX_ENV" --profile "$PROFILE" --list-generations '
+        + "2>/dev/null | awk '/\\(current\\)/ {print $1}')\"\n"
         + '"$RIGX_NIX_ENV" --profile "$PROFILE" --rollback\n'
         + 'NEW_SELF="$(readlink -f "$PROFILE")"\n'
-        + 'exec "$NEW_SELF/bin/activate"\n'
+        # Not exec: if the older plan's gates fail, its activate has put
+        # the live plan's units back, and the profile must follow.
+        + 'if ! "$NEW_SELF/bin/activate"; then\n'
+        + '  if [ -n "$GEN" ]; then\n'
+        + '    "$RIGX_NIX_ENV" --profile "$PROFILE" --switch-generation "$GEN"\n'
+        + "  fi\n"
+        + "  exit 1\n"
+        + "fi\n"
     )

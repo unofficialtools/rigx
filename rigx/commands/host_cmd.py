@@ -88,11 +88,23 @@ def cmd_host_ls(args: argparse.Namespace) -> int:
     # Containers rigx named but no testbed profile claims. This is the
     # shape a half-removed deployment leaves behind, and the reason the
     # listing shows containers at all rather than just profiles.
-    known = {info.name for info in testbeds}
+    # Exact names from each testbed's live manifest; a name prefix would
+    # hide testbed `app-staging`'s orphans behind testbed `app`. A
+    # testbed whose manifest can't be read claims its prefix, as the
+    # best guess available.
+    owned: set[str] = set()
+    unreadable: list[str] = []
+    for info in testbeds:
+        if info.manifest is None:
+            unreadable.append(f"rigx-{info.name}-")
+        else:
+            owned |= hostinv.service_containers(
+                info.name, info.manifest.get("services") or {},
+            )
     orphans = [
         c for c in containers
-        if c.name.startswith("rigx-")
-        and not any(c.belongs_to(n) for n in known)
+        if c.name.startswith("rigx-") and c.name not in owned
+        and not c.name.startswith(tuple(unreadable))
     ]
     if orphans:
         print()

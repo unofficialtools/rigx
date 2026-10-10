@@ -81,9 +81,7 @@ def resolve_capsule_paths(project: Project, testbed: Target) -> dict[str, str]:
     return paths
 
 
-def assemble_plan_dir(
-    dest: Path, manifest: dict, previous_manifest: dict | None = None,
-) -> Path:
+def assemble_plan_dir(dest: Path, manifest: dict) -> Path:
     """Write `manifest.json` + `units/` + `bin/activate` +
     `bin/rollback` under `dest`. `dest` must not already exist."""
     (dest / "units").mkdir(parents=True)
@@ -93,7 +91,7 @@ def assemble_plan_dir(
         (dest / "units" / name).write_text(text)
     activate_path = dest / "bin" / "activate"
     rollback_path = dest / "bin" / "rollback"
-    activate_path.write_text(activate.render_activate(manifest, previous_manifest))
+    activate_path.write_text(activate.render_activate(manifest))
     rollback_path.write_text(activate.render_rollback(manifest))
     activate_path.chmod(0o755)
     rollback_path.chmod(0o755)
@@ -154,8 +152,6 @@ def build_and_push_plan(
     project: Project,
     testbed: Target,
     target: SSHTarget,
-    *,
-    previous_manifest: dict | None = None,
 ) -> str:
     """End to end: build the referenced capsules, compile the
     manifest, assemble + content-address the plan, `nix copy` it to
@@ -168,7 +164,7 @@ def build_and_push_plan(
         testbed, capsule_paths, capsule_backends, artifact_paths,
     )
     with tempfile.TemporaryDirectory() as d:
-        plan_dir = assemble_plan_dir(Path(d) / testbed.name, manifest, previous_manifest)
+        plan_dir = assemble_plan_dir(Path(d) / testbed.name, manifest)
         store_path = add_to_local_store(plan_dir)
     # Everything the plan's units and scripts name by absolute path.
     # The plan itself records no references — see `copy_to_target`.

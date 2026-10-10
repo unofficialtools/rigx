@@ -1175,6 +1175,98 @@ class Modules(unittest.TestCase):
             proj.targets["frontend.tb"].services["s"].capsule, "frontend.web",
         )
 
+    def test_module_include_is_processed(self):
+        root = self._setup({
+            "rigx.toml": """
+                [project]
+                name = "p"
+
+                [modules]
+                include = ["frontend"]
+            """,
+            "frontend/rigx.toml": """
+                include = ["extra.toml"]
+
+                [targets.app]
+                kind = "executable"
+                sources = ["src/main.c"]
+            """,
+            "frontend/extra.toml": """
+                [targets.tool]
+                kind = "executable"
+                sources = ["src/tool.c"]
+            """,
+        })
+        proj = config.load(root)
+        self.assertIn("frontend.tool", proj.targets)
+
+    def test_module_dep_can_name_a_root_target(self):
+        root = self._setup({
+            "rigx.toml": """
+                [project]
+                name = "p"
+
+                [modules]
+                include = ["frontend"]
+
+                [targets.ptool]
+                kind = "static_library"
+                sources = ["lib.c"]
+            """,
+            "frontend/rigx.toml": """
+                [targets.app]
+                kind = "executable"
+                sources = ["src/main.c"]
+                deps.internal = ["ptool"]
+            """,
+        })
+        proj = config.load(root)
+        self.assertEqual(proj.targets["frontend.app"].deps.internal, ["ptool"])
+
+    def test_module_sibling_wins_over_root_target(self):
+        root = self._setup({
+            "rigx.toml": """
+                [project]
+                name = "p"
+
+                [modules]
+                include = ["frontend"]
+
+                [targets.greet]
+                kind = "static_library"
+                sources = ["lib.c"]
+            """,
+            "frontend/rigx.toml": """
+                [targets.greet]
+                kind = "static_library"
+                sources = ["g.c"]
+
+                [targets.app]
+                kind = "executable"
+                sources = ["src/main.c"]
+                deps.internal = ["greet"]
+            """,
+        })
+        proj = config.load(root)
+        self.assertEqual(
+            proj.targets["frontend.app"].deps.internal, ["frontend.greet"],
+        )
+
+    def test_two_modules_with_the_same_directory_name_are_an_error(self):
+        root = self._setup({
+            "rigx.toml": """
+                [project]
+                name = "p"
+
+                [modules]
+                include = ["a/x", "b/x"]
+            """,
+            "a/x/rigx.toml": "",
+            "b/x/rigx.toml": "",
+        })
+        with self.assertRaises(ConfigError):
+            config.load(root)
+
     def test_module_globs_resolve_against_module_root(self):
         root = self._setup({
             "rigx.toml": """

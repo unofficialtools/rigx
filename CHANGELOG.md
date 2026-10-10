@@ -19,6 +19,39 @@
 
 ### Bug fixes
 
+- **Deploy rollback is complete.** A deploy that drops a service used to
+  delete it before the health gates ran, so a failed deploy left it gone.
+  `rigx remote rollback` ran the older generation's activation, which never
+  removed services the newer one had added. And every rollback created a
+  new generation, so a second rollback landed back on the bad one. Now
+  `activate` records the live plan (`/var/lib/rigx/<testbed>/live`), works
+  out dropped services against it at run time, and removes them only after
+  every gate passes. Rollback creates no generation, and a rollback whose
+  older generation fails its gates switches the profile forward again.
+  Rolling back to a generation deployed by an older rigx still runs that
+  generation's own, older activation script.
+
+- **Deployed capsules survive `nix-collect-garbage` on the host.** The plan
+  records no store references, so the profile kept only the plan alive and
+  a garbage collection deleted the capsules the units run. Each plan's
+  capsules and artifacts are now GC roots under
+  `/nix/var/nix/gcroots/rigx-<testbed>/`, pruned once a plan is neither
+  live nor a profile generation.
+
+- **Testbeds whose names share a prefix no longer touch each other.**
+  `rigx host destroy … app` (and `host_exclusive` eviction) matched
+  `rigx-app-*`, so it also removed testbed `app-staging`'s units,
+  containers and generation links. The port preflight and `rigx host ls`
+  had the same overlap. All of them now use exact unit and container names
+  from the testbed's own plans and manifests.
+
+- **Modules.** A module's top-level `include = [...]` was silently ignored;
+  it is now processed relative to the module. A bare name in a module's
+  `deps.internal` always got the module's prefix, so it could never name a
+  root-project target; it now means the sibling if there is one, else the
+  root target. Two modules with the same directory name, which silently
+  merged into one namespace, are now an error.
+
 - **Fixes from a code review.**
   - **Deploy.** Services are now enabled for boot, so they come back after
     a reboot. systemd no longer expands `$`/`${…}`/`%` inside health

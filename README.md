@@ -917,20 +917,25 @@ Each module's `rigx.toml`:
 
 - **must not** define `[project]` or `[nixpkgs]` (the parent owns identity).
 - **may** define `[targets.*]`, `[vars]`, `[dependencies.git.*]`,
-  `[dependencies.local.*]`, and its own `[modules]` (recursive).
+  `[dependencies.local.*]`, `[external_inputs.*]`, its own `[modules]`
+  (recursive), and a top-level `include = [...]`, resolved against the
+  module's directory.
 - has its `[targets.*]` automatically prefixed with the module's directory
   name: `frontend/rigx.toml`'s `[targets.app]` becomes `frontend.app` in the
-  merged set.
+  merged set. Two modules can't share a directory name (`a/x` and `b/x`
+  would both be `x`); that is a config error.
 - has its source paths interpreted relative to the module's directory and
   rewritten to be parent-root-relative — so a module looks like a normal
   rigx project to its author.
 
-Inside a module, `deps.internal = ["greet"]` (unqualified) auto-binds to the
-same module's `greet`. To reference a different module, qualify it:
+Inside a module, an unqualified name (`deps.internal = ["greet"]`, a
+`${greet}` interpolation, `run`, a testbed service's `capsule`) binds to
+the same module's `greet` if there is one, and otherwise to the root
+project's `greet`. To reference a different module, qualify it:
 `deps.internal = ["other.foo"]`.
 
-`[vars]`, `[dependencies.git.*]`, and `[dependencies.local.*]` from each
-module are flat-merged into the parent. Name collisions across modules (or
+`[vars]`, `[dependencies.git.*]`, `[dependencies.local.*]`, and
+`[external_inputs.*]` from each module are flat-merged into the parent. Name collisions across modules (or
 between a module and the parent) are config errors — keeps things explicit.
 
 Picking between (A) `[dependencies.local.*]` and (B) `[modules]`:
@@ -2610,6 +2615,16 @@ rigx remote myapp start        # dependency order
 rigx remote myapp restart      # dependency order
 rigx remote myapp rollback     # back to the previous generation
 ```
+
+`rollback` re-runs the previous generation's own activation, so it
+also removes services the newer generation added; running it again goes
+one more generation back. A deploy that fails its health gates leaves
+the previous services in place, including any the new config drops:
+those are removed only once every gate has passed. Each generation's
+capsules are registered as Nix GC roots on the host, so
+`nix-collect-garbage` there can't delete what a live or rollback-able
+generation runs; deleting old profile generations frees their capsules
+at the next deploy.
 
 `<target>` (right after `remote`) always names which deployable
 (`services`-bearing) testbed to act on — there's no default, even

@@ -77,8 +77,8 @@ def _resolve_ssh_url(testbed: Target, args: argparse.Namespace) -> str:
 
 def _fetch_previous_manifest(ssh_target: SSHTarget, testbed_name: str) -> dict | None:
     """Read `manifest.json` out of whatever generation is currently
-    live on the target (if any) — used to diff removed services at
-    plan-compile time (design decision #3). Returns None on a
+    live on the target (if any): its service list is what `start`/`stop`
+    act on, and what the port preflight counts as ours. Returns None on a
     first-ever deploy (no profile yet) or any read/parse failure."""
     profile = f"/nix/var/nix/profiles/rigx-{testbed_name}"
     proc = bootstrap.run_remote(
@@ -115,7 +115,9 @@ def _evict_other_testbeds(ssh_target: SSHTarget, testbed: Target) -> None:
         print(f"[rigx remote deploy] evicted {name!r} (volumes kept)")
 
 
-def _check_port_conflicts(ssh_target: SSHTarget, testbed: Target) -> None:
+def _check_port_conflicts(
+    ssh_target: SSHTarget, testbed: Target, live_manifest: dict | None,
+) -> None:
     """Fail before building anything if a container that isn't ours
     already holds a host port this testbed publishes.
 
@@ -131,8 +133,13 @@ def _check_port_conflicts(ssh_target: SSHTarget, testbed: Target) -> None:
     wanted = hostinv.declared_host_ports(testbed)
     if not wanted:
         return
+    # Ours: the services being deployed plus the ones live now (a
+    # renamed or dropped service still holds its port until activate).
+    ours = hostinv.service_containers(testbed.name, [
+        *testbed.services, *((live_manifest or {}).get("services") or {}),
+    ])
     conflicts = hostinv.find_port_conflicts(
-        hostinv.list_containers(ssh_target), testbed.name, wanted,
+        hostinv.list_containers(ssh_target), ours, wanted,
     )
     if conflicts:
         raise DeployError(hostinv.format_conflicts(testbed.name, conflicts))
@@ -167,14 +174,12 @@ def cmd_remote_deploy(args: argparse.Namespace) -> int:
         # after a full capsule build and a `nix copy`.
         if testbed.host_exclusive:
             _evict_other_testbeds(ssh_target, testbed)
-        _check_port_conflicts(ssh_target, testbed)
-
-        previous_manifest = _fetch_previous_manifest(ssh_target, testbed.name)
+        _check_port_conflicts(
+            ssh_target, testbed, _fetch_previous_manifest(ssh_target, testbed.name),
+        )
 
         print(f"[rigx remote deploy] building capsules + compiling plan for {testbed.name!r}")
-        store_path = pack.build_and_push_plan(
-            project, testbed, ssh_target, previous_manifest=previous_manifest,
-        )
+        store_path = pack.build_and_push_plan(project, testbed, ssh_target)
         print(f"[rigx remote deploy] plan at {store_path}")
 
         if testbed.testbed_secrets:

@@ -54,6 +54,7 @@ from rigx.deploy.bootstrap import DeployError, SSHTarget, run_remote
 
 PROFILE_DIR = "/nix/var/nix/profiles"
 STATE_ROOT = "/var/lib/rigx"
+GCROOTS_DIR = "/nix/var/nix/gcroots"
 
 # Addresses that mean "every interface", and therefore collide with any
 # other bind on the same port rather than only with an identical one.
@@ -113,19 +114,22 @@ class Container:
         """The testbed this container belongs to, or None if it isn't a
         rigx service container.
 
-        Deliberately not derived by splitting on `-`: a container is
-        named `rigx-<testbed>-<service>` and both halves may contain
-        dashes, so the split is ambiguous in general. Callers ask
-        `belongs_to(name)` instead, which is the question they actually
-        have; this is only for display.
+        A guess, for display only: a container is named
+        `rigx-<testbed>-<service>` and both halves may contain dashes,
+        so the split is ambiguous. Ownership decisions use exact names
+        built from a testbed's service list (`service_containers`).
         """
         if not self.name.startswith("rigx-"):
             return None
         rest = self.name[len("rigx-"):]
         return rest.rsplit("-", 1)[0] if "-" in rest else None
 
-    def belongs_to(self, testbed: str) -> bool:
-        return self.name.startswith(f"rigx-{testbed}-")
+
+def service_containers(testbed: str, services) -> set[str]:
+    """The exact container names of `testbed`'s `services`. Matching on
+    the `rigx-<testbed>-` prefix instead would claim testbed
+    `app-staging`'s containers for `app`."""
+    return {f"rigx-{testbed}-{s}" for s in services}
 
 
 def parse_published(ports_field: str) -> frozenset[tuple[str, int]]:
@@ -211,7 +215,7 @@ def declared_host_ports(testbed) -> dict[str, list[tuple[str, int]]]:
 
 
 def find_port_conflicts(
-    containers: list[Container], testbed_name: str, wanted: dict[str, list[tuple[str, int]]],
+    containers: list[Container], ours: set[str], wanted: dict[str, list[tuple[str, int]]],
 ) -> list[PortConflict]:
     """Which of `wanted`'s host ports are already held by a container
     that isn't ours.
@@ -221,14 +225,15 @@ def find_port_conflicts(
     container in that state — erroring on it would block the most
     ordinary operation there is.
 
-    Our own running containers are skipped too, for the same reason from
-    the other direction: on a redeploy the service being replaced still
+    Our own running containers (`ours`: exact names, see
+    `service_containers`) are skipped too, for the same reason from the
+    other direction: on a redeploy the service being replaced still
     holds the port at preflight time, and `activate` restarting the unit
     is precisely what frees it.
     """
     conflicts: list[PortConflict] = []
     for c in containers:
-        if not c.running or c.belongs_to(testbed_name):
+        if not c.running or c.name in ours:
             continue
         for sname, pairs in sorted(wanted.items()):
             for addr, port in pairs:
@@ -364,31 +369,57 @@ def teardown_script(testbed_name: str, *, purge: bool = False) -> str:
     lines = [
         "set -u",
         f"T={t}",
-        'for u in "/etc/systemd/system/rigx-$T-"*.service '
-        '"/etc/systemd/system/rigx-$T-"*.timer; do',
+        f"P={PROFILE_DIR}",
+        "S=/etc/systemd/system",
+        # Exact unit names only: a `rigx-$T-*` glob alone would also
+        # take testbed `app-staging`'s units when tearing down `app`.
+        # Installed units say which testbed they belong to in their
+        # Description; the testbed's own plans (live, profile, every
+        # generation) list the rest, including ones already uninstalled
+        # whose containers may still be running.
+        'NAMES=""',
+        'for u in "$S/rigx-$T-"*.service "$S/rigx-$T-"*.timer; do',
         '  [ -e "$u" ] || continue',
-        '  n=${u##*/}',
-        '  systemctl disable --now "$n" >/dev/null 2>&1 || true',
-        '  rm -f "$u"',
+        '  grep -qF "Description=rigx testbed $T " "$u" || continue',
+        '  NAMES="$NAMES ${u##*/}"',
         "done",
-        'rm -f "/etc/systemd/system/multi-user.target.wants/rigx-$T-"*.service',
+        f'for plan in "{STATE_ROOT}/$T/live" "$P/rigx-$T" "$P/rigx-$T-"*-link; do',
+        '  case "$plan" in *-link)',
+        '    _n=${plan##*/}; _n=${_n#rigx-$T-}; _n=${_n%-link}',
+        '    case "$_n" in ""|*[!0-9]*) continue ;; esac ;;',
+        "  esac",
+        '  for u in "$plan/units/rigx-$T-"*; do',
+        '    [ -e "$u" ] && NAMES="$NAMES ${u##*/}"',
+        "  done",
+        "done",
+        "for n in $NAMES; do",
+        '  systemctl disable --now "$n" >/dev/null 2>&1 || true',
+        '  rm -f "$S/$n" "$S/multi-user.target.wants/$n"',
+        "done",
         "systemctl daemon-reload >/dev/null 2>&1 || true",
         # Reaped by name rather than by `--rm`: the container can outlive
         # the runner that started it, which is the whole reason this
         # module exists.
-        'for c in $(podman ps -aq --filter "name=^rigx-$T-" 2>/dev/null || '
-        'docker ps -aq --filter "name=^rigx-$T-" 2>/dev/null || true); do',
+        "for n in $NAMES; do",
+        '  case "$n" in *-health.service|*.timer) continue ;; esac',
+        '  c=${n%.service}',
         '  podman rm -f "$c" >/dev/null 2>&1 || '
         'docker rm -f "$c" >/dev/null 2>&1 || true',
         "done",
         'podman network rm "rigx-$T" >/dev/null 2>&1 || '
         'docker network rm "rigx-$T" >/dev/null 2>&1 || true',
+        f'rm -rf "{GCROOTS_DIR}/rigx-$T"',
+        f'rm -f "{STATE_ROOT}/$T/live"',
     ]
     if purge:
         lines.append(f'rm -rf "{STATE_ROOT}/$T"')
     lines += [
-        f'rm -f "{PROFILE_DIR}/rigx-$T"',
-        f'rm -f "{PROFILE_DIR}/rigx-$T-"*-link',
+        'for g in "$P/rigx-$T-"*-link; do',
+        '  _n=${g##*/}; _n=${_n#rigx-$T-}; _n=${_n%-link}',
+        '  case "$_n" in ""|*[!0-9]*) continue ;; esac',
+        '  rm -f "$g"',
+        "done",
+        'rm -f "$P/rigx-$T"',
     ]
     return "\n".join(lines) + "\n"
 

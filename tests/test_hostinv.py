@@ -76,14 +76,20 @@ class ParsePublished(unittest.TestCase):
         self.assertEqual(hostinv.parse_published("nonsense->x/tcp"), frozenset())
 
 
+_OURS = hostinv.service_containers("app", ["web"])
+
+
 class ContainerNaming(unittest.TestCase):
-    def test_belongs_to_matches_only_the_whole_testbed_segment(self):
-        c = hostinv.Container(name="rigx-hello_py4web_prod-web", state="running")
-        self.assertTrue(c.belongs_to("hello_py4web_prod"))
-        # The bug that started all this: `hello` and `hello_py4web_prod`
-        # are different testbeds sharing a name prefix. Matching on the
-        # prefix alone would have made each look like the other's.
-        self.assertFalse(c.belongs_to("hello"))
+    def test_ownership_is_by_exact_name(self):
+        # `app` and `app-staging` share a name prefix; `app`'s web
+        # service is exactly one container name, never a prefix match.
+        self.assertEqual(
+            hostinv.service_containers("app", ["web", "db"]),
+            {"rigx-app-web", "rigx-app-db"},
+        )
+        self.assertNotIn(
+            "rigx-app-staging-web", hostinv.service_containers("app", ["web"]),
+        )
 
     def test_non_rigx_container_has_no_testbed(self):
         self.assertIsNone(hostinv.Container(name="nginx", state="running").testbed())
@@ -159,7 +165,7 @@ class PortConflicts(unittest.TestCase):
 
     def test_another_testbeds_running_container_conflicts(self):
         cs = [self._c("rigx-hello-web")]
-        conflicts = hostinv.find_port_conflicts(cs, "app", self.wanted)
+        conflicts = hostinv.find_port_conflicts(cs, _OURS, self.wanted)
         self.assertEqual(len(conflicts), 1)
         self.assertEqual(conflicts[0].port, 80)
         self.assertEqual(conflicts[0].holder, "rigx-hello-web")
@@ -169,23 +175,23 @@ class PortConflicts(unittest.TestCase):
         # A redeploy always finds the generation it is replacing still
         # holding the port; restarting the unit is what frees it.
         cs = [self._c("rigx-app-web")]
-        self.assertEqual(hostinv.find_port_conflicts(cs, "app", self.wanted), [])
+        self.assertEqual(hostinv.find_port_conflicts(cs, _OURS, self.wanted), [])
 
     def test_stopped_container_holds_nothing(self):
         cs = [self._c("rigx-hello-web", state="exited")]
-        self.assertEqual(hostinv.find_port_conflicts(cs, "app", self.wanted), [])
+        self.assertEqual(hostinv.find_port_conflicts(cs, _OURS, self.wanted), [])
 
     def test_non_rigx_container_still_conflicts(self):
         # A hand-started nginx breaks the deploy just as thoroughly, and
         # naming it is the whole point of the check.
         cs = [self._c("nginx")]
-        conflicts = hostinv.find_port_conflicts(cs, "app", self.wanted)
+        conflicts = hostinv.find_port_conflicts(cs, _OURS, self.wanted)
         self.assertEqual(len(conflicts), 1)
         self.assertIsNone(conflicts[0].holder_testbed)
 
     def test_different_port_does_not_conflict(self):
         cs = [self._c("rigx-hello-web", ports="0.0.0.0:8080->8080/tcp")]
-        self.assertEqual(hostinv.find_port_conflicts(cs, "app", self.wanted), [])
+        self.assertEqual(hostinv.find_port_conflicts(cs, _OURS, self.wanted), [])
 
     def test_disjoint_bind_addresses_do_not_conflict(self):
         # Two services can share a port number on different interfaces.
@@ -198,7 +204,7 @@ class PortConflicts(unittest.TestCase):
         )
         wanted = hostinv.declared_host_ports(t)
         cs = [self._c("rigx-hello-web", ports="192.168.1.5:80->8080/tcp")]
-        self.assertEqual(hostinv.find_port_conflicts(cs, "app", wanted), [])
+        self.assertEqual(hostinv.find_port_conflicts(cs, _OURS, wanted), [])
 
     def test_wildcard_bind_conflicts_with_a_specific_one(self):
         t = _testbed(
@@ -209,7 +215,7 @@ class PortConflicts(unittest.TestCase):
         )
         wanted = hostinv.declared_host_ports(t)
         cs = [self._c("rigx-hello-web", ports="0.0.0.0:80->8080/tcp")]
-        self.assertEqual(len(hostinv.find_port_conflicts(cs, "app", wanted)), 1)
+        self.assertEqual(len(hostinv.find_port_conflicts(cs, _OURS, wanted)), 1)
 
     def test_no_declared_ports_means_nothing_to_check(self):
         t = _testbed(
@@ -222,7 +228,7 @@ class PortConflicts(unittest.TestCase):
     def test_message_names_holder_and_the_way_out(self):
         cs = [self._c("rigx-hello-web")]
         msg = hostinv.format_conflicts(
-            "app", hostinv.find_port_conflicts(cs, "app", self.wanted),
+            "app", hostinv.find_port_conflicts(cs, _OURS, self.wanted),
         )
         self.assertIn("port 80", msg)
         self.assertIn("rigx-hello-web", msg)
@@ -262,7 +268,7 @@ class NameSafety(unittest.TestCase):
 class TeardownScript(unittest.TestCase):
     def test_keeps_state_by_default(self):
         script = hostinv.teardown_script("app")
-        self.assertNotIn("/var/lib/rigx", script)
+        self.assertNotIn('rm -rf "/var/lib/rigx/$T"', script)
 
     def test_purge_removes_state(self):
         script = hostinv.teardown_script("app", purge=True)
@@ -273,7 +279,7 @@ class TeardownScript(unittest.TestCase):
         # `rigx host ls`, not invisible and half-alive.
         script = hostinv.teardown_script("app")
         self.assertGreater(
-            script.index("/nix/var/nix/profiles/rigx-$T"),
+            script.index('rm -f "$P/rigx-$T"\n'),
             script.index("podman rm -f"),
         )
 
@@ -294,6 +300,7 @@ class TeardownExecution(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
+        self.root = root
         self.bindir = root / "bin"
         self.bindir.mkdir()
         self.log = root / "calls.log"
@@ -313,6 +320,9 @@ class TeardownExecution(unittest.TestCase):
         # Point the script's absolute paths at the temp tree.
         script = script.replace("/etc/systemd/system", str(self.units))
         script = script.replace("/nix/var/nix/profiles", str(self.profiles))
+        # Never the real host paths, even ones a test run can't write.
+        script = script.replace("/nix/var/nix/gcroots", str(self.root / "gcroots"))
+        script = script.replace("/var/lib/rigx", str(self.root / "state"))
         # Prepend to the inherited PATH rather than naming /usr/bin:/bin.
         # The suite also runs inside a Nix build sandbox, which has
         # neither — the real `rm`/`ls` the script uses live in stdenv's
@@ -324,13 +334,18 @@ class TeardownExecution(unittest.TestCase):
             [_BASH, "-c", script], env=env, capture_output=True, text=True,
         )
 
+    def _unit(self, testbed: str, name: str, what: str = "service web") -> None:
+        (self.units / name).write_text(
+            f"[Unit]\nDescription=rigx testbed {testbed} {what}\n"
+        )
+
     def test_removes_units_containers_and_profile(self):
-        (self.units / "rigx-app-web.service").write_text("x")
-        (self.units / "rigx-app-web-health.timer").write_text("x")
+        self._unit("app", "rigx-app-web.service")
+        self._unit("app", "rigx-app-web-health.timer", "health timer for web")
         (self.profiles / "rigx-app").write_text("x")
         (self.profiles / "rigx-app-1-link").write_text("x")
         # A different testbed sharing the name prefix must survive.
-        (self.units / "rigx-app_prod-web.service").write_text("x")
+        self._unit("app_prod", "rigx-app_prod-web.service")
         (self.profiles / "rigx-app_prod").write_text("x")
 
         r = self._run(hostinv.teardown_script("app"))
@@ -347,6 +362,36 @@ class TeardownExecution(unittest.TestCase):
         self.assertIn("systemctl disable --now rigx-app-web.service", calls)
         self.assertIn("systemctl daemon-reload", calls)
         self.assertIn("podman network rm rigx-app", calls)
+
+    def test_a_dashed_testbed_sharing_the_prefix_survives(self):
+        """`app-staging`'s units, containers and generations match every
+        `rigx-app-*` glob; tearing down `app` must leave them alone."""
+        self._unit("app", "rigx-app-web.service")
+        self._unit("app-staging", "rigx-app-staging-web.service")
+        (self.profiles / "rigx-app-3-link").write_text("x")
+        (self.profiles / "rigx-app-staging").write_text("x")
+        (self.profiles / "rigx-app-staging-2-link").write_text("x")
+
+        r = self._run(hostinv.teardown_script("app"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+        self.assertFalse((self.units / "rigx-app-web.service").exists())
+        self.assertFalse((self.profiles / "rigx-app-3-link").exists())
+        self.assertTrue((self.units / "rigx-app-staging-web.service").exists())
+        self.assertTrue((self.profiles / "rigx-app-staging").exists())
+        self.assertTrue((self.profiles / "rigx-app-staging-2-link").exists())
+        calls = self.log.read_text()
+        self.assertIn("podman rm -f rigx-app-web", calls)
+        self.assertNotIn("rigx-app-staging-web", calls)
+
+    def test_containers_of_uninstalled_units_come_from_the_plans(self):
+        plan = self.root / "plan"
+        (plan / "units").mkdir(parents=True)
+        (plan / "units" / "rigx-app-worker.service").write_text("x")
+        (self.profiles / "rigx-app").symlink_to(plan)
+        r = self._run(hostinv.teardown_script("app"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("podman rm -f rigx-app-worker", self.log.read_text())
 
     def test_succeeds_on_a_host_with_nothing_to_remove(self):
         # Idempotence isn't cosmetic here: `rigx host destroy` is the
