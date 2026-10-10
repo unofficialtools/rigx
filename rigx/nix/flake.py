@@ -506,7 +506,8 @@ def generate(project: Project) -> str:
     w(f"  description = {nix_str(desc)};")
     w("")
     w("  inputs = {")
-    w(f"    nixpkgs.url = {nix_str(f'github:NixOS/nixpkgs/{project.nixpkgs_ref}')};")
+    nixpkgs_at = project.nixpkgs_rev or project.nixpkgs_ref
+    w(f"    nixpkgs.url = {nix_str(f'github:NixOS/nixpkgs/{nixpkgs_at}')};")
     for name, dep in project.git_deps.items():
         w(f"    {name}.url = {nix_str(git_input_url(dep))};")
         w(f"    {name}.flake = {'true' if dep.flake else 'false'};")

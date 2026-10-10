@@ -58,6 +58,15 @@
 
 ### New features
 
+- **Pin nixpkgs to an exact commit: `[nixpkgs] rev` and `rigx lock --pin`.**
+  `rev = "<40-char commit>"` in `[nixpkgs]` is used instead of `ref`, so
+  nixpkgs is fixed by `rigx.toml` alone. It needs no flake.lock and no branch
+  lookup, so it also works offline. Host-side tools come from the same
+  commit instead of the flake registry. `rigx lock --pin` looks up the commit
+  `ref` points at now, writes it as `rev` (editing only that line, so comments
+  survive), and re-locks; re-run it to move the pin forward. `[nixpkgs]` now
+  rejects unknown keys and a non-string `ref`.
+
 - **Offline builds: `rigx prefetch` and `rigx --offline`.** `rigx prefetch`,
   run while online, fetches the flake inputs (writing `flake.lock` if needed),
   the build inputs of every target and sandboxed test, and the

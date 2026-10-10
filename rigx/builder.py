@@ -122,9 +122,11 @@ def network_hint(project: Project, offline_note: bool = True) -> str:
         )
     if not _network_down():
         return ""
-    no_lock = "" if (project.root / "flake.lock").is_file() else (
-        " This project has no flake.lock yet, so its nixpkgs can't be "
-        "resolved without the network."
+    no_lock = "" if (
+        project.nixpkgs_rev or (project.root / "flake.lock").is_file()
+    ) else (
+        " This project has no flake.lock and no [nixpkgs] rev, so its "
+        "nixpkgs can't be resolved without the network."
     )
     return (
         "\n\nnote: the network looks unreachable (cannot resolve "
@@ -257,10 +259,13 @@ def _locked_nixpkgs_flakeref(root_str: str) -> str | None:
 def _nixpkgs_pkg_ref(project: Project, pkg: str) -> str:
     """A flake reference to `pkg` from the project's nixpkgs.
 
-    Prefers the locked commit (registry-free, reproducible, no GitHub API
-    call); falls back to the registry indirection ``nixpkgs/<ref>`` when no
-    usable lock is present."""
-    base = _locked_nixpkgs_flakeref(str(project.root.resolve()))
+    Prefers the commit pinned by `[nixpkgs] rev`, then the locked commit
+    (both registry-free, reproducible, no GitHub API call); falls back to
+    the registry indirection ``nixpkgs/<ref>`` when neither is available."""
+    if project.nixpkgs_rev:
+        base = f"github:NixOS/nixpkgs/{project.nixpkgs_rev}"
+    else:
+        base = _locked_nixpkgs_flakeref(str(project.root.resolve()))
     if base is None:
         base = f"nixpkgs/{project.nixpkgs_ref}"
     return f"{base}#{pkg}"
@@ -306,6 +311,49 @@ def update_lock(project: Project) -> None:
     after = lock_path.read_bytes() if lock_path.is_file() else b""
     if before != after:
         _hint_commit_generated(project, ["flake.lock"])
+
+
+def pin_nixpkgs(project: Project) -> str:
+    """Resolve `[nixpkgs] ref` to the commit it points at right now and
+    write it to rigx.toml as `[nixpkgs] rev`, replacing any previous pin.
+    The caller re-locks (`update_lock`) so flake.lock follows. Returns
+    the commit."""
+    from datetime import date
+
+    from rigx import nixpkgs_pin
+    if offline_mode():
+        raise BuildError(
+            "pinning nixpkgs needs the network: run it without --offline / "
+            f"{OFFLINE_ENV}=1"
+        )
+    nix = _nix_bin()
+    ref = project.nixpkgs_ref
+    # --refresh: a branch fetched within tarball-ttl would otherwise
+    # resolve to the cached, possibly hours-old commit.
+    r = subprocess.run(
+        [nix, *_nix_flags(), "flake", "metadata", "--json", "--refresh",
+         f"github:NixOS/nixpkgs/{ref}"],
+        cwd=project.root, check=False, stdout=subprocess.PIPE, text=True,
+    )
+    if r.returncode != 0:
+        raise BuildError(
+            f"resolving nixpkgs {ref!r} failed (exit {r.returncode})"
+            + network_hint(project)
+        )
+    try:
+        rev = json.loads(r.stdout)["locked"]["rev"]
+    except (ValueError, KeyError, TypeError):
+        raise BuildError(f"nix reported no commit for nixpkgs {ref!r}")
+    toml = project.root / "rigx.toml"
+    try:
+        new = nixpkgs_pin.set_rev(
+            toml.read_text(), rev, ref, note=f"{ref} on {date.today()}",
+        )
+    except nixpkgs_pin.PinError as e:
+        raise BuildError(str(e))
+    toml.write_text(new)
+    project.nixpkgs_rev = rev
+    return rev
 
 
 def _resolve_attr(project: Project, spec: str) -> str:

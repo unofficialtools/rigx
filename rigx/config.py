@@ -70,6 +70,7 @@ VALID_KINDS = {
 # layout matches their vendor blob (`include`, `lib`, `bin`, `share`,
 # `pkgconfig`, `firmware`, …). The bucket name is the substitution key
 # users write as `${<input>.<bucket>}`.
+_NIXPKGS_REV_RE = re.compile(r"^[0-9a-f]{40}$")
 _BUCKET_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 # Picks `${name}` out of strings — used to auto-derive deps.internal from
@@ -546,6 +547,11 @@ class Project:
     # empty disables the check. Editable dev installs (whose reported
     # version is `0.0.0+unknown`) skip the check silently.
     rigx_min_version: str = ""
+    # `[nixpkgs] rev` — a full nixpkgs commit. When set, it is the flake
+    # input instead of `nixpkgs_ref`, so nixpkgs never needs resolving
+    # from a branch (or the flake registry), even with no flake.lock.
+    # `rigx lock --pin` writes it.
+    nixpkgs_rev: str | None = None
     # `[project] sources` — repo-wide include globs that act as the baseline
     # source-set for every derivation. When set, each target's `src` is
     # narrowed to the intersection of this list, the target's own `sources`,
@@ -1920,6 +1926,21 @@ def _load(root: Path, _visited: set[Path]) -> Project:
     if not isinstance(nixpkgs, dict):
         raise ConfigError("[nixpkgs] must be a table")
     nixpkgs_ref = nixpkgs.get("ref", "nixos-24.11")
+    if not isinstance(nixpkgs_ref, str) or not nixpkgs_ref:
+        raise ConfigError("[nixpkgs].ref must be a non-empty string")
+    nixpkgs_rev = nixpkgs.get("rev")
+    if nixpkgs_rev is not None and (
+        not isinstance(nixpkgs_rev, str) or not _NIXPKGS_REV_RE.match(nixpkgs_rev)
+    ):
+        raise ConfigError(
+            f"[nixpkgs].rev must be a full 40-character commit hash, got "
+            f"{nixpkgs_rev!r} (`rigx lock --pin` writes it for you)"
+        )
+    unknown = nixpkgs.keys() - {"ref", "rev"}
+    if unknown:
+        raise ConfigError(
+            f"[nixpkgs]: unknown keys {sorted(unknown)} (allowed: ref, rev)"
+        )
 
     external_inputs = _parse_external_inputs(
         data.get("external_inputs", {}), source_label=""
@@ -2233,6 +2254,7 @@ def _load(root: Path, _visited: set[Path]) -> Project:
         description=description,
         install=install,
         nixpkgs_ref=nixpkgs_ref,
+        nixpkgs_rev=nixpkgs_rev,
         git_deps=git_deps,
         local_deps=local_deps,
         targets=targets,

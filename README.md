@@ -472,6 +472,7 @@ rigx version              # print the rigx version (also: `--version` / `-V`)
 rigx list                 # list targets
 rigx list --kind test     # filter by kind (executable, test, run, …)
 rigx lock                 # generate flake.nix and update flake.lock
+rigx lock --pin           # also pin [nixpkgs] to its current commit in rigx.toml
 rigx prefetch             # while online, fetch everything an offline build needs
 rigx --offline build      # build without touching the network (also: RIGX_OFFLINE=1)
 rigx build                # build every target (and variant)
@@ -508,7 +509,9 @@ target and sandboxed test (compilers, libraries, Python venvs) plus the
 It doesn't build the targets themselves or run any test, so a source
 you edit later still builds offline. Each fetched path gets a GC root
 under `output/.prefetch/`, so `nix-collect-garbage` keeps them;
-`rigx clean` removes the roots.
+`rigx clean` removes the roots. Commit `flake.lock`, or pin
+nixpkgs with `rigx lock --pin`: a project with neither can't resolve
+its nixpkgs offline.
 
 After that, `rigx --offline build` (or `test`, `run`, `pkg`) works
 without a network. Offline mode passes `--offline` to every `nix` call,
@@ -639,11 +642,25 @@ python_packages = "python3Packages"  # nixpkgs python set to build against; e.g.
 ```toml
 [nixpkgs]
 ref = "nixos-24.11"          # optional; default "nixos-24.11". Any nixpkgs branch, tag, or commit.
+rev = "50ab793786d9de88ee30ec4e4c24fb4236fc2674"  # optional; an exact commit (written by `rigx lock --pin`)
 ```
 
 The revision is resolved into `flake.lock` on `rigx lock`.
 The default value for `ref` may change in future versions of rigx so we recommend
 that you specify a value for it.
+
+`rev` pins nixpkgs to one exact commit in `rigx.toml` itself. When it is
+set, it is used instead of `ref`, so every machine gets the same nixpkgs
+even without a committed `flake.lock`. Nothing has to look up which
+commit a branch points at, so a project builds offline even with no
+lock at all (after `rigx prefetch`). Host-side tools (`rigx pkg`,
+`deps.nixpkgs` of scripts and testbeds) come from the same commit.
+
+You don't have to write it by hand: `rigx lock --pin` looks up the commit
+`ref` points at right now, writes it as `rev` (with a dated comment),
+and updates `flake.lock` to match. Comments and the rest of the file are
+untouched. Run it again to move the pin forward; `ref` stays as the
+branch to follow. It must be a full 40-character commit hash.
 
 ### `[vars]`
 

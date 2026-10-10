@@ -12,6 +12,9 @@ def cmd_lock(args: argparse.Namespace) -> int:
     from rigx import cli
     project = cli._load(args)
     try:
+        if args.pin:
+            rev = builder.pin_nixpkgs(project)
+            print(f"pinned nixpkgs {project.nixpkgs_ref} to {rev} in rigx.toml")
         builder.update_lock(project)
     except builder.BuildError as e:
         report_build_error(e)

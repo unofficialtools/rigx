@@ -102,6 +102,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_build)
 
     sp = sub.add_parser("lock", help="update lock file")
+    sp.add_argument(
+        "--pin",
+        action="store_true",
+        help="resolve [nixpkgs] ref to its current commit and write it to "
+             "rigx.toml as [nixpkgs] rev (re-run to move the pin forward)",
+    )
     sp.set_defaults(func=cmd_lock)
 
     sp = sub.add_parser(
