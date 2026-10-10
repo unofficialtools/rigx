@@ -26,22 +26,24 @@ from rigx.testbed import Network
 
 
 def main() -> None:
-    with Network() as net:
-        # One shared tempdir, attached to both capsules at /shared.
-        # The writer mounts rw; the viewer mounts ro so accidental
-        # writes from the HTTP server can't corrupt the log.
-        notes = net.shared_volume("notes")
-        net.declare(
-            "note_writer",
-            volumes={notes: ("/shared", "rw")},
-        )
-        net.declare(
-            "note_viewer",
-            listens_on=[8000],
-            volumes={notes: ("/shared", "ro")},
-            expose=[("0.0.0.0", 8000)],
-        )
+    # Topology must be declared before the testbed starts (`with net:`).
+    net = Network()
+    # One shared tempdir, attached to both capsules at /shared.
+    # The writer mounts rw; the viewer mounts ro so accidental
+    # writes from the HTTP server can't corrupt the log.
+    notes = net.shared_volume("notes")
+    net.declare(
+        "note_writer",
+        volumes={notes: ("/shared", "rw")},
+    )
+    net.declare(
+        "note_viewer",
+        listens_on=[8000],
+        volumes={notes: ("/shared", "ro")},
+        expose=[("0.0.0.0", 8000)],
+    )
 
+    with net:
         with start("note_writer", **net.bindings("note_writer")) as wr, \
              start("note_viewer", **net.bindings("note_viewer")) as vw:
             vw.wait_for_port(8000, timeout=15)

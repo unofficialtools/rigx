@@ -141,6 +141,38 @@ _rigx_resolve_volume() {{
 }}"""
 
 
+def emit_volume_flags() -> str:
+    """Bash that appends a `-v` flag per mount to RUN_FLAGS: TOML
+    volumes first, then RIGX_VOLUMES. Needs the helpers from
+    `emit_volume_helpers` and the array from `emit_toml_volumes_array`
+    above it. Shared by the lite/shell and nixos runners."""
+    return """\
+_RUNTIME_VOLS=()
+if [ -n "${RIGX_VOLUMES:-}" ]; then
+    IFS=',' read -ra _RUNTIME_VOLS <<< "$RIGX_VOLUMES"
+fi
+# A runtime mount replaces a TOML mount at the same container path:
+# the engine rejects two mounts on one path ("Duplicate mount point"),
+# and the orchestrator's choice (e.g. a testbed shared_volume) is the
+# more specific one. Entries are `host:container[:mode]`.
+_rigx_vol_dest() { local _r="${1#*:}"; printf '%s' "${_r%%:*}"; }
+for _v in "${TOML_VOLUMES[@]}"; do
+    _shadowed=
+    for _rv in "${_RUNTIME_VOLS[@]}"; do
+        if [ "$(_rigx_vol_dest "$_v")" = "$(_rigx_vol_dest "$_rv")" ]; then
+            _shadowed=1
+        fi
+    done
+    if [ -z "$_shadowed" ]; then
+        RUN_FLAGS+=(-v "$(_rigx_resolve_volume "$_v")")
+    fi
+done
+for _v in "${_RUNTIME_VOLS[@]}"; do
+    RUN_FLAGS+=(-v "$(_rigx_resolve_volume "$_v")")
+done
+"""
+
+
 def _emit_runtime_spec_loader(label: str) -> str:
     """Bash that loads `RIGX_RUNTIME_SPEC` (a JSON file) and surfaces its
     fields onto the RIGX_* env vars the rest of the runner consumes.
@@ -249,6 +281,7 @@ def capsule_runner_script(target: Target, *, mode: str) -> str:
     )
     toml_volumes_block = emit_toml_volumes_array(target)
     volume_helpers_block = emit_volume_helpers(label)
+    volume_flags_block = emit_volume_flags()
     runtime_spec_loader = _emit_runtime_spec_loader(label)
     user_default = target.user
     return f"""\
@@ -321,15 +354,7 @@ fi
 
 {volume_helpers_block}
 {toml_volumes_block}
-for _v in "${{TOML_VOLUMES[@]}}"; do
-    RUN_FLAGS+=(-v "$(_rigx_resolve_volume "$_v")")
-done
-if [ -n "${{RIGX_VOLUMES:-}}" ]; then
-    IFS=',' read -ra _RUNTIME_VOLS <<< "$RIGX_VOLUMES"
-    for _v in "${{_RUNTIME_VOLS[@]}}"; do
-        RUN_FLAGS+=(-v "$(_rigx_resolve_volume "$_v")")
-    done
-fi
+{volume_flags_block}
 
 # A container from a previous run can outlive its runner: killing an
 # attached `run` does not reliably stop the container, so `--rm` never
@@ -370,6 +395,7 @@ def nixos_runner_script(target: Target) -> str:
     label = f"run-{target.name}"
     nixos_volumes_array = emit_toml_volumes_array(target)
     nixos_volume_helpers = emit_volume_helpers(label)
+    volume_flags_block = emit_volume_flags()
     runtime_spec_loader = _emit_runtime_spec_loader(label)
     return f"""\
 #!/usr/bin/env bash
@@ -421,15 +447,7 @@ fi
 
 {nixos_volume_helpers}
 {nixos_volumes_array}
-for _v in "${{TOML_VOLUMES[@]}}"; do
-    RUN_FLAGS+=(-v "$(_rigx_resolve_volume "$_v")")
-done
-if [ -n "${{RIGX_VOLUMES:-}}" ]; then
-    IFS=',' read -ra _RUNTIME_VOLS <<< "$RIGX_VOLUMES"
-    for _v in "${{_RUNTIME_VOLS[@]}}"; do
-        RUN_FLAGS+=(-v "$(_rigx_resolve_volume "$_v")")
-    done
-fi
+{volume_flags_block}
 
 # A container from a previous run can outlive its runner: killing an
 # attached `run` does not reliably stop the container, so `--rm` never

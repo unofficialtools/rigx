@@ -1764,7 +1764,7 @@ The runner inherits a few env knobs that orchestrators set:
 | `RIGX_NETWORK_ALIAS`| extra name the container answers to on `RIGX_NETWORK` (`--network-alias`), so peers can use a short stable name instead of the unique container name in `RIGX_NAME`. Ignored without `RIGX_NETWORK`. |
 | `RIGX_PUBLISH`      | `host:cont,host:cont,…` port forwards            |
 | `RIGX_ENV`          | `K=V,K=V,…` extra env vars                       |
-| `RIGX_VOLUMES`      | `host:cont[:mode],…` extra bind-mounts (`mode`: `rw` / `ro`, default `rw`). Relative `host` paths resolve against `RIGX_PROJECT_ROOT`. Appended to any `volumes` declared in `rigx.toml`. |
+| `RIGX_VOLUMES`      | `host:cont[:mode],…` extra bind-mounts (`mode`: `rw` / `ro`, default `rw`). Relative `host` paths resolve against `RIGX_PROJECT_ROOT`. Appended to any `volumes` declared in `rigx.toml`; an entry whose container path matches a TOML one replaces it (the engine rejects two mounts on one path). |
 | `RIGX_PROJECT_ROOT` | absolute project root used to resolve relative `host` paths in `RIGX_VOLUMES` and TOML-declared volumes. Default: walk up from `$PWD` to find `rigx.toml`. |
 | `RIGX_USER`         | override the TOML `user` (`<user>[:<group>]`); empty/unset keeps the TOML default. |
 
@@ -1995,11 +1995,15 @@ chain that sits between capsules:
 from rigx.capsule import start
 from rigx.testbed import Network
 
-with Network() as net:
-    net.declare("sim", listens_on=[5000])
-    net.declare("fc",  listens_on=[5001])
-    net.link("sim", "fc", to_port=5001)   # sim → fc:5001
+# Topology first: declare(), link() and shared_volume() must all run
+# before the testbed starts (`with net:`), since that's when host ports
+# are bound and proxy listeners come up.
+net = Network()
+net.declare("sim", listens_on=[5000])
+net.declare("fc",  listens_on=[5001])
+net.link("sim", "fc", to_port=5001)   # sim → fc:5001
 
+with net:
     with start("simulator",       **net.bindings("sim")) as sim, \
          start("flight_computer", **net.bindings("fc"))  as fc:
         sim.wait_for_port(5000)
@@ -2045,12 +2049,13 @@ testbed and attach it to each capsule with a container-side path:
 from rigx.capsule import start
 from rigx.testbed import Network
 
-with Network() as net:
-    data = net.shared_volume("data")           # tempdir, auto-cleaned
-    net.declare("rx", listens_on=[8001], volumes={data: "/shared"})
-    net.declare("vis", listens_on=[8000],
-                volumes={data: ("/shared", "ro")})  # read-only mount
+net = Network()
+data = net.shared_volume("data")           # tempdir, auto-cleaned
+net.declare("rx", listens_on=[8001], volumes={data: "/shared"})
+net.declare("vis", listens_on=[8000],
+            volumes={data: ("/shared", "ro")})  # read-only mount
 
+with net:
     with start("telemetry_receiver",   **net.bindings("rx"))  as rx, \
          start("telemetry_visualizer", **net.bindings("vis")) as vis:
         rx.wait_for_port(8001)
@@ -2075,13 +2080,14 @@ adds an *additional* `(addr, port)` publish on top of the normal
 loopback alias, so a port stays reachable both ways:
 
 ```python
-with Network(subnet="127.0.10.0/24") as net:
-    net.declare("vis", listens_on=[8000],
-                expose=[("0.0.0.0", 8000)])
-    # vis is reachable to other capsules on its 127.0.10.X alias
-    # (proxied, fault-injectable) AND to a browser on 0.0.0.0:8000
-    # (direct, no faults — the proxy never sees it).
+net = Network(subnet="127.0.10.0/24")
+net.declare("vis", listens_on=[8000],
+            expose=[("0.0.0.0", 8000)])
+# vis is reachable to other capsules on its 127.0.10.X alias
+# (proxied, fault-injectable) AND to a browser on 0.0.0.0:8000
+# (direct, no faults — the proxy never sees it).
 
+with net:
     with start("telemetry_visualizer", **net.bindings("vis")) as vis:
         vis.wait_for_port(8000)
         print("open http://localhost:8000 in your browser")
@@ -2142,12 +2148,14 @@ semantics — pass a `subnet` (must be inside `127.0.0.0/8`) to
 `Network`:
 
 ```python
-with Network(subnet="127.0.10.0/24") as net:
-    net.declare("sim", listens_on=[5000])    # auto: 127.0.10.2
-    net.declare("fc",  listens_on=[5001])    # auto: 127.0.10.3
-    # Or pin explicitly: declare("sim", address="127.0.10.10", …)
-    net.link("sim", "fc", to_port=5001)
-    # ...
+net = Network(subnet="127.0.10.0/24")
+net.declare("sim", listens_on=[5000])    # auto: 127.0.10.2
+net.declare("fc",  listens_on=[5001])    # auto: 127.0.10.3
+# Or pin explicitly: declare("sim", address="127.0.10.10", …)
+net.link("sim", "fc", to_port=5001)
+
+with net:
+    ...
 ```
 
 The testbed binds each capsule's listener on its own loopback alias
@@ -2164,11 +2172,12 @@ DNS — declare UDP listening ports separately and link with
 `proto="udp"`:
 
 ```python
-with Network(subnet="127.0.10.0/24") as net:
-    net.declare("sim", listens_on=[5000])           # TCP
-    net.declare("fc",  udp_listens_on=[5001])        # UDP
-    net.link("sim", "fc", to_port=5001, proto="udp")
+net = Network(subnet="127.0.10.0/24")
+net.declare("sim", listens_on=[5000])           # TCP
+net.declare("fc",  udp_listens_on=[5001])        # UDP
+net.link("sim", "fc", to_port=5001, proto="udp")
 
+with net:
     with start("simulator",       **net.bindings("sim")) as sim, \
          start("flight_computer", **net.bindings("fc"))  as fc:
         # Capsules may speak both protocols; declare both lists and
@@ -2207,15 +2216,16 @@ injection on both protocols:
 from rigx.capsule import start
 from rigx.testbed import Network
 
-with Network(subnet="127.0.10.0/24") as net:
-    # sim sends control commands over TCP/5001 and pushes telemetry
-    # over UDP/6000. fc accepts both.
-    net.declare("sim", listens_on=[5000], udp_listens_on=[6000])
-    net.declare("fc",  listens_on=[5001], udp_listens_on=[6000])
+net = Network(subnet="127.0.10.0/24")
+# sim sends control commands over TCP/5001 and pushes telemetry
+# over UDP/6000. fc accepts both.
+net.declare("sim", listens_on=[5000], udp_listens_on=[6000])
+net.declare("fc",  listens_on=[5001], udp_listens_on=[6000])
 
-    net.link("sim", "fc", to_port=5001)                  # TCP control
-    net.link("sim", "fc", to_port=6000, proto="udp")     # UDP telemetry
+net.link("sim", "fc", to_port=5001)                  # TCP control
+net.link("sim", "fc", to_port=6000, proto="udp")     # UDP telemetry
 
+with net:
     with start("simulator",       **net.bindings("sim")) as sim, \
          start("flight_computer", **net.bindings("fc"))  as fc:
         sim.wait_for_port(5000)

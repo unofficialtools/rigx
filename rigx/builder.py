@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import os
 import shutil
 import subprocess
 import sys
+import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
 
@@ -325,8 +329,31 @@ def run_script_target(
     """
     assert target.script is not None
     cmd = _script_cmd(project, target, extra_args)
-    result = subprocess.run(cmd, cwd=project.root, check=False)
+    with _script_env() as env:
+        result = subprocess.run(cmd, cwd=project.root, env=env, check=False)
     return result.returncode
+
+
+@contextmanager
+def _script_env() -> Iterator[dict[str, str]]:
+    """Environment for host-side scripts: the caller's env, plus this
+    rigx's own package importable from any Python 3.11+.
+
+    Testbed and script bodies typically run `python3` from
+    `deps.nixpkgs`, which can't see rigx when rigx was installed with
+    `nix profile install` or into some other interpreter's venv — so
+    `from rigx.capsule import start` fails. PYTHONPATH gets a tempdir
+    holding only a `rigx` symlink, not rigx's whole site-packages: that
+    could carry C extensions built for a different Python. The entry is
+    appended, so a PYTHONPATH the user set still wins. rigx.capsule and
+    rigx.testbed are stdlib-only, so the package works standalone."""
+    pkg_dir = Path(__file__).resolve().parent
+    env = dict(os.environ)
+    with tempfile.TemporaryDirectory(prefix="rigx-pythonpath-") as d:
+        (Path(d) / "rigx").symlink_to(pkg_dir, target_is_directory=True)
+        existing = env.get("PYTHONPATH")
+        env["PYTHONPATH"] = f"{existing}{os.pathsep}{d}" if existing else d
+        yield env
 
 
 def _script_cmd(
@@ -648,10 +675,11 @@ def _run_test_capture(project: Project, target) -> tuple[int, str]:
     parallel test output doesn't interleave on the parent terminal."""
     assert target.script is not None
     cmd = _script_cmd(project, target)
-    result = subprocess.run(
-        cmd, cwd=project.root, check=False,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-    )
+    with _script_env() as env:
+        result = subprocess.run(
+            cmd, cwd=project.root, env=env, check=False,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
     return result.returncode, result.stdout or ""
 
 

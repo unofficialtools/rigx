@@ -4,6 +4,28 @@
 
 ### Bug fixes
 
+- **Testbed and script bodies can `import rigx`.** A testbed's `python3`
+  comes from `deps.nixpkgs`, which couldn't see rigx when rigx was installed
+  the recommended way (`nix profile install`), so `from rigx.capsule import
+  start` failed with `ModuleNotFoundError`. Host-side `script`, `testbed`,
+  and `sandbox = false` test targets now get the running rigx's own package
+  on `PYTHONPATH`. Only the `rigx` package is exposed, not its whole
+  site-packages, and a `PYTHONPATH` you set yourself still takes precedence.
+
+- **A testbed `shared_volume` can reuse a path the capsule already mounts.**
+  A runtime mount (`RIGX_VOLUMES`, which `shared_volume` uses) at the same
+  container path as a `volumes` entry in `rigx.toml` produced two `-v` flags
+  for one path, and docker refused to start the container (`Duplicate mount
+  point`). The runtime mount now replaces the TOML one. This is what broke
+  `example-project`'s `notes_demo`.
+
+- **Testbed docs declared topology in the wrong place.** Every `rigx.testbed`
+  example in the README, the module docstring, and
+  `example-project/testbeds/notes_demo.py` called `declare()` inside `with
+  Network() as net:`, which has always raised `declare() must be called
+  before entering the testbed`. They now build the topology first
+  (`shared_volume`, `declare`, `link`) and then enter `with net:`.
+
 - **Stopping a testbed service now stops its container.** `ExecStart=` is an
   attached `podman run`, and killing an attached run does not reliably take
   the container down with it — so `--rm` never fired and `rigx remote

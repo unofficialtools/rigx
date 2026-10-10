@@ -10,11 +10,12 @@ Typical use:
     from rigx.capsule import start
     from rigx.testbed import Network
 
-    with Network() as net:
-        net.declare("sim", listens_on=[5000])
-        net.declare("fc",  listens_on=[5001])
-        net.link("sim", "fc", to_port=5001)   # sim → fc:5001
+    net = Network()
+    net.declare("sim", listens_on=[5000])     # topology first: declare,
+    net.declare("fc",  listens_on=[5001])     # link and shared_volume
+    net.link("sim", "fc", to_port=5001)       # must precede `with net:`
 
+    with net:
         with start("simulator",       **net.bindings("sim")) as sim, \\
              start("flight_computer", **net.bindings("fc"))  as fc:
             sim.wait_for_port(5000)

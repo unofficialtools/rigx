@@ -82,6 +82,7 @@ _capsule_manifest = _capsule_common.capsule_manifest
 _capsule_runner_script = _capsule_common.capsule_runner_script
 _emit_toml_volumes_array = _capsule_common.emit_toml_volumes_array
 _emit_volume_helpers = _capsule_common.emit_volume_helpers
+_emit_volume_flags = _capsule_common.emit_volume_flags
 _PLACEHOLDER_PATH = _capsule_common.PLACEHOLDER_PATH
 _PLACEHOLDER_BASH_BIN = _capsule_common.PLACEHOLDER_BASH_BIN
 _mk_lite_capsule_derivation = _capsule_lite.mk_lite_capsule_derivation

@@ -1,5 +1,9 @@
 """Tests for builder attribute resolution logic (no Nix invocation)."""
 
+import os
+import shutil
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -323,6 +327,68 @@ class ScriptCmdNixShellSkip(unittest.TestCase):
         cmd = run.call_args.args[0]
         self.assertEqual(cmd, ["bash", "-eo", "pipefail", "-c", "true", "t"])
         self.assertEqual(run.call_args.kwargs["cwd"], proj.root)
+
+
+class ScriptEnvExposesRigx(unittest.TestCase):
+    """Host-side scripts can `import rigx` from whatever python3 they
+    run — e.g. a testbed's `deps.nixpkgs = ["python3"]` when rigx
+    itself was installed with `nix profile install`."""
+
+    PKG_DIR = Path(builder.__file__).resolve().parent
+
+    def _pythonpath_entries(self, env):
+        return env["PYTHONPATH"].split(os.pathsep)
+
+    def test_pythonpath_holds_only_a_rigx_symlink(self):
+        env_in = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+        with mock.patch.dict(os.environ, env_in, clear=True), \
+             builder._script_env() as env:
+            [entry] = self._pythonpath_entries(env)
+            self.assertEqual(os.listdir(entry), ["rigx"])
+            self.assertEqual((Path(entry) / "rigx").resolve(), self.PKG_DIR)
+        self.assertFalse(Path(entry).exists(), "tempdir not cleaned up")
+
+    def test_user_pythonpath_is_kept_first(self):
+        with mock.patch.dict(os.environ, {"PYTHONPATH": "/mine"}), \
+             builder._script_env() as env:
+            entries = self._pythonpath_entries(env)
+        self.assertEqual(entries[0], "/mine")
+        self.assertEqual(len(entries), 2)
+
+    def test_both_run_paths_pass_the_env(self):
+        proj = _project_with(
+            t=Target(name="t", kind="test", sandbox=False, script="true"),
+        )
+        for fn in (builder.run_script_target, builder._run_test_capture):
+            with mock.patch("rigx.builder.subprocess.run") as run:
+                run.return_value = mock.Mock(returncode=0, stdout="")
+                fn(proj, proj.targets["t"])
+            self.assertIn("PYTHONPATH", run.call_args.kwargs["env"], fn.__name__)
+
+    def test_script_python_can_import_rigx_testbed(self):
+        # End to end: cwd is an empty dir, site-packages is disabled
+        # (-S), and the caller's PYTHONPATH is cleared, so the only way
+        # `rigx` imports is through the entry _script_env adds.
+        python = shutil.which("python3") or sys.executable
+        with tempfile.TemporaryDirectory() as root:
+            out = Path(root) / "where"
+            proj = Project(
+                name="p", version="0.1.0", nixpkgs_ref="nixos-24.11",
+                git_deps={}, root=Path(root),
+                targets={"tb": Target(
+                    name="tb", kind="testbed",
+                    script=(
+                        f'"{python}" -S -c "import rigx.testbed, rigx.capsule, '
+                        f'pathlib; print(pathlib.Path(rigx.__file__).resolve().parent)"'
+                        f' > "{out}"'
+                    ),
+                )},
+            )
+            env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+            with mock.patch.dict(os.environ, env, clear=True):
+                rc = builder.run_script_target(proj, proj.targets["tb"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(Path(out.read_text().strip()), self.PKG_DIR)
 
 
 class WriteFlakeIdempotent(unittest.TestCase):

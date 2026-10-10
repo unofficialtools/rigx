@@ -311,15 +311,7 @@ class VolumesRunnerExec(unittest.TestCase):
             "RUN_FLAGS=()\n"
             f"{helpers}\n"
             f"{toml_arr}\n"
-            'for _v in "${TOML_VOLUMES[@]}"; do\n'
-            '    RUN_FLAGS+=(-v "$(_rigx_resolve_volume "$_v")")\n'
-            "done\n"
-            'if [ -n "${RIGX_VOLUMES:-}" ]; then\n'
-            '    IFS="," read -ra _RUNTIME_VOLS <<< "$RIGX_VOLUMES"\n'
-            '    for _v in "${_RUNTIME_VOLS[@]}"; do\n'
-            '        RUN_FLAGS+=(-v "$(_rigx_resolve_volume "$_v")")\n'
-            "    done\n"
-            "fi\n"
+            f"{nix_gen._emit_volume_flags()}\n"
             'printf "%s\\n" "${RUN_FLAGS[@]}"\n'
         )
 
@@ -371,6 +363,30 @@ class VolumesRunnerExec(unittest.TestCase):
         # 2 mounts × 2 lines each (-v <spec>)
         self.assertEqual(lines[0:2], ["-v", f"{proj}/runtime-data:/r:rw"])
         self.assertEqual(lines[2:4], ["-v", "/abs:/a:ro"])
+
+    def test_runtime_volume_replaces_toml_volume_at_same_path(self):
+        # A testbed shared_volume mounted where the capsule's rigx.toml
+        # already mounts something: docker rejects two mounts on one
+        # path ("Duplicate mount point"), so the runtime one must win.
+        import subprocess
+        script = self._render_runner([
+            config.Volume(host="/toml/notes", container="/shared", mode="rw"),
+            config.Volume(host="/toml/keep", container="/keep", mode="ro"),
+        ])
+        r = subprocess.run(
+            ["bash", "-c", script],
+            env={
+                **os.environ,
+                "RIGX_PROJECT_ROOT": "/unused",
+                "RIGX_VOLUMES": "/tmp/shared-vol:/shared:ro",
+            },
+            capture_output=True, text=True, check=True,
+        )
+        lines = [l for l in r.stdout.splitlines() if l]
+        self.assertEqual(lines, [
+            "-v", "/toml/keep:/keep:ro",
+            "-v", "/tmp/shared-vol:/shared:ro",
+        ])
 
 
 # ---------------------------------------------------------------------------
