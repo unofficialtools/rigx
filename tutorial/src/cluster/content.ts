@@ -301,7 +301,7 @@ script = """
     bullets: [
       "One container image that we can start as many times as we like",
       "Each network connection is one multiplication",
-      "Only kilobytes in size, because it reuses the program we already built",
+      "Small: just the worker and the libraries it needs, with no base OS",
     ],
     slides: [
       {
@@ -319,7 +319,7 @@ entrypoint    = "socat TCP-LISTEN:7000,fork EXEC:\${matmul}/bin/matmul"
 ports         = [7000]`,
         notes: [
           { at: '"capsule"', text: "Package a built program as a runnable container." },
-          { at: "backend", text: "`lite`: a FROM-scratch image that uses the host's `/nix/store`, so the image is only kilobytes." },
+          { at: "backend", text: "`lite`: a minimal image with just the program and the libraries it needs. No base OS." },
           { at: "deps.internal", text: "The worker program goes inside." },
           { at: "deps.nixpkgs", text: "`socat` is the container's only other tool." },
           { at: "entrypoint", text: "Listen on 7000. Each connection starts one `matmul`, with the socket as its stdin and stdout." },

@@ -1264,7 +1264,7 @@ function OutroScene() {
     ['compiler = "clang18"', "a pinned clang, the same on every machine"],
     ['deps.nixpkgs = ["eigen"]', "libraries and tools through rigx, nothing installed on the host"],
     ['kind = "test"', "sandboxed, cached on its input hash"],
-    ['kind = "capsule"', "a kilobyte container around the binary"],
+    ['kind = "capsule"', "a minimal container around the binary"],
     ['kind = "testbed"', "three capsules driven from Python"],
   ];
   return (
