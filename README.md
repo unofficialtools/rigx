@@ -2,7 +2,7 @@
 
 <p align="center"><img src="rigx.png" alt="rigx logo" width="320"></p>
 
-[WEBSITE & VIDEO TUTORIALS](https://unofficialtools.github.io/rigx/) · [TESTBED VIDEO EXAMPLE](https://www.youtube.com/watch?v=scHcUO_asbo)
+[WEBSITE & VIDEO TUTORIALS](https://unofficialtools.github.io/rigx/) · [TESTBED VIDEO EXAMPLE](https://www.youtube.com/watch?v=scHcUO_asbo) · [ABOUT THE AUTHOR](https://mdipierro.github.io/)
 
 We wanted a modern build system for humans — one that is *even easier* than
 Make, using the intuitive, purely declarative syntax of TOML, yet *as powerful*
