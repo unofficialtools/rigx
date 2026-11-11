@@ -3173,6 +3173,10 @@ Do not run `rigx build`, `rigx run`, `rigx test`, or any
 reviewing the rigx.toml, capsule entrypoints, custom scripts, and the
 git / local-flake inputs first.
 
+## About the Author
+
+rigx is created by [Massimo Di Pierro](https://mdipierro.github.io/).
+
 ## License
 
 BSD 3-Clause License. See [`LICENSE.md`](LICENSE.md) for the full text.

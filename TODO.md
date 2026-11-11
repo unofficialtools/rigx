@@ -163,6 +163,7 @@ qemu) should talk through the same testbed naturally — both sides
 just expose host ports, and the testbed proxies between them.
 Verification needed once both backends are real.
 
+<<<<<<< Updated upstream
 ## Offline operation — what's left
 
 Done in 0.13.0: `rigx prefetch`, `rigx --offline` / `RIGX_OFFLINE=1`
@@ -190,3 +191,121 @@ Still open:
 - **Doctor check** — "can this project build offline right now?": lock
   present, locked rev in store, per-target closures, venv FOD hashes.
   ~120 lines.
+=======
+## Offline operation — `rigx` should work without a network
+
+Reported symptom:
+
+```
+error: Request failed after 3 retries
+  Caused by: Failed to fetch: `https://pypi.org/simple/rigx/`
+  Caused by: dns error: failed to lookup address information
+```
+
+**That specific error is not rigx's code.** rigx never contacts PyPI at
+runtime — no update check, no `pip`, no index lookup anywhere in
+`rigx/`. The only PyPI traffic in the repo comes from targets you invoke
+deliberately (`rigx run publish`, `rigx run dist` → `uv build`/`uv
+publish`), and those fetch *setuptools*, not `rigx`. A fetch of
+`pypi.org/simple/**rigx**/` means something is resolving the rigx
+*package* from the index — i.e. the launcher, not the tool. The wording
+is verbatim `uv`, so the likely cause is `uvx rigx` / `uv tool run rigx`,
+which re-resolves the tool against the index on every invocation.
+
+Fixes at that layer are documentation, not code:
+
+- `uv tool install rigx` once (resolves at install time) instead of
+  `uvx rigx` on every run
+- `UV_OFFLINE=1` / `uvx --offline`
+- `nix profile install github:unofficialtools/rigx/stable` — no index at all
+- README should state plainly: rigx has no PyPI dependency at runtime;
+  a pypi.org error means your *launcher* is re-resolving it.
+
+The rest of this entry is the real work: what an offline `rigx build`
+actually needs. There are four independent chokepoints, and today every
+one of them surfaces as raw `nix` stderr.
+
+### 1. Flake input resolution
+
+`rigx.nix.flake` emits `nixpkgs.url = "github:NixOS/nixpkgs/<ref>"` — a
+*branch*, not a rev. Offline works only if `flake.lock` exists **and**
+the locked nixpkgs source is already in the store. It breaks when the
+project is fresh (no lock), the lock is gitignored, or `write_flake`
+changed the input set so nix re-locks.
+
+Worse: when `builder._locked_nixpkgs_flakeref()` returns `None` (no
+lock, unreadable lock, non-github input), the host-side paths fall back
+to the indirect ref `nixpkgs/<branch>`, which needs the flake registry —
+a second network dependency, and the same one that motivated the
+locked-rev preference in the first place (see that function's docstring
+on GitHub API rate limits).
+
+Directions: let `[nixpkgs]` accept a `rev` (or a full `url`) so the
+branch never needs resolving; have `build()` warn or refuse when no
+usable lock exists rather than letting nix discover it three layers
+down; treat "no lock" as a first-class diagnosable state — `rigx lock`
+is already the fix, it just isn't suggested at the right moment.
+
+### 2. Substituters
+
+Even with a perfect lock, any derivation not in the local store is
+fetched from cache.nixos.org. Offline that is a hang, then a failure
+with no useful text. Passing `--offline` to nix (which also disables
+substituters) turns it into an immediate, honest "path not available".
+
+### 3. Python venv FODs
+
+`rigx.nix.python.mk_python_derivation` runs `uv sync --frozen` inside a
+fixed-output derivation — network is permitted *by design*, and pinned
+by `outputHash`. Offline this works only if a store path with that exact
+hash already exists (then nix skips the build entirely — the happy
+path). It breaks the moment deps change, or while the hash is still
+`FAKE_SHA256`.
+
+Options, roughly in increasing order of ambition: pre-seed a uv cache
+into the FOD source; vendor wheels and use `--find-links`; or move to a
+nix-native resolver (uv2nix / pyproject.nix) so Python deps arrive from
+substituters like every other dependency. Regardless of which, this case
+deserves a targeted error: "this target's venv is not in the store and
+building it requires network".
+
+### 4. `rigx remote`
+
+`rigx.deploy.bootstrap` curls `install.determinate.systems`. LAN deploys
+to an already-bootstrapped host are fine; first touch of a fresh host
+needs internet *on the target*. An offline-installer path (pre-staged
+tarball, copied over SSH) would close it.
+
+### Candidate features, in value order
+
+- **`rigx --offline` / `RIGX_OFFLINE=1`** — add `--offline` to every
+  `nix build` / `nix shell` / `nix run` invocation. All the call sites
+  funnel through `builder.py` (`build_one`, `_script_cmd`,
+  `run_nixpkgs_tool`, `update_lock`, `_run_sandboxed_tests`), so this is
+  small. Turns DNS-timeout soup into a fast, legible failure.
+  ~40 lines. Highest payoff per line in this list.
+- **Offline-aware error triage** — pattern-match nix stderr for
+  DNS/connect failures the way `_cross_arch_hint` already does for
+  binfmt, and print: "network unreachable — run `rigx lock` while online
+  and commit flake.lock, or pass `--offline` if everything is already in
+  your store." ~40 lines. This alone makes most reports self-answering.
+- **`rigx prefetch` (a.k.a. `warm`)** — while online, realize the full
+  build-time closure of every target, including the venv FODs, so a
+  later offline run is guaranteed to hit. This is the piece that makes
+  offline actually *work* rather than merely fail politely. ~100 lines.
+- **Pin nixpkgs by rev in `rigx.toml`**, with `rigx lock` writing the
+  resolved rev back. Removes both the branch-resolution and the registry
+  dependency. ~60 lines plus schema and docs.
+- **`rigx bundle export` / `import`** — `nix copy` a project's closure to
+  a file for genuinely air-gapped machines. The `nix copy` machinery
+  already exists in the SSH deploy backend; this is mostly plumbing.
+  ~150 lines.
+- **A doctor check** — "can this project build offline right now?":
+  lock present, locked rev in store, per-target closure availability,
+  venv FOD hash present. Reports which of the four chokepoints would
+  bite. ~120 lines.
+
+The minimal coherent slice is the first three: `prefetch` makes offline
+possible, `--offline` makes it deterministic, the error hint makes the
+failure teachable.
+>>>>>>> Stashed changes
